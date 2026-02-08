@@ -3,6 +3,9 @@ import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import axios from 'axios';
 import io from 'socket.io-client';
 
+// ☁️ YOUR CLOUD SERVER ADDRESS
+const API_URL = 'https://aura-trade.onrender.com';
+
 const ChartComponent = () => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
@@ -64,14 +67,18 @@ const ChartComponent = () => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- 📰 NEW: FETCH NEWS MARKERS (Updated "Flag" Logic) ---
+  // --- 📰 FETCH NEWS MARKERS (Connected to Cloud) ---
   const fetchNewsMarkers = async () => {
       try {
-          const res = await axios.get(`http://localhost:5000/api/news`, {
-              params: { limit: 50 } 
+          console.log("📡 Fetching News from Cloud...");
+          // UPDATE: Using API_URL instead of localhost
+          const res = await axios.get(`${API_URL}/api/news`, {
+              params: { limit: 100 } // Get last 100 events to be safe
           });
           
           if (!res.data || !Array.isArray(res.data)) return;
+
+          console.log(`✅ Loaded ${res.data.length} News Events`);
 
           // TRANSFORM: Events -> Red/Orange Flags
           const markers = res.data.map(news => {
@@ -79,11 +86,11 @@ const ChartComponent = () => {
               
               return {
                   time: getCandleStartTime(news.time, timeframeRef.current),
-                  position: 'aboveBar', // Always on top like a flag
-                  color: isHigh ? '#ef5350' : '#ffa726', // Red for High, Orange for Medium
-                  shape: 'arrowDown', // Points down at the candle (like a flag)
-                  text: isHigh ? `🚩 ${news.event || news.title}` : '', // Only show text for High Impact
-                  size: isHigh ? 2 : 1, // Make High Impact bigger
+                  position: 'aboveBar',
+                  color: isHigh ? '#ef5350' : '#ffa726',
+                  shape: 'arrowDown',
+                  text: isHigh ? `🚩 ${news.event}` : '', 
+                  size: isHigh ? 2 : 1,
               };
           });
 
@@ -104,8 +111,8 @@ const ChartComponent = () => {
       const oldestTime = allDataRef.current[0].time; 
       
       try {
-          console.log("⚡ Infinite Scroll: Fetching before", oldestTime);
-          const res = await axios.get(`http://localhost:5000/api/candles/${timeframeRef.current}`, {
+          console.log("⚡ Fetching older history from Cloud...");
+          const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { 
                   limit: 500, 
                   before: oldestTime, 
@@ -114,10 +121,7 @@ const ChartComponent = () => {
           });
 
           const rawData = Array.isArray(res.data) ? res.data : [];
-          if (rawData.length === 0) {
-              console.log("End of history reached.");
-              return;
-          }
+          if (rawData.length === 0) return;
 
           const newOldData = rawData.map(item => ({
             time: getCandleStartTime(item.time, timeframeRef.current), 
@@ -217,8 +221,10 @@ const ChartComponent = () => {
       allDataRef.current = [];
       
       try {
-        const res = await axios.get(`http://localhost:5000/api/candles/${timeframe}`, {
-            params: { limit: 100, timestamp: Date.now() }
+        console.log("⚡ Fetching initial data from Cloud...");
+        // UPDATE: Fetch 500 candles (approx 20 days) so we can see last week's news
+        const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
+            params: { limit: 500, timestamp: Date.now() }
         });
         
         const rawData = Array.isArray(res.data) ? res.data : [];
@@ -240,6 +246,7 @@ const ChartComponent = () => {
                 currentBarRef.current = data[data.length - 1];
             }
             
+            // Scroll to end
             chartRef.current.timeScale().scrollToPosition(0, false);
             chartRef.current.priceScale('right').applyOptions({ autoScale: true });
         }
@@ -260,9 +267,10 @@ const ChartComponent = () => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET ---
+  // --- EFFECT 3: SOCKET (Connected to Cloud) ---
   useEffect(() => {
-    const socket = io('http://localhost:5000', { transports: ['websocket'], reconnection: true });
+    // UPDATE: Connect Socket.io to Cloud
+    const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     socketRef.current = socket;
 
     socket.on('connect', () => setConnectionStatus('Connected'));
