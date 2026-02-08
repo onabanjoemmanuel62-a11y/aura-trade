@@ -7,11 +7,11 @@ const SignalCard = ({ chartData = [] }) => {
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
   
-  // 📰 NEW: Real News State
+  // 📰 Real News State
   const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
-  // --- 1. THE BRAIN: Fetch Analysis (Preserved) ---
+  // --- 1. THE BRAIN: Fetch Analysis ---
   const fetchAnalysis = async () => {
     if (!chartData || chartData.length < 30) return;
 
@@ -30,21 +30,20 @@ const SignalCard = ({ chartData = [] }) => {
     }
   };
 
-  // --- 2. THE FILTER: Find "Sniper" News Only (NEW) ---
+  // --- 2. THE FILTER: Find "Sniper" News Only ---
   const fetchDailyNews = async () => {
       try {
           const res = await axios.get('http://localhost:5000/api/news');
-          const today = new Date().toDateString(); // e.g. "Fri Feb 07 2026"
+          const today = new Date().toDateString(); 
 
           // 🚨 THE SNIPER FILTER 🚨
-          // We find the *next* critical event happening today.
           const criticalEvent = res.data.find(n => {
               const newsDate = new Date(n.time).toDateString();
               return (
                   newsDate === today &&       // Must be today
                   n.impact === 'High' &&      // Must be High Impact (Red Folder)
-                  n.currency === 'USD' &&     // Must be USD (affects Gold)
-                  new Date(n.time) > new Date() // Must be in the future
+                  n.currency === 'USD' &&     // Must be USD
+                  new Date(n.time) > new Date() // Must be in future
               );
           });
 
@@ -55,7 +54,7 @@ const SignalCard = ({ chartData = [] }) => {
       }
   };
 
-  // --- 3. COUNTDOWN TIMER (UPDATED) ---
+  // --- 3. COUNTDOWN TIMER ---
   useEffect(() => {
     if (!nextNews) return;
 
@@ -65,7 +64,6 @@ const SignalCard = ({ chartData = [] }) => {
       const now = new Date();
       const diff = targetDate - now;
 
-      // If news time passed, hide the alert
       if (diff <= 0) {
         setNextNews(null); 
         setNewsCountdown("");
@@ -84,13 +82,12 @@ const SignalCard = ({ chartData = [] }) => {
 
   // --- TRIGGERS ---
   useEffect(() => {
-      fetchDailyNews(); // Check news immediately on load
-      
+      fetchDailyNews(); 
       if (chartData.length > 0 && !analysis) fetchAnalysis();
       
       const interval = setInterval(() => { 
           if (chartData.length > 0) fetchAnalysis();
-          fetchDailyNews(); // Re-check news every minute
+          fetchDailyNews(); 
       }, 60000);
       
       return () => clearInterval(interval);
@@ -185,13 +182,18 @@ const SignalCard = ({ chartData = [] }) => {
                 </div>
             </div>
 
-            {/* 2. HISTORICAL REFERENCE */}
+            {/* 2. HISTORICAL REFERENCE (Dynamic) */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: '3px solid #7C4DFF' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: '#7C4DFF', fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> FRACTAL MATCH
                 </div>
+                {/* 🚀 FIXED: Now uses real API reason */}
                 <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.4' }}>
-                    "Pattern matches the <b>Liquidity Sweep</b> seen in <span style={{color: '#FFF'}}>Oct 2019</span>. Expect volatility."
+                    {analysis?.reason ? (
+                        analysis.reason 
+                    ) : (
+                        "Scanning historical patterns..."
+                    )}
                 </div>
             </div>
 
