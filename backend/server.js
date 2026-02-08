@@ -6,8 +6,9 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const dns = require('dns');
 const connectDB = require('./config/db');
-const cron = require('node-cron');           // 🕒 Scheduler
-const fetchLiveNews = require('./scripts/fetchLiveNews'); // 📰 Import Script
+const cron = require('node-cron');
+const fetchLiveNews = require('./scripts/fetchLiveNews');
+const axios = require('axios'); // <--- NEW: Import Axios for self-ping
 
 // 1. IMPORT THE MODEL
 const Candle = require('./models/Candle');
@@ -16,7 +17,7 @@ const Candle = require('./models/Candle');
 const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
 const analysisRoutes = require('./routes/analysisRoutes');
-const newsRoutes = require('./routes/newsRoutes'); // 📰 News Route
+const newsRoutes = require('./routes/newsRoutes');
 
 // ISP Bypass: DNS Setup
 try {
@@ -50,7 +51,10 @@ const PORT = process.env.PORT || 5000;
 app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/analyze', analysisRoutes);
-app.use('/api/news', newsRoutes); // 📰 Enable News API
+app.use('/api/news', newsRoutes);
+
+// <--- NEW: Health Check Route (Lightweight response for the pinger)
+app.get('/healthcheck', (req, res) => res.status(200).send('OK'));
 
 app.get('/', (req, res) => res.send('API is Running'));
 
@@ -224,6 +228,20 @@ const handleDisconnection = () => {
 };
 
 connectBinanceStream();
+
+// ==========================================
+// 💓 KEEP ALIVE PING (For Render Free Tier)
+// ==========================================
+// <--- NEW: This prevents the server from sleeping
+if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://aura-trade.onrender.com';
+  
+  setInterval(() => {
+    axios.get(`${RENDER_URL}/healthcheck`)
+      .then(() => console.log('💓 Self-Ping: Keeping the brain awake...'))
+      .catch((err) => console.error(`⚠️ Ping failed: ${err.message}`));
+  }, 300000); // 5 Minutes
+}
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
