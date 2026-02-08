@@ -2,27 +2,22 @@ const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
 
 // CONFIGURATION
-const PATTERN_LENGTH = 8;        // The "DNA" length (Input size)
-const FORECAST_HORIZON = 4;      // Look ahead 4 candles to determine win/loss
-const SIMILARITY_THRESHOLD = 5.0; // Stricter = Lower number. 5.0 is a good balance for % based data.
+const PATTERN_LENGTH = 8;        // Input size
+const FORECAST_HORIZON = 4;      // Look ahead size
+const SIMILARITY_THRESHOLD = 5.0; // Euclidean Distance Threshold
 
 // ==========================================
 // 🧮 MATH ENGINE: Vector Normalization
 // ==========================================
-// Converts raw prices [2000, 2010, 2005] -> Percentage Moves [0, 0.5, 0.25]
-// This allows matching 2004 patterns (low price) with 2026 patterns (high price).
 const normalizePattern = (prices) => {
   if (!prices || prices.length === 0) return [];
   const basePrice = prices[0];
-  // Multiply by 100 to get percentage points (e.g., 1.5%)
   return prices.map(p => ((p - basePrice) / basePrice) * 100);
 };
 
 // ==========================================
 // 🧮 MATH ENGINE: Euclidean Distance
 // ==========================================
-// Calculates the "Shape Difference" between two patterns.
-// 0 = Identical Shape.
 const calculateDistance = (patternA, patternB) => {
   if (patternA.length !== patternB.length) return Infinity;
   let sum = 0;
@@ -38,91 +33,94 @@ const calculateDistance = (patternA, patternB) => {
 // @route   POST /api/analyze/pattern
 const analyzePattern = async (req, res) => {
   try {
-    // Frontend sends: { currentPattern: [4950.5, 4951.2, ...], timeframe: '1h' }
     const { currentPattern, timeframe } = req.body;
 
     // 1. Validation
     if (!currentPattern || currentPattern.length < 5) {
-      return res.status(400).json({ message: 'Pattern array is too short (min 5 candles).' });
+      return res.status(400).json({ message: 'Pattern array is too short.' });
     }
 
-    // 2. Normalize the Input (The "Target" Vector)
+    // 2. Normalize Input
     const targetVector = normalizePattern(currentPattern);
     const patternLength = currentPattern.length;
 
-    // 3. Fetch History (Optimized Field Selection)
-    // We only need 'close' and 'time' for the scan. 
-    // .lean() makes it plain JS objects (faster).
+    // 3. Fetch History
     const history = await Candle.find({ timeframe: timeframe || '1h' })
-      .sort({ time: 1 }) // Oldest -> Newest
+      .sort({ time: 1 })
       .select('close time -_id')
       .lean();
 
     if (history.length < 1000) {
-      return res.status(400).json({ message: 'Not enough historical data to perform Fractal Analysis.' });
+      return res.status(400).json({ message: 'Not enough historical data.' });
     }
 
     let matches = [];
     const historyLimit = history.length - patternLength - FORECAST_HORIZON;
 
-    // 4. The Sliding Window Scan (The Time Machine)
-    // Loop through 20 years of history...
+    // 4. Time Machine Scan
     for (let i = 0; i < historyLimit; i++) {
-      
-      // Extract window
       const windowCandles = history.slice(i, i + patternLength);
       const windowPrices = windowCandles.map(c => c.close);
-      
-      // Normalize window to % change
-      const windowVector = normalizePattern(windowPrices);
-
-      // Compare Shapes (Math)
+      const windowVector = normalizePattern(windowPrices); // Normalize history to match today
       const dist = calculateDistance(targetVector, windowVector);
 
-      // 5. Filter for Matches
       if (dist < SIMILARITY_THRESHOLD) {
-        
-        // Determine Outcome (Next 4 Candles)
-        const entryPrice = history[i + patternLength - 1].close; // End of pattern
-        const exitPrice = history[i + patternLength + FORECAST_HORIZON - 1].close; // 4 periods later
-        
-        // Did price go UP or DOWN after this shape?
+        const entryPrice = history[i + patternLength - 1].close;
+        const exitPrice = history[i + patternLength + FORECAST_HORIZON - 1].close;
         const percentChange = ((exitPrice - entryPrice) / entryPrice) * 100;
 
         matches.push({
           time: windowCandles[0].time, // Unix Timestamp
           similarity: dist,
-          outcome: percentChange, // +1.5% or -0.5%
+          outcome: percentChange, 
         });
       }
     }
 
-    // 6. Sort & Analyze Top Matches
-    // Sort by Similarity (Lowest distance is best)
+    // 5. Sort Matches
     matches.sort((a, b) => a.similarity - b.similarity);
-    
-    // Take Top 20 Twins
     const topMatches = matches.slice(0, 20); 
 
-    let bullishCount = 0;
-    let bearishCount = 0;
-
-    // 7. Contextual Check (Did news cause this?)
-    // We enrich the Top 5 matches with News Data for the frontend to display
+    // =================================================================
+    // 🧠 LOGIC UPDATE: PRECISE NEWS CONTEXT (+/- 2 Hours)
+    // =================================================================
     const enrichedMatches = await Promise.all(topMatches.slice(0, 5).map(async (m) => {
-      // Check for High Impact news +/- 12 hours of the match
-      const news = await NewsEvent.findOne({
-        time: { $gte: m.time - 43200, $lte: m.time + 43200 },
-        impact: { $regex: /High/i }
-      }).select('event currency impact');
+      // Logic: Find news within 2 hours (7200s) of the match time
+      // This confirms if the move was driven by fundamentals or purely technicals.
+      const matchTime = m.time;
+      
+      const preciseNews = await NewsEvent.findOne({
+        time: { 
+          $gte: matchTime - 7200, // 2 hours before
+          $lte: matchTime + 7200  // 2 hours after
+        },
+        currency: 'USD', // Focus on USD as requested
+        impact: { $regex: /High/i } // Only High Impact
+      }).select('event currency impact actual forecast');
+
+      let contextLabel = "Technical Move"; // Default if no news found
+      
+      if (preciseNews) {
+        contextLabel = `⚠️ ${preciseNews.event} (${preciseNews.currency})`;
+        
+        // Add Fundamental Bias Check
+        if (preciseNews.actual && preciseNews.forecast) {
+           const deviation = preciseNews.actual - preciseNews.forecast;
+           contextLabel += ` [Dev: ${deviation.toFixed(1)}]`;
+        }
+      }
 
       return {
         ...m,
-        newsContext: news ? `${news.event} (${news.currency})` : null
+        newsContext: contextLabel,
+        rawNews: preciseNews // Send full object in case frontend needs it
       };
     }));
 
-    // Calculate Stats
+    // 6. Calculate Probability
+    let bullishCount = 0;
+    let bearishCount = 0;
+
     topMatches.forEach(m => {
       if (m.outcome > 0) bullishCount++;
       else bearishCount++;
@@ -141,13 +139,12 @@ const analyzePattern = async (req, res) => {
       else if (Number(probabilityDown) > 60) sentiment = 'BEARISH';
     }
 
-    // 8. Return Analysis
     res.json({
       sentiment,
       probabilityUp: parseFloat(probabilityUp),
       probabilityDown: parseFloat(probabilityDown),
-      matchesFound: matches.length, // "Found 142 similar patterns in history"
-      topMatches: enrichedMatches   // "Here is what happened the last 5 times"
+      matchesFound: matches.length,
+      topMatches: enrichedMatches
     });
 
   } catch (error) {

@@ -6,20 +6,20 @@ const SignalCard = ({ chartData = [] }) => {
   // --- STATE ---
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
+  
+  // 📰 NEW: Real News State
+  const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
   // --- 1. THE BRAIN: Fetch Analysis (Preserved) ---
   const fetchAnalysis = async () => {
-    // Safety check
     if (!chartData || chartData.length < 30) return;
 
     setLoading(true);
     try {
-      // 4. API CALL: Send the last 50 candles
       const res = await axios.post('http://localhost:5000/api/analyze', {
         candles: chartData.slice(-50) 
       });
-
       if (res.data) {
           setAnalysis(res.data);
       }
@@ -30,58 +30,92 @@ const SignalCard = ({ chartData = [] }) => {
     }
   };
 
-  // --- 2. LIVE TRIGGERS (Preserved) ---
-  useEffect(() => {
-      if (chartData.length > 0 && !analysis) fetchAnalysis();
-      const interval = setInterval(() => { if (chartData.length > 0) fetchAnalysis(); }, 60000);
-      return () => clearInterval(interval);
-  }, [chartData.length]);
+  // --- 2. THE FILTER: Find "Sniper" News Only (NEW) ---
+  const fetchDailyNews = async () => {
+      try {
+          const res = await axios.get('http://localhost:5000/api/news');
+          const today = new Date().toDateString(); // e.g. "Fri Feb 07 2026"
 
-  // --- 3. NEWS TIMER LOGIC (New Feature) ---
-  useEffect(() => {
-    // Mock target time for UX demonstration (In real app, fetch from /api/news)
-    const targetDate = new Date();
-    targetDate.setHours(targetDate.getHours() + 2); // Fake "Next News" in 2 hours
+          // 🚨 THE SNIPER FILTER 🚨
+          // We find the *next* critical event happening today.
+          const criticalEvent = res.data.find(n => {
+              const newsDate = new Date(n.time).toDateString();
+              return (
+                  newsDate === today &&       // Must be today
+                  n.impact === 'High' &&      // Must be High Impact (Red Folder)
+                  n.currency === 'USD' &&     // Must be USD (affects Gold)
+                  new Date(n.time) > new Date() // Must be in the future
+              );
+          });
 
+          setNextNews(criticalEvent || null);
+
+      } catch (err) {
+          console.error("News Fetch Failed:", err);
+      }
+  };
+
+  // --- 3. COUNTDOWN TIMER (UPDATED) ---
+  useEffect(() => {
+    if (!nextNews) return;
+
+    const targetDate = new Date(nextNews.time);
+    
     const timer = setInterval(() => {
       const now = new Date();
       const diff = targetDate - now;
 
+      // If news time passed, hide the alert
       if (diff <= 0) {
-        setNewsCountdown("00:00:00");
+        setNextNews(null); 
+        setNewsCountdown("");
         return;
       }
 
-      const hours = Math.floor((diff / (1000 * 60 * 60)) % 24);
-      const minutes = Math.floor((diff / (1000 * 60)) % 60);
-      const seconds = Math.floor((diff / 1000) % 60);
+      const h = Math.floor((diff / (1000 * 60 * 60)) % 24);
+      const m = Math.floor((diff / (1000 * 60)) % 60);
+      const s = Math.floor((diff / 1000) % 60);
 
-      setNewsCountdown(`${hours}h ${minutes}m ${seconds}s`);
+      setNewsCountdown(`${h}h ${m}m ${s}s`);
     }, 1000);
 
     return () => clearInterval(timer);
-  }, []);
+  }, [nextNews]);
 
-  // --- HELPERS & VISUAL MATH ---
+  // --- TRIGGERS ---
+  useEffect(() => {
+      fetchDailyNews(); // Check news immediately on load
+      
+      if (chartData.length > 0 && !analysis) fetchAnalysis();
+      
+      const interval = setInterval(() => { 
+          if (chartData.length > 0) fetchAnalysis();
+          fetchDailyNews(); // Re-check news every minute
+      }, 60000);
+      
+      return () => clearInterval(interval);
+  }, [chartData.length]);
+
+  // --- HELPERS ---
   const getSignalColor = (signal) => {
       if (!signal) return '#9ca3af';
       const s = signal.toUpperCase();
-      if (s.includes('BUY')) return '#00E676'; // Bright Green
-      if (s.includes('SELL')) return '#FF1744'; // Bright Red
-      return '#FFC107'; // Amber/Wait
+      if (s.includes('BUY')) return '#00E676'; 
+      if (s.includes('SELL')) return '#FF1744'; 
+      return '#FFC107'; 
   };
 
   const signalColor = getSignalColor(analysis?.signal);
   const confidence = analysis?.confidence || 0;
   
   // SVG Gauge Math
-  const radius = 36; // Size of the ring
+  const radius = 36;
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (confidence / 100) * circumference;
 
   return (
     <div style={{
-      backgroundColor: 'rgba(21, 25, 32, 0.8)', // Slightly darker for contrast
+      backgroundColor: 'rgba(21, 25, 32, 0.8)', 
       backdropFilter: 'blur(12px)',
       border: '1px solid rgba(255, 255, 255, 0.08)',
       borderRadius: '16px',
@@ -120,7 +154,7 @@ const SignalCard = ({ chartData = [] }) => {
           </div>
       ) : (
         <>
-            {/* 1. WIN RATE METER (Circular Gauge) */}
+            {/* 1. WIN RATE METER */}
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'linear-gradient(145deg, rgba(255,255,255,0.03) 0%, rgba(0,0,0,0.2) 100%)', padding: '15px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
                 <div style={{ display: 'flex', flexDirection: 'column' }}>
                     <span style={{ fontSize: '11px', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Probability</span>
@@ -135,9 +169,7 @@ const SignalCard = ({ chartData = [] }) => {
                 {/* SVG Gauge */}
                 <div style={{ position: 'relative', width: '80px', height: '80px' }}>
                     <svg width="80" height="80" style={{ transform: 'rotate(-90deg)' }}>
-                        {/* Background Ring */}
                         <circle cx="40" cy="40" r={radius} stroke="#374357" strokeWidth="6" fill="transparent" opacity="0.3" />
-                        {/* Value Ring */}
                         <circle 
                             cx="40" cy="40" r={radius} 
                             stroke={signalColor} strokeWidth="6" fill="transparent" 
@@ -147,14 +179,13 @@ const SignalCard = ({ chartData = [] }) => {
                             style={{ transition: 'stroke-dashoffset 1s ease-in-out' }}
                         />
                     </svg>
-                    {/* Center Icon */}
                     <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: '#FFF' }}>
                         <TrendingUp size={18} />
                     </div>
                 </div>
             </div>
 
-            {/* 2. HISTORICAL REFERENCE (The "Why") */}
+            {/* 2. HISTORICAL REFERENCE */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: '3px solid #7C4DFF' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: '#7C4DFF', fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> FRACTAL MATCH
@@ -164,22 +195,25 @@ const SignalCard = ({ chartData = [] }) => {
                 </div>
             </div>
 
-            {/* 3. IMPACT ALERT (News Timer) */}
-            <div style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ef5350', fontSize: '11px', fontWeight: 'bold' }}>
-                        <AlertTriangle size={14} /> NEWS ALERT
+            {/* 3. IMPACT ALERT (Dynamic Visibility) */}
+            {nextNews && (
+                <div style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)', animation: 'pulse 2s infinite' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ef5350', fontSize: '11px', fontWeight: 'bold' }}>
+                            <AlertTriangle size={14} /> NEWS ALERT
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ef5350', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold' }}>
+                            <Clock size={12} /> {newsCountdown}
+                        </div>
                     </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ef5350', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold' }}>
-                        <Clock size={12} /> {newsCountdown}
+                    <div style={{ fontSize: '11px', color: '#ff8a80', marginTop: '4px' }}>
+                        Upcoming: <b>{nextNews.title || nextNews.event || "High Impact News"}</b>
                     </div>
+                    <style>{`@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(239, 83, 80, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0); } }`}</style>
                 </div>
-                <div style={{ fontSize: '11px', color: '#ff8a80', marginTop: '4px' }}>
-                    Upcoming: <b>CPI Data Release</b>
-                </div>
-            </div>
+            )}
 
-            {/* 4. TRADE SETUP GRID (Compact) */}
+            {/* 4. TRADE SETUP GRID */}
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px', marginTop: 'auto' }}>
                 <div style={{ background: 'rgba(0,0,0,0.3)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
                     <div style={{ fontSize: '9px', color: '#9ca3af', marginBottom: '2px' }}>ENTRY</div>
