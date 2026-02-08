@@ -7,37 +7,35 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade.onrender.com';
 
 const ChartComponent = () => {
-  // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
-  const seriesRef = useRef(null);
+  
+  // 1. UPDATED REF NAME FOR SAFETY
+  const candleSeriesRef = useRef(null); 
+  
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
   const timeframeRef = useRef('1h'); 
   
-  // ⚡ DATA STORE
   const allDataRef = useRef([]);
   const isLoadingRef = useRef(false); 
-
-  // ⚡ PERFORMANCE
   const latestCandleRef = useRef(null); 
   const isHistoryLoaded = useRef(false);
 
-  // --- STATE ---
   const [timeframe, setTimeframe] = useState('1h');
   const [prediction, setPrediction] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
   const [isHoveringControls, setIsHoveringControls] = useState(false);
+  
+  // 📰 NEW: News State for Robust Markers
+  const [newsData, setNewsData] = useState([]);
 
-  // --- HELPER: Strict Grid Snapping ---
   const getCandleStartTime = useCallback((timestamp, tf) => {
     let seconds = Number(timestamp);
     if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
-    
-    let resolution = 3600; // 1h
-    if (tf === '4h') resolution = 14400; // 4h
-    
+    let resolution = 3600; 
+    if (tf === '4h') resolution = 14400; 
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
@@ -45,11 +43,10 @@ const ChartComponent = () => {
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
-      if (seriesRef.current && latestCandleRef.current) {
-        seriesRef.current.update(latestCandleRef.current);
+      if (candleSeriesRef.current && latestCandleRef.current) {
+        candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
         
-        // Update Source of Truth
         const lastIdx = allDataRef.current.length - 1;
         if (lastIdx >= 0) {
              const lastItem = allDataRef.current[lastIdx];
@@ -67,43 +64,58 @@ const ChartComponent = () => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- 📰 FETCH NEWS MARKERS (Connected to Cloud) ---
-  const fetchNewsMarkers = async () => {
-      try {
-          console.log("📡 Fetching News from Cloud...");
-          // 🚀 UPDATED: Use Live Cloud Backend
-          const res = await axios.get(`${API_URL}/api/news`, {
-              params: { limit: 100 } // Get last 100 events to be safe
-          });
-          
-          if (!res.data || !Array.isArray(res.data)) return;
-
-          console.log(`✅ Loaded ${res.data.length} News Events`);
-
-          // TRANSFORM: Events -> Red/Orange Flags
-          const markers = res.data.map(news => {
-              const isHigh = news.impact === 'High';
-              
-              return {
-                  time: getCandleStartTime(news.time, timeframeRef.current),
-                  position: 'aboveBar',
-                  color: isHigh ? '#ef5350' : '#ffa726',
-                  shape: 'arrowDown',
-                  text: isHigh ? `🚩 ${news.event}` : '', 
-                  size: isHigh ? 2 : 1,
-              };
-          });
-
-          if (seriesRef.current) {
-              seriesRef.current.setMarkers(markers);
+  // --- 📰 STEP 1: FETCH NEWS DATA (API -> State) ---
+  useEffect(() => {
+      const fetchNews = async () => {
+          try {
+              console.log("📡 Fetching News from Cloud...");
+              const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 50 } });
+              if (Array.isArray(res.data)) {
+                  // Standardize the time field
+                  const formattedData = res.data.map(n => ({...n, time: n.time}));
+                  setNewsData(formattedData);
+              }
+          } catch (err) {
+              console.error("News Fetch Error:", err);
           }
+      };
+      fetchNews();
+  }, []);
 
-      } catch (err) {
-          console.error("News Marker Error:", err);
-      }
-  };
+  // --- 📰 STEP 2: ROBUST MARKER RENDERING (State -> Chart) ---
+  useEffect(() => {
+    // Only run if we have news AND the chart series is ready
+    if (newsData.length > 0 && candleSeriesRef.current) {
+        
+        const markers = newsData
+            .filter(n => n.time) // Ensure time exists
+            .map(n => {
+                const time = getCandleStartTime(n.time, timeframeRef.current);
+                const isHigh = n.impact === 'High';
+                
+                return {
+                    time: time,
+                    position: 'aboveBar',
+                    color: isHigh ? '#ef5350' : '#ffa726',
+                    shape: 'arrowDown',
+                    text: isHigh ? `🚩 ${n.event}` : '', 
+                    size: isHigh ? 2 : 1,
+                };
+            })
+            .sort((a, b) => a.time - b.time); 
 
-  // --- INTERNAL: FETCH OLDER HISTORY (Infinite Scroll) ---
+        try {
+            if (candleSeriesRef.current) {
+                candleSeriesRef.current.setMarkers(markers);
+                console.log(`✅ Pinned ${markers.length} News Flags to the Chart`);
+            }
+        } catch (err) {
+            console.error("❌ Failed to set markers:", err);
+        }
+    }
+  }, [newsData, timeframe, getCandleStartTime]);
+
+  // --- INTERNAL: FETCH OLDER HISTORY ---
   const fetchOlderHistory = async () => {
       if (isLoadingRef.current || !allDataRef.current.length) return;
       
@@ -111,8 +123,7 @@ const ChartComponent = () => {
       const oldestTime = allDataRef.current[0].time; 
       
       try {
-          console.log("⚡ Fetching older history from Cloud...");
-          // 🚀 UPDATED: Use Live Cloud Backend
+          console.log("⚡ Fetching older history...");
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { 
                   limit: 500, 
@@ -130,20 +141,16 @@ const ChartComponent = () => {
             high: parseFloat(item.high), 
             low: parseFloat(item.low), 
             close: parseFloat(item.close)
-          }))
-          .sort((a, b) => a.time - b.time);
+          })).sort((a, b) => a.time - b.time);
 
           const combinedData = [...newOldData, ...allDataRef.current]
               .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
 
           allDataRef.current = combinedData;
-          
-          if (seriesRef.current) {
-              seriesRef.current.setData(combinedData);
-          }
+          if (candleSeriesRef.current) candleSeriesRef.current.setData(combinedData);
 
       } catch (err) {
-          console.error("Infinite Scroll Error:", err);
+          console.error("History Error:", err);
       } finally {
           isLoadingRef.current = false;
       }
@@ -158,24 +165,9 @@ const ChartComponent = () => {
       grid: { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
       width: chartContainerRef.current.clientWidth,
       height: 500,
-      timeScale: { 
-        timeVisible: true, 
-        secondsVisible: false, 
-        rightOffset: 15,
-        barSpacing: 12,
-        minBarSpacing: 5,
-      },
-      rightPriceScale: {
-        scaleMargins: { top: 0.1, bottom: 0.1 },
-        borderVisible: false,
-        autoScale: true,
-        mode: 0,
-      },
-      crosshair: {
-        mode: 1, 
-        vertLine: { labelVisible: true },
-        horzLine: { labelVisible: true, labelBackgroundColor: '#4CAF50' }
-      }
+      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 15, barSpacing: 12, minBarSpacing: 5 },
+      rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 }, borderVisible: false, autoScale: true },
+      crosshair: { mode: 1, vertLine: { labelVisible: true }, horzLine: { labelVisible: true, labelBackgroundColor: '#4CAF50' } }
     });
 
     const newSeries = chart.addSeries(CandlestickSeries, {
@@ -186,13 +178,13 @@ const ChartComponent = () => {
     });
 
     chartRef.current = chart;
-    seriesRef.current = newSeries;
+    
+    // 2. CRITICAL: Save series to the Ref
+    candleSeriesRef.current = newSeries; 
 
     const onVisibleLogicalRangeChanged = (newVisibleLogicalRange) => {
         if (newVisibleLogicalRange === null) return;
-        if (newVisibleLogicalRange.from < 10) {
-            fetchOlderHistory();
-        }
+        if (newVisibleLogicalRange.from < 10) fetchOlderHistory();
     };
 
     chart.timeScale().subscribeVisibleLogicalRangeChange(onVisibleLogicalRangeChanged);
@@ -213,7 +205,7 @@ const ChartComponent = () => {
 
   // --- EFFECT 2: INITIAL LOAD ---
   useEffect(() => {
-    if (!seriesRef.current) return;
+    if (!candleSeriesRef.current) return;
 
     const loadInitialHistory = async () => {
       setIsLoading(true);
@@ -222,8 +214,6 @@ const ChartComponent = () => {
       allDataRef.current = [];
       
       try {
-        console.log("⚡ Fetching initial data from Cloud...");
-        // 🚀 UPDATED: Use Live Cloud Backend
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 500, timestamp: Date.now() }
         });
@@ -239,23 +229,19 @@ const ChartComponent = () => {
         .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i)
         .sort((a, b) => a.time - b.time);
 
-        if (seriesRef.current) {
+        if (candleSeriesRef.current) {
             allDataRef.current = data;
-            seriesRef.current.setData(data);
+            candleSeriesRef.current.setData(data);
 
             if (data.length > 0) {
                 currentBarRef.current = data[data.length - 1];
             }
             
-            // Scroll to end
             chartRef.current.timeScale().scrollToPosition(0, false);
             chartRef.current.priceScale('right').applyOptions({ autoScale: true });
         }
         
         isHistoryLoaded.current = true; 
-        
-        // 📰 Fetch News Markers AFTER history loads
-        fetchNewsMarkers();
 
       } catch (err) {
         console.error("Load Error:", err);
@@ -268,9 +254,8 @@ const ChartComponent = () => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET (Connected to Cloud) ---
+  // --- EFFECT 3: SOCKET ---
   useEffect(() => {
-    // 🚀 UPDATED: Use Live Cloud Backend for Sockets
     const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     socketRef.current = socket;
 
@@ -360,7 +345,6 @@ const ChartComponent = () => {
         onMouseLeave={() => setIsHoveringControls(false)}
     >
       
-      {/* LOADING SPINNER */}
       {isLoading && (
         <div style={{
             position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
@@ -376,7 +360,6 @@ const ChartComponent = () => {
         </div>
       )}
 
-      {/* HEADER */}
       <div style={{ position: 'absolute', top: '15px', left: '15px', right: '15px', zIndex: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(42, 46, 57, 0.8)', padding: '4px 10px', borderRadius: '4px', borderLeft: `3px solid ${getStatusColor()}` }}>
@@ -405,7 +388,6 @@ const ChartComponent = () => {
         </div>
       </div>
 
-      {/* --- GHOST CONTROLS --- */}
       <div style={{
           position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)',
           zIndex: 30, display: 'flex', gap: '8px',
