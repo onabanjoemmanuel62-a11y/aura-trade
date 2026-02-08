@@ -7,7 +7,8 @@ const HistoryTable = () => {
   useEffect(() => {
     const fetchTrades = async () => {
       try {
-        const response = await axios.get('http://localhost:5000/api/trades');
+        // 🚀 UPDATED: Use Live Cloud Backend
+        const response = await axios.get('https://aura-trade.onrender.com/api/trades');
         setTrades(response.data);
       } catch (error) {
         console.error("Error fetching trades:", error);

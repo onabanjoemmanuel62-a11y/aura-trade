@@ -17,7 +17,8 @@ const SignalCard = ({ chartData = [] }) => {
 
     setLoading(true);
     try {
-      const res = await axios.post('http://localhost:5000/api/analyze', {
+      // 🚀 UPDATED: Use Live Cloud Backend
+      const res = await axios.post('https://aura-trade.onrender.com/api/analyze', {
         candles: chartData.slice(-50) 
       });
       if (res.data) {
@@ -33,7 +34,8 @@ const SignalCard = ({ chartData = [] }) => {
   // --- 2. THE FILTER: Find "Sniper" News Only ---
   const fetchDailyNews = async () => {
       try {
-          const res = await axios.get('http://localhost:5000/api/news');
+          // 🚀 UPDATED: Use Live Cloud Backend
+          const res = await axios.get('https://aura-trade.onrender.com/api/news');
           const today = new Date().toDateString(); 
 
           // 🚨 THE SNIPER FILTER 🚨
@@ -41,7 +43,7 @@ const SignalCard = ({ chartData = [] }) => {
               const newsDate = new Date(n.time).toDateString();
               return (
                   newsDate === today &&       // Must be today
-                  n.impact === 'High' &&      // Must be High Impact (Red Folder)
+                  n.impact === 'High' &&      // Must be High Impact
                   n.currency === 'USD' &&     // Must be USD
                   new Date(n.time) > new Date() // Must be in future
               );
@@ -187,7 +189,6 @@ const SignalCard = ({ chartData = [] }) => {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: '#7C4DFF', fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> FRACTAL MATCH
                 </div>
-                {/* 🚀 FIXED: Now uses real API reason */}
                 <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.4' }}>
                     {analysis?.reason ? (
                         analysis.reason 

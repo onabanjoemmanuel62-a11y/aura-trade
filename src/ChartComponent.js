@@ -3,7 +3,7 @@ import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import axios from 'axios';
 import io from 'socket.io-client';
 
-// ☁️ YOUR CLOUD SERVER ADDRESS
+// ☁️ LIVE CLOUD SERVER ADDRESS
 const API_URL = 'https://aura-trade.onrender.com';
 
 const ChartComponent = () => {
@@ -71,7 +71,7 @@ const ChartComponent = () => {
   const fetchNewsMarkers = async () => {
       try {
           console.log("📡 Fetching News from Cloud...");
-          // UPDATE: Using API_URL instead of localhost
+          // 🚀 UPDATED: Use Live Cloud Backend
           const res = await axios.get(`${API_URL}/api/news`, {
               params: { limit: 100 } // Get last 100 events to be safe
           });
@@ -112,6 +112,7 @@ const ChartComponent = () => {
       
       try {
           console.log("⚡ Fetching older history from Cloud...");
+          // 🚀 UPDATED: Use Live Cloud Backend
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { 
                   limit: 500, 
@@ -222,7 +223,7 @@ const ChartComponent = () => {
       
       try {
         console.log("⚡ Fetching initial data from Cloud...");
-        // UPDATE: Fetch 500 candles (approx 20 days) so we can see last week's news
+        // 🚀 UPDATED: Use Live Cloud Backend
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 500, timestamp: Date.now() }
         });
@@ -269,7 +270,7 @@ const ChartComponent = () => {
 
   // --- EFFECT 3: SOCKET (Connected to Cloud) ---
   useEffect(() => {
-    // UPDATE: Connect Socket.io to Cloud
+    // 🚀 UPDATED: Use Live Cloud Backend for Sockets
     const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     socketRef.current = socket;
 
