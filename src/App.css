@@ -51,17 +51,26 @@
     flex-direction: column !important;
     display: flex !important;
     width: 100% !important;
+    height: auto !important; /* Allow container to grow */
   }
 
   /* FULL WIDTH CARDS: Make every box take up the full phone screen */
   .signal-card, 
-  .chart-container, 
   .news-panel,
   .ai-brain-panel {
     width: 100% !important;
     max-width: 100% !important;
     margin-bottom: 20px; /* Add space between stacked items */
     height: auto !important; /* Let height grow naturally */
+  }
+
+  /* ⚡ CHART FIX: FORCE TALL HEIGHT ON MOBILE */
+  .chart-container, .chart-wrapper {
+    width: 100% !important;
+    height: 450px !important;       /* Force fixed height */
+    min-height: 50vh !important;    /* Take up half the screen */
+    margin-bottom: 20px !important; /* Space between chart and AI Brain */
+    display: block !important;
   }
 
   /* TEXT READABILITY: Bump up font sizes for thumb-scrolling */
@@ -71,6 +80,17 @@
 
   h1, h2 {
     font-size: 22px !important; /* Prevent huge headers from breaking layout */
+  }
+
+  /* CHART LABELS: Ensure price text inside chart is readable */
+  .recharts-text {
+    font-size: 12px !important;
+  }
+
+  /* TIMEFRAME BUTTONS: Make them easier to tap */
+  .timeframe-selector button {
+    padding: 10px 15px !important; /* Fatter buttons for thumbs */
+    font-size: 14px !important;
   }
 
   /* TABLE SCROLLING: If you have a trade history table, let it scroll sideways */
