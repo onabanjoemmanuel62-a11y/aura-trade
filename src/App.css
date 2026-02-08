@@ -44,14 +44,26 @@
 /* 1. The Trigger: Apply these rules ONLY for screens smaller than 768px */
 @media screen and (max-width: 768px) {
 
+  /* 🚨 MOBILE SCROLL UNLOCK (Critical Fix) 🚨 */
+  /* This forces the browser to allow scrolling instead of cutting off the screen */
+  html, body, #root, .App {
+    height: auto !important;       
+    min-height: 100vh !important;  /* Grow as tall as the content needs */
+    overflow-y: auto !important;   /* FORCE vertical scrolling */
+    overflow-x: hidden;            /* Block horizontal side-scrolling */
+  }
+
   /* FORCE STACKING: Turn the main dashboard row into a vertical column */
+  /* Added padding-bottom so you can scroll past the last item */
   .dashboard-container, 
   .main-row,
   .top-section {
     flex-direction: column !important;
     display: flex !important;
     width: 100% !important;
-    height: auto !important; /* Allow container to grow */
+    height: auto !important;     /* Allow container to grow */
+    overflow-y: visible !important;
+    padding-bottom: 80px !important; /* Extra space at bottom */
   }
 
   /* FULL WIDTH CARDS: Make every box take up the full phone screen */
