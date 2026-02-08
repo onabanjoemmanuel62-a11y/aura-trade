@@ -1,102 +1,158 @@
-const similarity = require('compute-cosine-similarity');
 const Candle = require('../models/Candle');
+const NewsEvent = require('../models/NewsEvent');
 
-// @desc    Scan history for High-Precision "Twin" patterns
+// CONFIGURATION
+const PATTERN_LENGTH = 8;        // The "DNA" length (Input size)
+const FORECAST_HORIZON = 4;      // Look ahead 4 candles to determine win/loss
+const SIMILARITY_THRESHOLD = 5.0; // Stricter = Lower number. 5.0 is a good balance for % based data.
+
+// ==========================================
+// 🧮 MATH ENGINE: Vector Normalization
+// ==========================================
+// Converts raw prices [2000, 2010, 2005] -> Percentage Moves [0, 0.5, 0.25]
+// This allows matching 2004 patterns (low price) with 2026 patterns (high price).
+const normalizePattern = (prices) => {
+  if (!prices || prices.length === 0) return [];
+  const basePrice = prices[0];
+  // Multiply by 100 to get percentage points (e.g., 1.5%)
+  return prices.map(p => ((p - basePrice) / basePrice) * 100);
+};
+
+// ==========================================
+// 🧮 MATH ENGINE: Euclidean Distance
+// ==========================================
+// Calculates the "Shape Difference" between two patterns.
+// 0 = Identical Shape.
+const calculateDistance = (patternA, patternB) => {
+  if (patternA.length !== patternB.length) return Infinity;
+  let sum = 0;
+  for (let i = 0; i < patternA.length; i++) {
+    sum += Math.pow(patternA[i] - patternB[i], 2);
+  }
+  return Math.sqrt(sum);
+};
+
+// ==========================================
+// 🚀 CONTROLLER: Contextual Pattern Search
+// ==========================================
 // @route   POST /api/analyze/pattern
-// @access  Public
 const analyzePattern = async (req, res) => {
   try {
-    const { timeframe, currentPattern } = req.body; 
+    // Frontend sends: { currentPattern: [4950.5, 4951.2, ...], timeframe: '1h' }
+    const { currentPattern, timeframe } = req.body;
 
     // 1. Validation
     if (!currentPattern || currentPattern.length < 5) {
-      return res.status(400).json({ message: 'Pattern array is too short.' });
+      return res.status(400).json({ message: 'Pattern array is too short (min 5 candles).' });
     }
 
-    // 2. Fetch History (Optimized)
-    // We assume you are now sending '1m' or '1h' as the timeframe
-    const history = await Candle.find({ timeframe: timeframe || '1h' }) 
-      .sort({ time: 1 }) // Oldest -> Newest
-      .select('close open time'); 
-
-    if (history.length < 100) {
-      return res.status(400).json({ message: 'Not enough historical data to scan.' });
-    }
-
+    // 2. Normalize the Input (The "Target" Vector)
+    const targetVector = normalizePattern(currentPattern);
     const patternLength = currentPattern.length;
-    const threshold = 0.90; // Minimum entry requirement (we will filter stricter later)
-    let potentialMatches = [];
 
-    console.log(`🔍 Scanning ${history.length} candles for precision matches...`);
+    // 3. Fetch History (Optimized Field Selection)
+    // We only need 'close' and 'time' for the scan. 
+    // .lean() makes it plain JS objects (faster).
+    const history = await Candle.find({ timeframe: timeframe || '1h' })
+      .sort({ time: 1 }) // Oldest -> Newest
+      .select('close time -_id')
+      .lean();
 
-    // 3. The Sliding Window Scan
-    for (let i = 0; i < history.length - patternLength - 1; i++) {
+    if (history.length < 1000) {
+      return res.status(400).json({ message: 'Not enough historical data to perform Fractal Analysis.' });
+    }
+
+    let matches = [];
+    const historyLimit = history.length - patternLength - FORECAST_HORIZON;
+
+    // 4. The Sliding Window Scan (The Time Machine)
+    // Loop through 20 years of history...
+    for (let i = 0; i < historyLimit; i++) {
       
-      const historicalSlice = history.slice(i, i + patternLength).map(c => c.close);
+      // Extract window
+      const windowCandles = history.slice(i, i + patternLength);
+      const windowPrices = windowCandles.map(c => c.close);
+      
+      // Normalize window to % change
+      const windowVector = normalizePattern(windowPrices);
 
-      // Skip if lengths don't match exactly due to data gaps
-      if (historicalSlice.length !== patternLength) continue;
+      // Compare Shapes (Math)
+      const dist = calculateDistance(targetVector, windowVector);
 
-      // Calculate Similarity
-      const sim = similarity(currentPattern, historicalSlice);
+      // 5. Filter for Matches
+      if (dist < SIMILARITY_THRESHOLD) {
+        
+        // Determine Outcome (Next 4 Candles)
+        const entryPrice = history[i + patternLength - 1].close; // End of pattern
+        const exitPrice = history[i + patternLength + FORECAST_HORIZON - 1].close; // 4 periods later
+        
+        // Did price go UP or DOWN after this shape?
+        const percentChange = ((exitPrice - entryPrice) / entryPrice) * 100;
 
-      // 4. Collect Candidates
-      if (sim >= threshold) {
-        // Look at the "Future" candle (the one immediately after the pattern)
-        const nextCandle = history[i + patternLength];
-        const isUp = nextCandle.close > nextCandle.open;
-
-        potentialMatches.push({
-          similarity: sim,
-          nextCandle: nextCandle,
-          result: isUp ? 'UP' : 'DOWN'
+        matches.push({
+          time: windowCandles[0].time, // Unix Timestamp
+          similarity: dist,
+          outcome: percentChange, // +1.5% or -0.5%
         });
       }
     }
 
-    // 5. The Sniper Filter: Sort & Limit
-    // Sort by Similarity (Highest first)
-    potentialMatches.sort((a, b) => b.similarity - a.similarity);
+    // 6. Sort & Analyze Top Matches
+    // Sort by Similarity (Lowest distance is best)
+    matches.sort((a, b) => a.similarity - b.similarity);
+    
+    // Take Top 20 Twins
+    const topMatches = matches.slice(0, 20); 
 
-    // Keep ONLY the Top 50 "Perfect Twins"
-    // If we have less than 50, we take them all.
-    const bestMatches = potentialMatches.slice(0, 50);
+    let bullishCount = 0;
+    let bearishCount = 0;
 
-    // 6. Calculate Stats on the Elite Set
-    let upCount = 0;
-    let downCount = 0;
+    // 7. Contextual Check (Did news cause this?)
+    // We enrich the Top 5 matches with News Data for the frontend to display
+    const enrichedMatches = await Promise.all(topMatches.slice(0, 5).map(async (m) => {
+      // Check for High Impact news +/- 12 hours of the match
+      const news = await NewsEvent.findOne({
+        time: { $gte: m.time - 43200, $lte: m.time + 43200 },
+        impact: { $regex: /High/i }
+      }).select('event currency impact');
 
-    bestMatches.forEach(match => {
-      if (match.result === 'UP') upCount++;
-      else downCount++;
+      return {
+        ...m,
+        newsContext: news ? `${news.event} (${news.currency})` : null
+      };
+    }));
+
+    // Calculate Stats
+    topMatches.forEach(m => {
+      if (m.outcome > 0) bullishCount++;
+      else bearishCount++;
     });
 
-    const totalElite = bestMatches.length;
+    const total = topMatches.length;
     let probabilityUp = 0;
     let probabilityDown = 0;
     let sentiment = 'NEUTRAL';
 
-    if (totalElite > 0) {
-      probabilityUp = ((upCount / totalElite) * 100).toFixed(1);
-      probabilityDown = ((downCount / totalElite) * 100).toFixed(1);
+    if (total > 0) {
+      probabilityUp = ((bullishCount / total) * 100).toFixed(1);
+      probabilityDown = ((bearishCount / total) * 100).toFixed(1);
 
-      // Define Sentiment
-      if (Number(probabilityUp) > 55) sentiment = 'BULLISH';
-      else if (Number(probabilityDown) > 55) sentiment = 'BEARISH';
+      if (Number(probabilityUp) > 60) sentiment = 'BULLISH';
+      else if (Number(probabilityDown) > 60) sentiment = 'BEARISH';
     }
 
-    // 7. Return Precision Data
+    // 8. Return Analysis
     res.json({
-      matchesFound: totalElite, // Now shows e.g., "50" instead of "124,000"
-      totalScanned: potentialMatches.length, // Optional: Shows how many raw matches existed
+      sentiment,
       probabilityUp: parseFloat(probabilityUp),
       probabilityDown: parseFloat(probabilityDown),
-      sentiment
+      matchesFound: matches.length, // "Found 142 similar patterns in history"
+      topMatches: enrichedMatches   // "Here is what happened the last 5 times"
     });
 
   } catch (error) {
-    console.error("Analysis Error:", error);
-    res.status(500).json({ message: 'Server Error during analysis' });
+    console.error("Fractal Analysis Error:", error);
+    res.status(500).json({ message: 'Analysis Engine Failed' });
   }
 };
 
