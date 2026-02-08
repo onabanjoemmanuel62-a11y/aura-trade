@@ -19,9 +19,6 @@ if (require.main === module) {
 }
 
 const FEED_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.xml';
-// We allow many currencies to ensure we see data
-const TARGET_CURRENCIES = ['USD', 'EUR', 'GBP', 'JPY', 'XAU', 'AUD', 'NZD', 'CAD', 'CHF', 'CNY']; 
-const TARGET_IMPACTS = ['High', 'Medium'];
 
 // 🛡️ Helper: Generate ID
 const generateHashId = (str) => {
@@ -38,8 +35,7 @@ const fetchLiveNews = async () => {
     console.log('📡 Fetching Live ForexFactory Calendar...');
 
     try {
-        // --- 🕵️ FIX: STEALTH MODE ---
-        // We add headers to pretend we are a real Chrome browser.
+        // --- 🕵️ STEALTH MODE ---
         const response = await axios.get(FEED_URL, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -58,18 +54,26 @@ const fetchLiveNews = async () => {
         const events = result.weeklyevents.event;
         const eventList = Array.isArray(events) ? events : [events];
         let count = 0;
+        let skipped = 0;
 
+        // --- 🛡️ THE SMART FILTER STRATEGY ---
         for (const item of eventList) {
-            // A. FILTERING
-            if (!TARGET_CURRENCIES.includes(item.country)) continue;
-            if (!TARGET_IMPACTS.includes(item.impact)) continue;
-
-            // B. ROBUST DATE PARSING
             try {
-                // 1. Split Date
+                // 1. FILTER: USD ONLY (Gold/Crypto is priced in USD)
+                if (item.country !== 'USD') {
+                    skipped++;
+                    continue;
+                }
+
+                // 2. FILTER: IMPACT (High & Medium Only)
+                if (item.impact !== 'High' && item.impact !== 'Medium') {
+                    skipped++;
+                    continue;
+                }
+
+                // --- DATE PARSING LOGIC ---
+                // Format: "MM-DD-YYYY" and "3:30pm"
                 const [monthStr, dayStr, yearStr] = item.date.split('-');
-                
-                // 2. Split Time (Use Regex to separate 3:00 from pm)
                 const timeMatch = item.time.match(/(\d+):(\d+)(am|pm)/i);
                 
                 if (!timeMatch) continue; 
@@ -78,17 +82,26 @@ const fetchLiveNews = async () => {
                 let h = parseInt(hours);
                 let m = parseInt(minutes);
 
-                // 3. Convert to 24-Hour Format
                 if (modifier.toLowerCase() === 'pm' && h < 12) h += 12;
                 if (modifier.toLowerCase() === 'am' && h === 12) h = 0;
 
-                // 4. Construct Date Object
                 const dateObj = new Date(parseInt(yearStr), parseInt(monthStr) - 1, parseInt(dayStr), h, m, 0);
                 const timeInSeconds = Math.floor(dateObj.getTime() / 1000);
 
                 if (isNaN(timeInSeconds)) continue;
 
-                // C. SAVE DATA
+                // 3. FILTER: TIME LOCK (Don't save ancient history)
+                // We keep events from the last 24 hours + all future events
+                // This prevents your DB from filling up with last week's news if the feed drifts
+                const nowSeconds = Math.floor(Date.now() / 1000);
+                const oneDayAgo = nowSeconds - (24 * 60 * 60);
+
+                if (timeInSeconds < oneDayAgo) {
+                    skipped++;
+                    continue;
+                }
+
+                // --- SAVE TO DATABASE ---
                 const uniqueSignature = `${item.country}-${item.title}-${timeInSeconds}`;
                 const syntheticId = generateHashId(uniqueSignature);
                 const parseNum = (val) => (val && val.trim() !== '' ? parseFloat(val) : null);
@@ -116,7 +129,7 @@ const fetchLiveNews = async () => {
             }
         }
 
-        console.log(`✅ Sync Complete. Processed/Updated ${count} events.`);
+        console.log(`✅ Smart Sync Complete. Saved ${count} USD Events. (Filtered out ${skipped} noise)`);
 
     } catch (error) {
         if (error.response && error.response.status === 429) {
