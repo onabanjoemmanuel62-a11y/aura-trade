@@ -36,3 +36,53 @@
     transform: rotate(360deg);
   }
 }
+
+/* =========================================
+   📱 MOBILE RESPONSIVENESS (Aura-Trade)
+   ========================================= */
+
+/* 1. The Trigger: Apply these rules ONLY for screens smaller than 768px */
+@media screen and (max-width: 768px) {
+
+  /* FORCE STACKING: Turn the main dashboard row into a vertical column */
+  .dashboard-container, 
+  .main-row,
+  .top-section {
+    flex-direction: column !important;
+    display: flex !important;
+    width: 100% !important;
+  }
+
+  /* FULL WIDTH CARDS: Make every box take up the full phone screen */
+  .signal-card, 
+  .chart-container, 
+  .news-panel,
+  .ai-brain-panel {
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-bottom: 20px; /* Add space between stacked items */
+    height: auto !important; /* Let height grow naturally */
+  }
+
+  /* TEXT READABILITY: Bump up font sizes for thumb-scrolling */
+  body, p, span, div {
+    font-size: 16px; /* easier to read on mobile */
+  }
+
+  h1, h2 {
+    font-size: 22px !important; /* Prevent huge headers from breaking layout */
+  }
+
+  /* TABLE SCROLLING: If you have a trade history table, let it scroll sideways */
+  .trade-history-table {
+    display: block;
+    overflow-x: auto; /* Adds a scrollbar if the table is too wide */
+    white-space: nowrap;
+  }
+
+  /* HIDE NON-ESSENTIALS: Hide complex decorative elements on mobile to save space */
+  .sidebar-desktop,
+  .decorative-background-shapes {
+    display: none !important;
+  }
+}
