@@ -72,14 +72,13 @@ const ChartComponent = () => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- 📰 STEP 1: FETCH NEWS DATA (API -> State) ---
+  // --- 📰 STEP 1: FETCH NEWS DATA ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
               console.log("📡 Fetching News from Cloud...");
               const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) {
-                  // Standardize the time field
                   const formattedData = res.data.map(n => ({...n, time: n.time}));
                   setNewsData(formattedData);
               }
@@ -90,17 +89,14 @@ const ChartComponent = () => {
       fetchNews();
   }, []);
 
-  // --- 📰 STEP 2: ROBUST MARKER RENDERING (State -> Chart) ---
+  // --- 📰 STEP 2: ROBUST MARKER RENDERING ---
   useEffect(() => {
-    // Only run if we have news AND the chart series object exists
     if (newsData.length > 0 && candleSeriesRef.current) {
-        
         const markers = newsData
-            .filter(n => n.time) // Ensure time exists
+            .filter(n => n.time) 
             .map(n => {
                 const time = getCandleStartTime(n.time, timeframeRef.current);
                 const isHigh = n.impact === 'High';
-                
                 return {
                     time: time,
                     position: 'aboveBar',
@@ -113,7 +109,6 @@ const ChartComponent = () => {
             .sort((a, b) => a.time - b.time); 
 
         try {
-            // 🛑 STRICT SAFETY CHECK: Check if the function actually exists
             if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
                 console.log(`✅ Pinned ${markers.length} News Flags to the Chart`);
@@ -189,8 +184,6 @@ const ChartComponent = () => {
     });
 
     chartRef.current = chart;
-    
-    // 2. CRITICAL: Save series to the Ref
     candleSeriesRef.current = newSeries; 
 
     const onVisibleLogicalRangeChanged = (newVisibleLogicalRange) => {
@@ -266,7 +259,7 @@ const ChartComponent = () => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET (With Smart Auto-Scroll) ---
+  // --- EFFECT 3: SOCKET ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     socketRef.current = socket;
@@ -301,21 +294,14 @@ const ChartComponent = () => {
 
         latestCandleRef.current = updatedCandle;
         
-        // 🧠 SMART AUTO-SCROLL LOGIC 🧠
-        // We only snap to the "live" view if the user is currently looking at the newest candle.
+        // 🧠 SMART AUTO-SCROLL
         if (chartRef.current) {
              const scrollPos = chartRef.current.timeScale().scrollPosition();
-             
-             // Calculate distance from the "Live" edge (0)
-             // Using Math.abs() covers cases where scrollPos might be slightly negative due to history loading
              const distanceToLive = Math.abs(scrollPos);
 
-             // IF distance is small (< 5 bars), it means user is watching live. SNAP IT.
              if (distanceToLive < 5) {
                  chartRef.current.timeScale().scrollToPosition(0, false);
              }
-             // ELSE: User is deep in history (> 5 bars away). DO NOT SNAP. 
-             // The chart will just update the data in the background (via renderLoop).
         }
     });
 
@@ -341,10 +327,14 @@ const ChartComponent = () => {
       isHistoryLoaded.current = false;
   };
 
+  // 🚀 FIXED: HARD SNAP RESET
   const handleReset = () => {
     if (chartRef.current) {
-        chartRef.current.timeScale().scrollToPosition(0, true);
+        // 1. Instant Jump (false = no animation)
+        chartRef.current.timeScale().scrollToPosition(0, false);
+        // 2. Reset Zoom
         chartRef.current.timeScale().applyOptions({ barSpacing: 12 });
+        // 3. Fix Scaling
         chartRef.current.priceScale('right').applyOptions({ autoScale: true });
     }
   };
