@@ -51,7 +51,6 @@ const ChartComponent = () => {
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
-      // Safety Check: Ensure series exists before updating
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
@@ -217,7 +216,6 @@ const ChartComponent = () => {
 
   // --- EFFECT 2: INITIAL LOAD ---
   useEffect(() => {
-    // Wait for the series to be ready
     if (!candleSeriesRef.current) return;
 
     const loadInitialHistory = async () => {
@@ -243,7 +241,6 @@ const ChartComponent = () => {
         .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i)
         .sort((a, b) => a.time - b.time);
 
-        // Safety Check again inside async function
         if (candleSeriesRef.current) {
             allDataRef.current = data;
             candleSeriesRef.current.setData(data);
@@ -269,7 +266,7 @@ const ChartComponent = () => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET ---
+  // --- EFFECT 3: SOCKET (With Smart Auto-Scroll) ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
     socketRef.current = socket;
@@ -304,11 +301,21 @@ const ChartComponent = () => {
 
         latestCandleRef.current = updatedCandle;
         
+        // 🧠 SMART AUTO-SCROLL LOGIC 🧠
+        // We only snap to the "live" view if the user is currently looking at the newest candle.
         if (chartRef.current) {
              const scrollPos = chartRef.current.timeScale().scrollPosition();
-             if (scrollPos < 2) {
+             
+             // Calculate distance from the "Live" edge (0)
+             // Using Math.abs() covers cases where scrollPos might be slightly negative due to history loading
+             const distanceToLive = Math.abs(scrollPos);
+
+             // IF distance is small (< 5 bars), it means user is watching live. SNAP IT.
+             if (distanceToLive < 5) {
                  chartRef.current.timeScale().scrollToPosition(0, false);
              }
+             // ELSE: User is deep in history (> 5 bars away). DO NOT SNAP. 
+             // The chart will just update the data in the background (via renderLoop).
         }
     });
 
