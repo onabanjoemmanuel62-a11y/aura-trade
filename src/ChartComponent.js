@@ -7,35 +7,43 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade.onrender.com';
 
 const ChartComponent = () => {
+  // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   
-  // 1. UPDATED REF NAME FOR SAFETY
+  // 1. SAFE REF NAME
   const candleSeriesRef = useRef(null); 
   
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
   const timeframeRef = useRef('1h'); 
   
+  // ⚡ DATA STORE
   const allDataRef = useRef([]);
   const isLoadingRef = useRef(false); 
+
+  // ⚡ PERFORMANCE
   const latestCandleRef = useRef(null); 
   const isHistoryLoaded = useRef(false);
 
+  // --- STATE ---
   const [timeframe, setTimeframe] = useState('1h');
   const [prediction, setPrediction] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
   const [isHoveringControls, setIsHoveringControls] = useState(false);
   
-  // 📰 NEW: News State for Robust Markers
+  // 📰 News State
   const [newsData, setNewsData] = useState([]);
 
+  // --- HELPER: Strict Grid Snapping ---
   const getCandleStartTime = useCallback((timestamp, tf) => {
     let seconds = Number(timestamp);
     if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
-    let resolution = 3600; 
-    if (tf === '4h') resolution = 14400; 
+    
+    let resolution = 3600; // 1h
+    if (tf === '4h') resolution = 14400; // 4h
+    
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
@@ -43,6 +51,7 @@ const ChartComponent = () => {
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
+      // Safety Check: Ensure series exists before updating
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
@@ -69,7 +78,7 @@ const ChartComponent = () => {
       const fetchNews = async () => {
           try {
               console.log("📡 Fetching News from Cloud...");
-              const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 50 } });
+              const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) {
                   // Standardize the time field
                   const formattedData = res.data.map(n => ({...n, time: n.time}));
@@ -84,7 +93,7 @@ const ChartComponent = () => {
 
   // --- 📰 STEP 2: ROBUST MARKER RENDERING (State -> Chart) ---
   useEffect(() => {
-    // Only run if we have news AND the chart series is ready
+    // Only run if we have news AND the chart series object exists
     if (newsData.length > 0 && candleSeriesRef.current) {
         
         const markers = newsData
@@ -105,9 +114,12 @@ const ChartComponent = () => {
             .sort((a, b) => a.time - b.time); 
 
         try {
-            if (candleSeriesRef.current) {
+            // 🛑 STRICT SAFETY CHECK: Check if the function actually exists
+            if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
                 console.log(`✅ Pinned ${markers.length} News Flags to the Chart`);
+            } else {
+                console.warn("⚠️ Chart Series not fully ready for markers yet.");
             }
         } catch (err) {
             console.error("❌ Failed to set markers:", err);
@@ -205,6 +217,7 @@ const ChartComponent = () => {
 
   // --- EFFECT 2: INITIAL LOAD ---
   useEffect(() => {
+    // Wait for the series to be ready
     if (!candleSeriesRef.current) return;
 
     const loadInitialHistory = async () => {
@@ -214,6 +227,7 @@ const ChartComponent = () => {
       allDataRef.current = [];
       
       try {
+        console.log("⚡ Fetching initial data...");
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 500, timestamp: Date.now() }
         });
@@ -229,6 +243,7 @@ const ChartComponent = () => {
         .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i)
         .sort((a, b) => a.time - b.time);
 
+        // Safety Check again inside async function
         if (candleSeriesRef.current) {
             allDataRef.current = data;
             candleSeriesRef.current.setData(data);
@@ -345,6 +360,7 @@ const ChartComponent = () => {
         onMouseLeave={() => setIsHoveringControls(false)}
     >
       
+      {/* LOADING SPINNER */}
       {isLoading && (
         <div style={{
             position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
@@ -360,6 +376,7 @@ const ChartComponent = () => {
         </div>
       )}
 
+      {/* HEADER */}
       <div style={{ position: 'absolute', top: '15px', left: '15px', right: '15px', zIndex: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(42, 46, 57, 0.8)', padding: '4px 10px', borderRadius: '4px', borderLeft: `3px solid ${getStatusColor()}` }}>
@@ -388,6 +405,7 @@ const ChartComponent = () => {
         </div>
       </div>
 
+      {/* --- GHOST CONTROLS --- */}
       <div style={{
           position: 'absolute', bottom: '20px', left: '50%', transform: 'translateX(-50%)',
           zIndex: 30, display: 'flex', gap: '8px',
