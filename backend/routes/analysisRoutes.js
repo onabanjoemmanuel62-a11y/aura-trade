@@ -147,7 +147,8 @@ const analyzeMarket = async (time, timeframe) => {
             signal,
             confidence: Math.round(bestScore * 100),
             reasoning,
-            ghostPath 
+            ghostPath,
+            keyLevels // 👈 NEW: Sending raw levels to the Chart!
         };
 
     } catch (error) {

@@ -1,12 +1,46 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
+import axios from 'axios'; // We need axios here now!
 import ChartComponent from './ChartComponent';
-import SignalCard from './SignalCard'; // This is now your SMART component
+import SignalCard from './SignalCard';
 import HistoryTable from './HistoryTable';
 import './App.css';
 
+// ☁️ API URL
+const API_URL = 'https://aura-trade.onrender.com';
+
 function App() {
-  // We don't need fetch logic here anymore! 
-  // SignalCard handles the Brain. 🧠
+  // 1. STATE: Lifted up so both Chart and SignalCard can use it
+  const [aiData, setAiData] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // 2. THE BRAIN: Fetch Logic moved here
+  const runAnalysis = async () => {
+    setLoading(true);
+    try {
+      console.log("🧠 App: Ping AI...");
+      // We ask the backend to scan the market
+      const res = await axios.post(`${API_URL}/api/analyze`, {
+        timeframe: '1h',
+        currency: 'USD'
+      });
+      
+      if (res.data) {
+        console.log("🧠 Data Received:", res.data);
+        setAiData(res.data);
+      }
+    } catch (err) {
+      console.error("Analysis Error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 3. AUTOMATION: Run on load and every 60s
+  useEffect(() => {
+    runAnalysis(); // Run immediately
+    const timer = setInterval(runAnalysis, 60000); // Run every minute
+    return () => clearInterval(timer);
+  }, []);
 
   return (
     <div className="dashboard-container" style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden', backgroundColor: '#0b0e11' }}>
@@ -29,13 +63,20 @@ function App() {
           
           {/* Chart Area */}
           <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden' }}>
-            <ChartComponent />
+            {/* 👇 PASSING THE 'EYES' (Key Levels) TO THE CHART */}
+            <ChartComponent 
+               levels={aiData?.keyLevels || []} 
+            />
           </div>
 
           {/* Signal Area */}
           <div className="signal-card" style={{ flex: 0.3 }}>
-             {/* No props needed! It fetches its own data. */}
-            <SignalCard />
+            {/* 👇 PASSING THE 'BRAIN' (Analysis) TO THE CARD */}
+            <SignalCard 
+               externalData={aiData} 
+               onRefresh={runAnalysis} 
+               loading={loading}
+            />
           </div>
 
         </div>
