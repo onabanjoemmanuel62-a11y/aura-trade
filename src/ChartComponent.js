@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
+import { createChart, ColorType, CandlestickSeries, LineSeries } from 'lightweight-charts'; // 1. Added LineSeries
 import axios from 'axios';
 import io from 'socket.io-client';
 
@@ -11,8 +11,8 @@ const ChartComponent = () => {
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
-  const ghostSeriesRef = useRef(null); // 👻 Ref for the Purple Ghost Line
-  const trendlineSeriesRef = useRef(null); // 📉 Ref for Trendlines
+  const ghostSeriesRef = useRef(null); 
+  const trendlineSeriesRef = useRef(null); 
   
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
@@ -40,59 +40,57 @@ const ChartComponent = () => {
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
-  // --- 🔮 NEW: GHOST PATTERN RENDERER ---
+  // --- 🔮 GHOST PATTERN RENDERER (v4 Compatible) ---
   const renderGhostPattern = useCallback((ghostPath) => {
+    // 🛡️ SAFETY: Stop if chart or data is missing
     if (!ghostPath || ghostPath.length === 0 || !currentBarRef.current || !chartRef.current) return;
 
-    // Initialize the ghost series if it doesn't exist
-    if (!ghostSeriesRef.current) {
-        ghostSeriesRef.current = chartRef.current.addLineSeries({
-            color: '#A855F7', // 🔮 AI Purple
-            lineWidth: 2,
-            lineStyle: 2,     // Dashed Line
-            crosshairMarkerVisible: false,
-            lastValueVisible: false,
-            priceLineVisible: false,
-        });
+    try {
+        // Initialize the ghost series if it doesn't exist
+        if (!ghostSeriesRef.current) {
+            // 2. FIXED: Use addSeries(LineSeries, options) instead of addLineSeries
+            ghostSeriesRef.current = chartRef.current.addSeries(LineSeries, {
+                color: '#A855F7', // 🔮 AI Purple
+                lineWidth: 2,
+                lineStyle: 2,     // Dashed Line
+                crosshairMarkerVisible: false,
+                lastValueVisible: false,
+                priceLineVisible: false,
+            });
+        }
+
+        // Scale & Shift Logic
+        const currentPrice = currentBarRef.current.close;
+        const startOfGhost = ghostPath[0];
+        const multiplier = currentPrice / startOfGhost;
+        const lastTime = currentBarRef.current.time;
+        let timeStep = timeframeRef.current === '4h' ? 14400 : 3600;
+
+        const projectedData = ghostPath.map((price, index) => ({
+            time: lastTime + ((index + 1) * timeStep),
+            value: price * multiplier
+        }));
+
+        ghostSeriesRef.current.setData(projectedData);
+    } catch (err) {
+        console.error("👻 Ghost Render Error:", err.message);
     }
-
-    // Scale historical prices to match current live price
-    const currentPrice = currentBarRef.current.close;
-    const startOfGhost = ghostPath[0];
-    const multiplier = currentPrice / startOfGhost;
-
-    // Shift time to project into the future
-    const lastTime = currentBarRef.current.time;
-    let timeStep = timeframeRef.current === '4h' ? 14400 : 3600;
-
-    const projectedData = ghostPath.map((price, index) => ({
-        time: lastTime + ((index + 1) * timeStep),
-        value: price * multiplier
-    }));
-
-    ghostSeriesRef.current.setData(projectedData);
   }, []);
 
-  // --- 📉 NEW: TRENDLINE RENDERER ---
+  // --- 📉 TRENDLINE RENDERER (v4 Compatible) ---
   const renderTrendlines = useCallback((keyLevels) => {
       if (!keyLevels || !chartRef.current) return;
 
-      // Use a LineSeries to draw horizontal support/resistance
       if (!trendlineSeriesRef.current) {
-          trendlineSeriesRef.current = chartRef.current.addLineSeries({
-              color: '#3b82f6', // Blue for levels
+          // 2. FIXED: v4 Syntax here too
+          trendlineSeriesRef.current = chartRef.current.addSeries(LineSeries, {
+              color: '#3b82f6', 
               lineWidth: 1,
-              lineStyle: 3,     // Dotted
+              lineStyle: 3, 
               lastValueVisible: true,
           });
       }
-      
-      // We take the last key level as a primary trendline for now
-      const latestLevel = keyLevels[keyLevels.length - 1];
-      if (latestLevel) {
-          // You can expand this to draw multiple lines if needed
-          console.log("📉 AI Levels detected:", keyLevels);
-      }
+      // Logic to draw lines would go here
   }, []);
 
   // --- ANIMATION LOOP ---
@@ -129,7 +127,7 @@ const ChartComponent = () => {
       grid: { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
       width: chartContainerRef.current.clientWidth,
       height: 500,
-      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 30, barSpacing: 12 },
+      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 50, barSpacing: 12 },
       rightPriceScale: { autoScale: true },
       crosshair: { mode: 1 }
     });
@@ -149,10 +147,11 @@ const ChartComponent = () => {
     return () => {
       window.removeEventListener('resize', handleResize);
       chart.remove();
+      chartRef.current = null; 
     };
   }, []);
 
-  // --- LOAD INITIAL HISTORY ---
+  // --- LOAD HISTORY ---
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
@@ -222,19 +221,17 @@ const ChartComponent = () => {
         latestCandleRef.current = updatedCandle;
     });
 
-    // 🧠 HANDLE AI PREDICTIONS
+    // 🧠 AI PREDICTION LISTENER
     socket.on('prediction-update', (data) => {
-        setPrediction(data);
+        // Anti-Flicker: Only update if signal changes
+        setPrediction(prev => {
+            if (prev && prev.signal === data.signal && prev.confidence === data.confidence) return prev;
+            return data;
+        });
         
-        // 🔮 Draw Ghost Projection
-        if (data.ghostPath) {
-            renderGhostPattern(data.ghostPath);
-        }
-        
-        // 📉 Draw Trendline levels (if available in reasoning or separate key)
-        if (data.reasoning) {
-            // Note: If backend sends explicit 'keyLevels' array, use that instead.
-            // renderTrendlines(data.keyLevels);
+        if (data.ghostPath && data.ghostPath.length > 0) {
+            // Delay slightly to allow chart to be ready
+            setTimeout(() => renderGhostPattern(data.ghostPath), 100);
         }
     });
 
@@ -247,8 +244,12 @@ const ChartComponent = () => {
       setTimeframe(newTf);
       timeframeRef.current = newTf; 
       isHistoryLoaded.current = false;
-      // Clear Ghost Line when changing timeframe
-      if (ghostSeriesRef.current) ghostSeriesRef.current.setData([]);
+      
+      // CLEANUP: Remove ghost series when switching timeframes
+      if (ghostSeriesRef.current && chartRef.current) {
+          chartRef.current.removeSeries(ghostSeriesRef.current);
+          ghostSeriesRef.current = null;
+      }
   };
 
   const handleReset = () => {
