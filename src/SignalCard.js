@@ -17,7 +17,6 @@ const SignalCard = ({ chartData = [] }) => {
 
     setLoading(true);
     try {
-      // 🚀 UPDATED: Use Live Cloud Backend
       const res = await axios.post('https://aura-trade.onrender.com/api/analyze', {
         candles: chartData.slice(-50) 
       });
@@ -34,7 +33,6 @@ const SignalCard = ({ chartData = [] }) => {
   // --- 2. THE FILTER: Find "Sniper" News Only ---
   const fetchDailyNews = async () => {
       try {
-          // 🚀 UPDATED: Use Live Cloud Backend
           const res = await axios.get('https://aura-trade.onrender.com/api/news');
           const today = new Date().toDateString(); 
 
@@ -112,11 +110,14 @@ const SignalCard = ({ chartData = [] }) => {
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (confidence / 100) * circumference;
 
+  // 🔴 VISUAL CUE: Border turns RED if high impact news is coming
+  const cardBorder = nextNews ? '1px solid #ef5350' : '1px solid rgba(255, 255, 255, 0.08)';
+
   return (
     <div style={{
       backgroundColor: 'rgba(21, 25, 32, 0.8)', 
       backdropFilter: 'blur(12px)',
-      border: '1px solid rgba(255, 255, 255, 0.08)',
+      border: cardBorder, // <--- DYNAMIC BORDER
       borderRadius: '16px',
       padding: '20px',
       height: '100%',
@@ -124,7 +125,8 @@ const SignalCard = ({ chartData = [] }) => {
       display: 'flex',
       flexDirection: 'column',
       gap: '16px',
-      boxShadow: '0 4px 20px rgba(0,0,0,0.2)'
+      boxShadow: nextNews ? '0 0 15px rgba(239, 83, 80, 0.2)' : '0 4px 20px rgba(0,0,0,0.2)',
+      transition: 'border 0.3s ease'
     }}>
       
       {/* HEADER */}
@@ -161,7 +163,7 @@ const SignalCard = ({ chartData = [] }) => {
                         {confidence}%
                     </span>
                     <span style={{ fontSize: '10px', color: signalColor, opacity: 0.8, marginTop: '4px' }}>
-                        {analysis?.signal || 'NEUTRAL'}
+                        {confidence > 0 ? (analysis?.signal || 'NEUTRAL') : 'NO SIGNAL'}
                     </span>
                 </div>
                 
@@ -184,21 +186,24 @@ const SignalCard = ({ chartData = [] }) => {
                 </div>
             </div>
 
-            {/* 2. HISTORICAL REFERENCE (Dynamic) */}
+            {/* 2. LOGIC / REASONING (Expanded & Scrollable) */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: '3px solid #7C4DFF' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: '#7C4DFF', fontSize: '11px', fontWeight: 'bold' }}>
-                    <History size={14} /> FRACTAL MATCH
+                    <History size={14} /> STRATEGY LOGIC
                 </div>
-                <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.4' }}>
-                    {analysis?.reason ? (
-                        analysis.reason 
-                    ) : (
-                        "Scanning historical patterns..."
-                    )}
+                <div style={{ 
+                    fontSize: '12px', 
+                    color: '#d1d5db', 
+                    lineHeight: '1.5',
+                    maxHeight: '100px', // Allow text to grow
+                    overflowY: 'auto',  // Scroll if text is huge
+                    whiteSpace: 'pre-wrap' // Preserve formatting
+                }}>
+                    {analysis?.reason ? analysis.reason : "Scanning market structure..."}
                 </div>
             </div>
 
-            {/* 3. IMPACT ALERT (Dynamic Visibility) */}
+            {/* 3. IMPACT ALERT */}
             {nextNews && (
                 <div style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)', animation: 'pulse 2s infinite' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -216,21 +221,37 @@ const SignalCard = ({ chartData = [] }) => {
                 </div>
             )}
 
-            {/* 4. TRADE SETUP GRID */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px', marginTop: 'auto' }}>
-                <div style={{ background: 'rgba(0,0,0,0.3)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
-                    <div style={{ fontSize: '9px', color: '#9ca3af', marginBottom: '2px' }}>ENTRY</div>
-                    <div style={{ fontSize: '12px', fontWeight: 'bold' }}>{analysis?.entry || '--'}</div>
+            {/* 4. TRADE SETUP OR QUIET MODE */}
+            {confidence > 0 ? (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: '8px', marginTop: 'auto' }}>
+                    <div style={{ background: 'rgba(0,0,0,0.3)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
+                        <div style={{ fontSize: '9px', color: '#9ca3af', marginBottom: '2px' }}>ENTRY</div>
+                        <div style={{ fontSize: '12px', fontWeight: 'bold' }}>{analysis?.entry || '--'}</div>
+                    </div>
+                    <div style={{ background: 'rgba(239, 83, 80, 0.15)', padding: '8px', borderRadius: '6px', textAlign: 'center', border: '1px solid rgba(239, 83, 80, 0.3)' }}>
+                        <div style={{ fontSize: '9px', color: '#ef5350', marginBottom: '2px' }}>STOP</div>
+                        <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#ef5350' }}>{analysis?.stopLoss || '--'}</div>
+                    </div>
+                    <div style={{ background: 'rgba(0, 230, 118, 0.15)', padding: '8px', borderRadius: '6px', textAlign: 'center', border: '1px solid rgba(0, 230, 118, 0.3)' }}>
+                        <div style={{ fontSize: '9px', color: '#00e676', marginBottom: '2px' }}>TARGET</div>
+                        <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#00e676' }}>{analysis?.takeProfit || '--'}</div>
+                    </div>
                 </div>
-                <div style={{ background: 'rgba(239, 83, 80, 0.15)', padding: '8px', borderRadius: '6px', textAlign: 'center', border: '1px solid rgba(239, 83, 80, 0.3)' }}>
-                    <div style={{ fontSize: '9px', color: '#ef5350', marginBottom: '2px' }}>STOP</div>
-                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#ef5350' }}>{analysis?.stopLoss || '--'}</div>
+            ) : (
+                // 🛑 0% STATE: QUIET MARKET
+                <div style={{ 
+                    marginTop: 'auto', 
+                    padding: '15px', 
+                    textAlign: 'center', 
+                    border: '1px dashed #374357', 
+                    borderRadius: '8px',
+                    color: '#9ca3af',
+                    fontSize: '12px',
+                    fontStyle: 'italic'
+                }}>
+                    "Market is Quiet. Waiting for Setup..."
                 </div>
-                <div style={{ background: 'rgba(0, 230, 118, 0.15)', padding: '8px', borderRadius: '6px', textAlign: 'center', border: '1px solid rgba(0, 230, 118, 0.3)' }}>
-                    <div style={{ fontSize: '9px', color: '#00e676', marginBottom: '2px' }}>TARGET</div>
-                    <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#00e676' }}>{analysis?.takeProfit || '--'}</div>
-                </div>
-            </div>
+            )}
 
         </>
       )}

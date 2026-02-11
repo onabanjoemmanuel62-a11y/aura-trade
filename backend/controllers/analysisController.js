@@ -6,11 +6,10 @@ const path = require('path');
 // CONFIGURATION
 const PATTERN_LENGTH = 8;        
 const FORECAST_HORIZON = 4;      
-const SIMILARITY_THRESHOLD = 5.0; 
 const NEWS_FILE = path.join(__dirname, '../data/news_cache.json');
 
 // ==========================================
-// 🧠 HELPER 1: CALCULATE TREND (SMA 50)
+// 🧠 HELPER: CALCULATE SMA (Trend)
 // ==========================================
 const calculateSMA = (candles, period) => {
     if (candles.length < period) return null;
@@ -20,7 +19,7 @@ const calculateSMA = (candles, period) => {
 };
 
 // ==========================================
-// 🧠 HELPER 2: DETECT CANDLESTICK PATTERNS
+// 🧠 HELPER: DETECT PATTERNS
 // ==========================================
 const detectPattern = (candles) => {
     const last = candles[candles.length - 1];       
@@ -47,30 +46,96 @@ const detectPattern = (candles) => {
         return { type: 'Hammer / Pinbar', bias: 'BUY', strength: 75 };
     }
 
-    // 4. Shooting Star
-    if (wick > body * 2 && tail < body * 0.5) {
-        return { type: 'Shooting Star', bias: 'SELL', strength: 75 };
-    }
-
     return { type: 'No Clear Pattern', bias: 'NEUTRAL', strength: 0 };
 };
 
 // ==========================================
-// 🧠 HELPER 3: FRACTAL MATH (Vector Norm)
+// 🕵️ NEW ENGINE: NEWS IMPACT ANALYZER (70% STRATEGY)
 // ==========================================
-const normalizePattern = (prices) => {
-  if (!prices || prices.length === 0) return [];
-  const basePrice = prices[0];
-  return prices.map(p => ((p - basePrice) / basePrice) * 100);
-};
+// Checks history to see how price reacted to this specific event name in the past.
+const analyzeNewsImpact = async () => {
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        const twoHoursLater = now + 7200;
 
-const calculateDistance = (patternA, patternB) => {
-  if (patternA.length !== patternB.length) return Infinity;
-  let sum = 0;
-  for (let i = 0; i < patternA.length; i++) {
-    sum += Math.pow(patternA[i] - patternB[i], 2);
-  }
-  return Math.sqrt(sum);
+        // 1. Identify Upcoming News (Next 2 Hours)
+        const upcomingNews = await NewsEvent.findOne({
+            time: { $gt: now, $lt: twoHoursLater },
+            currency: 'USD',
+            impact: { $regex: /High/i } // 'High Impact Expected' or 'High'
+        }).sort({ time: 1 });
+
+        if (!upcomingNews) return null; // No news, continue with technicals
+
+        console.log(`⚠️ Upcoming High Impact News Detected: ${upcomingNews.event}`);
+
+        // 2. Search History (2018-2025)
+        // Find all past instances of "CPI", "NFP", etc.
+        const pastEvents = await NewsEvent.find({
+            event: upcomingNews.event,
+            time: { $lt: now },
+            currency: 'USD'
+        })
+        .sort({ time: -1 })
+        .limit(50) // Analyze last 50 occurrences
+        .select('time event actual forecast');
+
+        if (pastEvents.length < 5) return null; // Not enough data to be sure
+
+        // 3. Correlate with Price (The Backtest)
+        let upCount = 0;
+        let downCount = 0;
+        let validSamples = 0;
+
+        for (const event of pastEvents) {
+            // Find the 1H candle that started at (or around) the news time
+            // We round down to the nearest hour to match candle timestamps
+            const candleTime = event.time - (event.time % 3600);
+
+            const candle = await Candle.findOne({ time: candleTime, timeframe: '1h' });
+
+            if (candle) {
+                validSamples++;
+                // Did price close higher than it opened during the news hour?
+                if (candle.close > candle.open) upCount++;
+                else downCount++;
+            }
+        }
+
+        if (validSamples < 5) return null;
+
+        // 4. Calculate Win Rate
+        const winRateUp = (upCount / validSamples) * 100;
+        const winRateDown = (downCount / validSamples) * 100;
+        let signal = 'NEUTRAL';
+        let confidence = 0;
+
+        // 5. Generate Signal (Only if > 70%)
+        if (winRateUp >= 70) {
+            signal = 'BUY';
+            confidence = winRateUp;
+        } else if (winRateDown >= 70) {
+            signal = 'SELL';
+            confidence = winRateDown;
+        } else {
+            // If historical reaction is mixed (e.g. 50/50), it's dangerous -> WAIT
+            signal = 'WAIT'; 
+            confidence = 50; 
+        }
+
+        return {
+            type: 'HISTORICAL_NEWS_BIAS',
+            eventName: upcomingNews.event,
+            signal: signal,
+            probability: confidence,
+            reason: `In ${validSamples} past '${upcomingNews.event}' events, Price dropped ${downCount} times and rose ${upCount} times.`,
+            isOverride: true // Tells the controller to ignore technicals
+        };
+
+    } catch (err) {
+        console.error("News Impact Analysis Error:", err);
+        return null;
+    }
 };
 
 // ==========================================
@@ -80,21 +145,44 @@ exports.analyzePattern = async (req, res) => {
     try {
         const { currentPattern, timeframe } = req.body;
 
-        // 1. FETCH DATA (Need 60 candles for SMA)
+        // STEP 1: RUN NEWS IMPACT ANALYZER FIRST
+        // If there is a clear historical bias for upcoming news, we execute that strategy.
+        const newsStrategy = await analyzeNewsImpact();
+
+        if (newsStrategy && newsStrategy.signal !== 'NEUTRAL' && newsStrategy.signal !== 'WAIT') {
+            return res.json({
+                signal: newsStrategy.signal,
+                confidence: newsStrategy.probability,
+                pattern: 'News Event Bias',
+                trend: 'News Driven',
+                reason: newsStrategy.reason,
+                newsContext: `⚠️ Upcoming: ${newsStrategy.eventName}`
+            });
+        }
+        
+        // If News Strategy says WAIT (mixed history), we pause trading.
+        if (newsStrategy && newsStrategy.signal === 'WAIT') {
+            return res.json({
+                signal: 'NEUTRAL',
+                confidence: 0,
+                pattern: 'News Uncertainty',
+                trend: 'Volatile',
+                reason: newsStrategy.reason + " (Market is unpredictable during this event)",
+                newsContext: `⚠️ Upcoming: ${newsStrategy.eventName}`
+            });
+        }
+
+        // STEP 2: IF NO NEWS, RUN TECHNICAL ANALYSIS
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
                                     .sort({ time: -1 })
                                     .limit(60);
         
         if (rawCandles.length < 50) {
-            return res.json({ sentiment: 'NEUTRAL', reason: 'Not enough data for SMA.' });
+            return res.json({ signal: 'NEUTRAL', reason: 'Not enough data.' });
         }
 
-        // Correct Order: Oldest -> Newest
-        const candles = rawCandles.reverse(); 
+        const candles = rawCandles.reverse(); // Oldest -> Newest
 
-        // -----------------------------------------
-        // A. TECHNICAL ANALYSIS LAYER
-        // -----------------------------------------
         const analysis = detectPattern(candles);
         const sma50 = calculateSMA(candles, 50);
         const currentPrice = candles[candles.length - 1].close;
@@ -114,71 +202,14 @@ exports.analyzePattern = async (req, res) => {
             analysis.reason = "Market is ranging. No technical setup.";
         }
 
-        // -----------------------------------------
-        // B. FRACTAL ANALYSIS LAYER (The Time Machine)
-        // -----------------------------------------
-        let fractalSentiment = 'NEUTRAL';
-        let matches = [];
-        
-        // Only run fractal search if we have a pattern from frontend
-        if (currentPattern && currentPattern.length >= 5) {
-             // ... (Fractal Logic Here - kept lightweight for speed)
-             // For now, we will assume the frontend sends the pattern to scan
-             // Or we can use the 'candles' we just fetched from DB
-             const recentPrices = candles.slice(-8).map(c => c.close); // Last 8 candles
-             const targetVector = normalizePattern(recentPrices);
-
-             // Quick scan of the 60 loaded candles (or load more if needed)
-             // In a real app, you'd scan the whole DB here, but let's keep it fast
-             // We return "Not Scanned" for now to save processing power on this route
-             fractalSentiment = 'UNSCANNED';
-        }
-
-        // -----------------------------------------
-        // C. NEWS SAFETY SWITCH (The Red Button)
-        // -----------------------------------------
-        // 1. Check File Cache first (Fastest)
-        let dangerNews = null;
-        if (fs.existsSync(NEWS_FILE)) {
-            const newsData = JSON.parse(fs.readFileSync(NEWS_FILE, 'utf8'));
-            const now = Date.now();
-            dangerNews = newsData.find(n => {
-                const eventTime = new Date(n.time * 1000).getTime(); // Ensure seconds to ms
-                return eventTime > now && eventTime < (now + 7200000); // Next 2 hours
-            });
-        }
-        
-        // 2. Check DB if File Cache misses (Backup)
-        if (!dangerNews) {
-            const nowSec = Math.floor(Date.now() / 1000);
-            const dbNews = await NewsEvent.findOne({
-                time: { $gte: nowSec, $lte: nowSec + 7200 },
-                impact: { $regex: /High/i },
-                currency: 'USD'
-            });
-            if (dbNews) dangerNews = { event: dbNews.event, currency: dbNews.currency };
-        }
-
-        // 3. EXECUTE KILL SWITCH
-        if (dangerNews) {
-            analysis.strength = 0;
-            analysis.bias = 'NEUTRAL';
-            analysis.reason = `⚠️ HALT: High Impact News Incoming (${dangerNews.event || dangerNews.title})`;
-        }
-
-        // -----------------------------------------
-        // D. FINAL RESPONSE
-        // -----------------------------------------
+        // Final Technical Response
         res.json({
             signal: analysis.bias,
-            confidence: analysis.strength, // 0 - 100
+            confidence: analysis.strength,
             pattern: analysis.type,
             trend: trend,
             reason: analysis.reason,
-            // Keep the fractal data structure so frontend doesn't break
-            probabilityUp: 0, 
-            probabilityDown: 0,
-            matchesFound: 0 
+            newsContext: "No major upcoming news."
         });
 
     } catch (error) {
