@@ -1,133 +1,143 @@
 const express = require('express');
 const router = express.Router();
 const Candle = require('../models/Candle');
-const NewsEvent = require('../models/NewsEvent');
-const { calculateNewsBias } = require('../utils/newsLogic');
 
-// @desc    Analyze market and generate a trade signal
-// @route   POST /api/analyze
+// ==========================================
+// 🧠 HELPER: COSINE SIMILARITY (The "Eye")
+// ==========================================
+// Compares two arrays of numbers to see how similar they look (0 to 1)
+const calculateSimilarity = (patternA, patternB) => {
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < patternA.length; i++) {
+        dotProduct += patternA[i] * patternB[i];
+        normA += patternA[i] ** 2;
+        normB += patternB[i] ** 2;
+    }
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+};
+
+// ==========================================
+// 📉 HELPER: ZIGZAG TRENDLINES (The "Pen")
+// ==========================================
+const findTrendlines = (candles) => {
+    let swings = [];
+    // Simple Swing Detection (Pivot Points)
+    for(let i=2; i<candles.length-2; i++) {
+        const c = candles[i];
+        const prev = candles[i-1];
+        const next = candles[i+1];
+
+        // Swing High
+        if(c.high > prev.high && c.high > next.high) {
+            swings.push({ time: c.time, price: c.high, type: 'RESISTANCE' });
+        }
+        // Swing Low
+        else if(c.low < prev.low && c.low < next.low) {
+            swings.push({ time: c.time, price: c.low, type: 'SUPPORT' });
+        }
+    }
+    return swings.slice(-4); // Return last 4 key levels
+};
+
+// ==========================================
+// 🧠 CORE LOGIC: THE ANALYZER
+// ==========================================
+// We export this function so server.js can use it automatically
+const analyzeMarket = async (time, timeframe) => {
+    try {
+        // 1. GET LIVE PATTERN (Last 50 Candles)
+        const liveCandles = await Candle.find({ timeframe }).sort({ time: -1 }).limit(50);
+        
+        if (liveCandles.length < 50) return { signal: "WAIT", reasoning: ["Not enough data to analyze"] };
+
+        // Normalize Live Data (Scale 0 to 1)
+        const closes = liveCandles.map(c => c.close).reverse();
+        const min = Math.min(...closes);
+        const max = Math.max(...closes);
+        const normalizedLive = closes.map(p => (p - min) / (max - min));
+
+        // 2. SCAN HISTORY (The "Time Travel")
+        // ⚠️ OPTIMIZATION: We scan a random sample of 2000 candles to keep the server fast.
+        const historySample = await Candle.aggregate([
+            { $match: { timeframe: timeframe, time: { $lt: time - 86400 } } }, // Older than 24h
+            { $sample: { size: 2000 } }, 
+            { $sort: { time: 1 } }
+        ]);
+
+        let bestMatch = null;
+        let bestScore = -1;
+
+        // Sliding Window Search
+        for (let i = 0; i < historySample.length - 70; i++) {
+            const segment = historySample.slice(i, i + 50);
+            const segmentCloses = segment.map(c => c.close);
+            
+            // Normalize Segment
+            const sMin = Math.min(...segmentCloses);
+            const sMax = Math.max(...segmentCloses);
+            const normalizedSegment = segmentCloses.map(p => (p - sMin) / (sMax - sMin));
+
+            // Compare
+            const score = calculateSimilarity(normalizedLive, normalizedSegment);
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestMatch = { segment, index: i, time: segment[0].time };
+            }
+        }
+
+        // 3. EXTRACT GHOST PATH (The Future)
+        let ghostPath = [];
+        let signal = 'WAIT';
+        let reasoning = [];
+        let nextMovePrediction = 0;
+
+        if (bestMatch && bestScore > 0.80) {
+            // Grab the 20 candles that happened AFTER the match
+            const futureSegment = historySample.slice(bestMatch.index + 50, bestMatch.index + 70);
+            ghostPath = futureSegment.map(c => c.close);
+
+            // Calculate Return
+            const entry = bestMatch.segment[49].close;
+            const exit = futureSegment[futureSegment.length - 1].close;
+            nextMovePrediction = (exit - entry) / entry;
+
+            reasoning.push(`Found ${(bestScore*100).toFixed(0)}% Match in History (${new Date(bestMatch.time * 1000).getFullYear()})`);
+
+            if (nextMovePrediction > 0.001) {
+                signal = 'BUY';
+                reasoning.push("Historical Pattern resolved BULLISH");
+            } else if (nextMovePrediction < -0.001) {
+                signal = 'SELL';
+                reasoning.push("Historical Pattern resolved BEARISH");
+            }
+        } else {
+            reasoning.push("Market is in a Unique Phase (No historical match found)");
+        }
+
+        // 4. TRENDLINES
+        const keyLevels = findTrendlines(liveCandles);
+        reasoning.push(`Key Levels: ${keyLevels.map(l => l.price).join(', ')}`);
+
+        return {
+            signal,
+            confidence: Math.round(bestScore * 100),
+            reasoning,
+            ghostPath // <--- THE DATA FOR THE PURPLE LINE
+        };
+
+    } catch (error) {
+        console.error("AI Error:", error);
+        return { signal: "ERROR", reasoning: ["AI Brain Malfunction"] };
+    }
+};
+
+// @route POST /api/analyze (Manual Trigger)
 router.post('/', async (req, res) => {
-  try {
-    const { time, currentPrice } = req.body;
-
-    if (!time || !currentPrice) {
-      return res.status(400).json({ message: "Please provide 'time' and 'currentPrice'" });
-    }
-
-    // 1. Initialize strictly as an Array
-    let reasoning = [];
-    let patternSignal = 'NEUTRAL';
-    let newsSignal = 'NEUTRAL';
-
-    // ==========================================
-    // 🧠 1. PATTERN RECOGNITION (The Technicals)
-    // ==========================================
-    const recentCandles = await Candle.find({ 
-      time: { $lte: time }, 
-      timeframe: '1h' 
-    })
-    .sort({ time: -1 })
-    .limit(3);
-
-    if (recentCandles.length === 3) {
-      const [c1, c2, c3] = recentCandles;
-
-      // Bearish Pattern
-      if (c1.close < c1.open && c2.close < c2.open && c3.close < c3.open) {
-        patternSignal = 'BEARISH';
-        reasoning.push("Technical: Three Black Crows pattern detected");
-      }
-      // Bullish Pattern
-      else if (c1.close > c1.open && c2.close > c2.open && c3.close > c3.open) {
-        patternSignal = 'BULLISH';
-        reasoning.push("Technical: Three White Soldiers pattern detected");
-      }
-    }
-
-    // ==========================================
-    // 📰 2. SENTIMENT ANALYSIS (The Fundamentals)
-    // ==========================================
-    const oneDayAgo = time - (24 * 60 * 60);
-    
-    // Sort Newest First so we get the latest news
-    const recentNews = await NewsEvent.find({
-      time: { $gte: oneDayAgo, $lte: time },
-      currency: 'USD',
-      impact: 'High Impact Expected'
-    }).sort({ time: -1 });
-
-    // ... inside your route ...
-if (recentNews.length > 0) {
-  const lastEvent = recentNews[0];
-
-  // ONE LINE TO RULE THEM ALL:
-  const newsAction = calculateNewsBias(lastEvent, 'XAUUSD'); // Returns 'SELL', 'BUY', or 'NEUTRAL'
-
-  if (newsAction === 'SELL') {
-    newsSignal = 'BEARISH';
-    reasoning.push(`Fundamental: Strong USD News (${lastEvent.event}: ${lastEvent.actual} > ${lastEvent.forecast})`);
-  } else if (newsAction === 'BUY') {
-    newsSignal = 'BULLISH';
-    reasoning.push(`Fundamental: Weak USD News (${lastEvent.event}: ${lastEvent.actual} < ${lastEvent.forecast})`);
-  }
-}
-
-    // ==========================================
-    // ⚖️ 3. THE DECISION ENGINE (The Brain)
-    // ==========================================
-    let finalSignal = 'WAIT'; // Default
-    let confidence = 50;      // Default
-
-    // Logic Matrix
-    if (newsSignal === 'BEARISH' && patternSignal === 'BEARISH') {
-      finalSignal = 'STRONG SELL';
-      confidence = 87;
-    } 
-    else if (newsSignal === 'BULLISH' && patternSignal === 'BULLISH') {
-      finalSignal = 'STRONG BUY';
-      confidence = 92;
-    }
-    else if (newsSignal === 'BEARISH') {
-      finalSignal = 'SELL';
-      confidence = 65;
-    }
-    else if (newsSignal === 'BULLISH') {
-      finalSignal = 'BUY';
-      confidence = 65;
-    }
-
-    // SAFETY CHECK: If no reasons exist, add a default message
-    // This prevents the frontend from crashing or showing an empty box
-    if (reasoning.length === 0) {
-      reasoning.push("Market is choppy. No clear patterns or recent news.");
-    }
-
-    // Calculate Targets
-    let entry = currentPrice;
-    let stopLoss = 0;
-    let takeProfit = 0;
-
-    if (finalSignal.includes('BUY')) {
-      stopLoss = currentPrice * 0.995; 
-      takeProfit = currentPrice * 1.015; 
-    } else if (finalSignal.includes('SELL')) {
-      stopLoss = currentPrice * 1.005;
-      takeProfit = currentPrice * 0.985;
-    }
-
-    res.json({
-      signal: finalSignal,
-      confidence,
-      entry,
-      stopLoss: parseFloat(stopLoss.toFixed(2)),
-      takeProfit: parseFloat(takeProfit.toFixed(2)),
-      reasoning // This is GUARANTEED to be an Array of Strings now
-    });
-
-  } catch (error) {
-    console.error("Analysis Error:", error);
-    res.status(500).json({ message: "Analysis Failed" });
-  }
+    const result = await analyzeMarket(req.body.time, req.body.timeframe || '1h');
+    res.json(result);
 });
 
-module.exports = router;
+module.exports = { router, analyzeMarket };
