@@ -8,7 +8,7 @@ const dns = require('dns');
 const connectDB = require('./config/db');
 const cron = require('node-cron');
 const fetchLiveNews = require('./scripts/fetchLiveNews');
-const axios = require('axios'); // <--- NEW: Import Axios for self-ping
+const axios = require('axios'); 
 
 // 1. IMPORT THE MODEL
 const Candle = require('./models/Candle');
@@ -16,7 +16,7 @@ const Candle = require('./models/Candle');
 // 2. IMPORT ROUTES
 const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
-const analysisRoutes = require('./routes/analysisRoutes');
+const analysisRoutes = require('./routes/analysisRoutes'); // ⚠️ This imports the object { router, analyzeMarket }
 const newsRoutes = require('./routes/newsRoutes');
 
 // ISP Bypass: DNS Setup
@@ -50,10 +50,13 @@ const PORT = process.env.PORT || 5000;
 // 3. REGISTER ROUTES
 app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
-app.use('/api/analyze', analysisRoutes);
+
+// ✅ FIX: Use .router here because we exported an object { router, analyzeMarket }
+app.use('/api/analyze', analysisRoutes.router); 
+
 app.use('/api/news', newsRoutes);
 
-// <--- NEW: Health Check Route (Lightweight response for the pinger)
+// Health Check Route
 app.get('/healthcheck', (req, res) => res.status(200).send('OK'));
 
 app.get('/', (req, res) => res.send('API is Running'));
@@ -80,15 +83,19 @@ cron.schedule('0 */6 * * *', () => {
 // 🛡️ HELPER: WEEKEND DETECTOR
 // ==========================================
 const isMarketClosed = (timestampInSeconds) => {
-  const date = new Date(timestampInSeconds * 1000);
-  const day = date.getUTCDay();   
-  const hour = date.getUTCHours(); 
-
-  if (day === 6) return true; 
-  if (day === 5 && hour >= 22) return true; 
-  if (day === 0 && hour < 22) return true; 
-
-  return false; 
+    // Basic Weekend Check (Not perfect for all markets, but good for crypto/forex standard breaks)
+    const date = new Date(timestampInSeconds * 1000);
+    const day = date.getUTCDay(); // 0 = Sunday, 6 = Saturday
+    const hour = date.getUTCHours(); 
+  
+    // Closed Saturday
+    if (day === 6) return true; 
+    // Closing Friday Night (after 10PM UTC)
+    if (day === 5 && hour >= 22) return true; 
+    // Opening Sunday Night (before 10PM UTC)
+    if (day === 0 && hour < 22) return true; 
+  
+    return false; 
 };
 
 // ==========================================
@@ -104,21 +111,24 @@ const getBucketTime = (timestamp, timeframe) => {
 // 🛡️ CORE LOGIC: HANDLE NEW TICK
 // ==========================================
 const handleNewTick = async (data) => {
+  // We need to pass data to update DB
   try {
     const price = data.close;
     const weekendFlag = isMarketClosed(data.time);
     const targetTimeframes = ['1h', '4h'];
 
+    // Update DB
     const updatePromises = targetTimeframes.map(async (tf) => {
       const bucketTime = getBucketTime(data.time, tf);
       const query = { time: bucketTime, timeframe: tf };
 
+      // Standard High/Low/Close Logic
       const update = {
         $max: { high: data.high },
         $min: { low: data.low },
         $set: { 
           close: data.close,
-          isWeekend: weekendFlag
+          isWeekend: weekendFlag // Mark weekend candles
         },
         $setOnInsert: { 
           open: data.open, 
@@ -128,17 +138,15 @@ const handleNewTick = async (data) => {
       };
 
       await Candle.findOneAndUpdate(query, update, { upsert: true, new: true });
-      
-      if (tf === '1h') {
-        console.log(`💾 [1H UPDATE] Bucket: ${bucketTime} | Price: ${price}`);
-      }
     });
 
     await Promise.all(updatePromises);
 
+    // Notify Frontend
+    io.emit('price-update', data);
+
   } catch (err) {
     console.error("❌ DB SAVE FAILED: ", err.message);
-    throw err; 
   }
 };
 
@@ -157,6 +165,8 @@ let failureCount = 0;
 let binanceWs = null;
 
 const connectBinanceStream = () => {
+  // Rotate endpoints if needed
+  if (currentEndpointIndex >= BINANCE_ENDPOINTS.length) currentEndpointIndex = 0;
   const currentUrl = BINANCE_ENDPOINTS[currentEndpointIndex];
   
   try {
@@ -170,9 +180,9 @@ const connectBinanceStream = () => {
       failureCount = 0;
     });
 
-    binanceWs.on('message', async (data) => {
+    binanceWs.on('message', async (raw) => {
       try {
-        const json = JSON.parse(data);
+        const json = JSON.parse(raw);
         const k = json.k;
         const timeInSeconds = Math.floor(k.t / 1000);
 
@@ -184,13 +194,11 @@ const connectBinanceStream = () => {
           close: parseFloat(k.c),
         };
 
+        // Process Data
         await handleNewTick(candlePayload);
-        io.emit('price-update', candlePayload);
 
       } catch (err) {
-        if (err.message && !err.message.includes('DB SAVE FAILED')) {
-             // silence non-critical errors
-        }
+         // Silent fail for JSON parse errors
       }
     });
 
@@ -211,18 +219,17 @@ const connectBinanceStream = () => {
 
 const handleDisconnection = () => {
   failureCount++;
+  // Retry same endpoint 3 times before switching
   if (failureCount < 3) {
       console.log(`⏳ Retrying same endpoint in 3s... (${failureCount}/3)`);
       setTimeout(connectBinanceStream, 3000);
       return;
   }
+  
+  // Switch Endpoint
   console.log(`🚫 Endpoint ${BINANCE_ENDPOINTS[currentEndpointIndex]} seems blocked.`);
   currentEndpointIndex++;
-  if (currentEndpointIndex >= BINANCE_ENDPOINTS.length) {
-    console.log('🔁 Exhausted all endpoints. Restarting list from top...');
-    currentEndpointIndex = 0;
-  }
-  console.log(`🔀 Switching to fallback: ${BINANCE_ENDPOINTS[currentEndpointIndex]}`);
+  console.log(`🔀 Switching to fallback...`);
   failureCount = 0;
   setTimeout(connectBinanceStream, 2000);
 };
@@ -232,7 +239,6 @@ connectBinanceStream();
 // ==========================================
 // 💓 KEEP ALIVE PING (For Render Free Tier)
 // ==========================================
-// <--- NEW: This prevents the server from sleeping
 if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://aura-trade.onrender.com';
   
