@@ -130,7 +130,7 @@ const SignalCard = ({ chartData = [] }) => {
   };
 
   const signalColor = getSignalColor(analysis?.signal);
-  const confidence = analysis?.confidence || 0;
+  const confidence = Math.max(0, analysis?.confidence || 0);
   
   // SVG Gauge Math
   const radius = 36;
