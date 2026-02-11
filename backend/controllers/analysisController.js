@@ -3,11 +3,6 @@ const NewsEvent = require('../models/NewsEvent');
 const fs = require('fs');
 const path = require('path');
 
-// CONFIGURATION
-const PATTERN_LENGTH = 8;        
-const FORECAST_HORIZON = 4;      
-const NEWS_FILE = path.join(__dirname, '../data/news_cache.json');
-
 // ==========================================
 // 🧠 HELPER: CALCULATE SMA (Trend)
 // ==========================================
@@ -50,91 +45,87 @@ const detectPattern = (candles) => {
 };
 
 // ==========================================
-// 🕵️ NEW ENGINE: NEWS IMPACT ANALYZER (70% STRATEGY)
+// 🕵️ REAL ENGINE: NEWS IMPACT ANALYZER (PHASE 2)
 // ==========================================
-const analyzeNewsImpact = async () => {
+const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
-        const now = Math.floor(Date.now() / 1000);
-        const twoHoursLater = now + 7200;
+        if (!targetEvent) return null; // No event selected by user
 
-        // ----------------------------------------------------
-        // 🚨 SIMULATION MODE: FAKE NEWS EVENT INJECTED
-        // ----------------------------------------------------
-        console.log("⚠️ SIMULATION: Injecting Fake CPI Event...");
-        const upcomingNews = {
-            event: 'CPI', // We use 'CPI' because we know it exists in history
-            time: now + 1800, // Happening in 30 mins
-            currency: 'USD',
-            impact: 'High Impact Expected'
-        };
-        // ----------------------------------------------------
+        console.log(`🔎 Scouting History for: ${targetEvent} (${targetCurrency})...`);
 
-        console.log(`⚠️ Upcoming High Impact News Detected: ${upcomingNews.event}`);
-
-        // 2. Search History (2018-2025)
-        // Find all past instances of "CPI" to see how Gold reacted
+        // 1. Search History (Real Database Query)
+        // Find past instances where we have actual data AND a forecast
         const pastEvents = await NewsEvent.find({
-            event: { $regex: /CPI/i }, // Loose match for 'CPI'
-            time: { $lt: now },
-            currency: 'USD'
+            event: targetEvent,
+            currency: targetCurrency,
+            actual: { $ne: null },
+            forecast: { $ne: null }
         })
-        .sort({ time: -1 })
-        .limit(50) 
-        .select('time event actual forecast');
+        .sort({ time: -1 }) // Newest first
+        .limit(50); // Analyze last 50 matches
 
-        console.log(`📜 Found ${pastEvents.length} past ${upcomingNews.event} events.`);
+        if (pastEvents.length < 3) {
+            console.log("⚠️ Not enough historical data for this event.");
+            return null;
+        }
 
-        if (pastEvents.length < 5) return null; 
+        let logicalMoves = 0; // Times the market obeyed the news
+        let fakeouts = 0;     // Times the market did the opposite
+        let totalValid = 0;
 
-        // 3. Correlate with Price (The Backtest)
-        let upCount = 0;
-        let downCount = 0;
-        let validSamples = 0;
+        // 2. The Replay Loop
+        for (const news of pastEvents) {
+            
+            // Calculate Deviation (Did news surprise the market?)
+            // If Actual > Forecast, Deviation is Positive
+            const deviation = news.actual - news.forecast;
+            
+            if (deviation === 0) continue; // Skip events with no surprise
 
-        for (const event of pastEvents) {
-            // Find the 1H candle that started at the news time
-            const candleTime = event.time - (event.time % 3600);
+            // Find the 1H candle that started at or near the news time
+            // We align to the start of the hour to match candle timestamps
+            const candleTime = news.time - (news.time % 3600); 
+            
             const candle = await Candle.findOne({ time: candleTime, timeframe: '1h' });
 
-            if (candle) {
-                validSamples++;
-                // Did price close higher than it opened?
-                if (candle.close > candle.open) upCount++;
-                else downCount++;
+            if (!candle) continue; // No candle data for that specific day
+
+            totalValid++;
+
+            const marketMove = candle.close - candle.open;
+            const isMarketGreen = marketMove > 0;
+            const isNewsPositive = deviation > 0;
+
+            // 3. The VAR Check (Win/Loss Logic)
+            // Rule: Positive News should mean Green Candle (Standard Logic)
+            // Note: For XAUUSD, this might need inversion later.
+            
+            if ((isNewsPositive && isMarketGreen) || (!isNewsPositive && !isMarketGreen)) {
+                logicalMoves++; // WIN: Market moved in direction of news
+            } else {
+                fakeouts++;     // LOSS: Market ignored news
             }
         }
 
-        console.log(`📊 Backtest Result: ${upCount} UP vs ${downCount} DOWN`);
+        if (totalValid === 0) return null;
 
-        if (validSamples < 5) return null;
-
-        // 4. Calculate Win Rate
-        const winRateUp = (upCount / validSamples) * 100;
-        const winRateDown = (downCount / validSamples) * 100;
+        // 4. Calculate Real Win Rate
+        const winRate = (logicalMoves / totalValid) * 100;
+        
         let signal = 'NEUTRAL';
-        let confidence = 0;
-
-        // 5. Generate Signal
-        if (winRateUp >= 60) { // Lowered threshold slightly for test visibility
-            signal = 'BUY';
-            confidence = winRateUp;
-        } else if (winRateDown >= 60) {
-            signal = 'SELL';
-            confidence = winRateDown;
-        } else {
-            signal = 'WAIT'; 
-            confidence = 50; 
-        }
+        if (winRate > 65) signal = 'FOLLOW_NEWS'; // High reliability
+        if (winRate < 35) signal = 'INVERSE_NEWS'; // Market usually does the opposite!
 
         return {
-            signal: signal,
-            probability: confidence,
-            reason: `Based on ${validSamples} past CPI events: Price dropped ${downCount} times and rose ${upCount} times.`,
-            eventName: upcomingNews.event
+            signal: signal === 'FOLLOW_NEWS' ? 'HIGH RELIABILITY' : 'CAUTION',
+            probability: Math.round(winRate),
+            reason: `Analyzed ${totalValid} past events. The market followed the news logic ${Math.round(winRate)}% of the time.`,
+            eventName: targetEvent,
+            stats: { wins: logicalMoves, losses: fakeouts }
         };
 
     } catch (err) {
-        console.error("News Impact Analysis Error:", err);
+        console.error("❌ News Analysis Error:", err);
         return null;
     }
 };
@@ -144,38 +135,50 @@ const analyzeNewsImpact = async () => {
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
-        const { currentPattern, timeframe } = req.body;
+        // Now accepting eventName and currency from Frontend
+        const { currentPattern, timeframe, eventName, currency } = req.body;
 
-        // STEP 1: RUN NEWS IMPACT ANALYZER FIRST
-        const newsStrategy = await analyzeNewsImpact();
+        // ----------------------------------------------------
+        // STEP 1: RUN REAL HISTORICAL ANALYSIS (If Event Selected)
+        // ----------------------------------------------------
+        let newsStrategy = null;
+        if (eventName) {
+            newsStrategy = await analyzeNewsImpact(eventName, currency || 'USD');
+        }
 
-        if (newsStrategy && newsStrategy.signal !== 'NEUTRAL') {
+        // If we found a strong news correlation, return that immediately
+        if (newsStrategy && newsStrategy.probability > 60) {
             return res.json({
-                signal: newsStrategy.signal,
+                signal: newsStrategy.probability > 60 ? 'STRONG CORRELATION' : 'WEAK',
                 confidence: newsStrategy.probability,
                 pattern: 'Historical News Bias',
                 trend: 'News Driven',
                 reason: newsStrategy.reason,
-                newsContext: `⚠️ Upcoming: ${newsStrategy.eventName}`
+                newsContext: `Stats: ${newsStrategy.stats.wins} Wins / ${newsStrategy.stats.losses} Losses`
             });
         }
 
-        // STEP 2: TECHNICAL ANALYSIS (Fallback)
+        // ----------------------------------------------------
+        // STEP 2: TECHNICAL ANALYSIS (The Fallback)
+        // ----------------------------------------------------
+        // This runs if there is no news event OR if the news correlation is weak
+        
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
-                                    .sort({ time: -1 })
-                                    .limit(60);
+                                        .sort({ time: -1 })
+                                        .limit(60);
         
         if (rawCandles.length < 50) {
-            return res.json({ signal: 'NEUTRAL', reason: 'Not enough data.' });
+            return res.json({ signal: 'NEUTRAL', reason: 'Not enough candle data.' });
         }
 
-        const candles = rawCandles.reverse(); 
+        const candles = rawCandles.reverse(); // Need oldest -> newest for calcs
 
         const analysis = detectPattern(candles);
         const sma50 = calculateSMA(candles, 50);
         const currentPrice = candles[candles.length - 1].close;
         const trend = currentPrice > sma50 ? 'UP' : 'DOWN';
 
+        // Boost score if Pattern matches Trend
         if (analysis.bias === 'BUY' && trend === 'UP') {
             analysis.strength += 10; 
             analysis.reason = `Strong ${analysis.type} in Uptrend`;
@@ -186,7 +189,7 @@ exports.analyzePattern = async (req, res) => {
             analysis.strength -= 20; 
             analysis.reason = `Weak ${analysis.type} (Counter-trend)`;
         } else {
-            analysis.reason = "Market is ranging. No technical setup.";
+            analysis.reason = "Market is ranging. No clear technical setup.";
         }
 
         res.json({
@@ -195,7 +198,7 @@ exports.analyzePattern = async (req, res) => {
             pattern: analysis.type,
             trend: trend,
             reason: analysis.reason,
-            newsContext: "No major upcoming news."
+            newsContext: "Technical Analysis Only (No News Event Selected)"
         });
 
     } catch (error) {
