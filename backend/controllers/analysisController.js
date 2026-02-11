@@ -1,125 +1,61 @@
 const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
-const fs = require('fs');
-const path = require('path');
+const TI = require('technicalindicators'); // 🧠 The New Brain Cell
 
 // ==========================================
-// 🧠 HELPER: CALCULATE SMA (Trend)
-// ==========================================
-const calculateSMA = (candles, period) => {
-    if (candles.length < period) return null;
-    const slice = candles.slice(candles.length - period);
-    const sum = slice.reduce((acc, c) => acc + c.close, 0);
-    return sum / period;
-};
-
-// ==========================================
-// 🧠 HELPER: DETECT PATTERNS
-// ==========================================
-const detectPattern = (candles) => {
-    const last = candles[candles.length - 1];       
-    const prev = candles[candles.length - 2];       
-
-    // 1. Bullish Engulfing
-    if (prev.close < prev.open && last.close > last.open && 
-        last.close > prev.open && last.open < prev.close) {
-        return { type: 'Bullish Engulfing', bias: 'BUY', strength: 80 };
-    }
-
-    // 2. Bearish Engulfing
-    if (prev.close > prev.open && last.close < last.open && 
-        last.close < prev.open && last.open > prev.close) {
-        return { type: 'Bearish Engulfing', bias: 'SELL', strength: 80 };
-    }
-
-    // 3. Hammer
-    const body = Math.abs(last.close - last.open);
-    const wick = last.high - Math.max(last.close, last.open);
-    const tail = Math.min(last.close, last.open) - last.low;
-    
-    if (tail > body * 2 && wick < body * 0.5) {
-        return { type: 'Hammer / Pinbar', bias: 'BUY', strength: 75 };
-    }
-
-    return { type: 'No Clear Pattern', bias: 'NEUTRAL', strength: 0 };
-};
-
-// ==========================================
-// 🕵️ REAL ENGINE: NEWS IMPACT ANALYZER (PHASE 2)
+// 🕵️ NEWS ANALYZER (Keep this - it works!)
 // ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
-        if (!targetEvent) return null; // No event selected by user
+        if (!targetEvent) return null;
 
         console.log(`🔎 Scouting History for: ${targetEvent} (${targetCurrency})...`);
 
-        // 1. Search History (Real Database Query)
-        // Find past instances where we have actual data AND a forecast
         const pastEvents = await NewsEvent.find({
             event: targetEvent,
             currency: targetCurrency,
             actual: { $ne: null },
             forecast: { $ne: null }
-        })
-        .sort({ time: -1 }) // Newest first
-        .limit(50); // Analyze last 50 matches
+        }).sort({ time: -1 }).limit(50);
 
-        if (pastEvents.length < 3) {
-            console.log("⚠️ Not enough historical data for this event.");
-            return null;
-        }
+        if (pastEvents.length < 3) return null;
 
-        let logicalMoves = 0; // Times the market obeyed the news
-        let fakeouts = 0;     // Times the market did the opposite
+        let logicalMoves = 0;
+        let fakeouts = 0;
         let totalValid = 0;
 
-        // 2. The Replay Loop
         for (const news of pastEvents) {
-            
-            // Calculate Deviation (Did news surprise the market?)
-            // If Actual > Forecast, Deviation is Positive
             const deviation = news.actual - news.forecast;
-            
-            if (deviation === 0) continue; // Skip events with no surprise
+            if (deviation === 0) continue;
 
-            // Find the 1H candle that started at or near the news time
-            // We align to the start of the hour to match candle timestamps
-            const candleTime = news.time - (news.time % 3600); 
-            
+            const candleTime = news.time - (news.time % 3600);
             const candle = await Candle.findOne({ time: candleTime, timeframe: '1h' });
 
-            if (!candle) continue; // No candle data for that specific day
+            if (!candle) continue;
 
             totalValid++;
-
             const marketMove = candle.close - candle.open;
             const isMarketGreen = marketMove > 0;
             const isNewsPositive = deviation > 0;
 
-            // 3. The VAR Check (Win/Loss Logic)
-            // Rule: Positive News should mean Green Candle (Standard Logic)
-            // Note: For XAUUSD, this might need inversion later.
-            
             if ((isNewsPositive && isMarketGreen) || (!isNewsPositive && !isMarketGreen)) {
-                logicalMoves++; // WIN: Market moved in direction of news
+                logicalMoves++;
             } else {
-                fakeouts++;     // LOSS: Market ignored news
+                fakeouts++;
             }
         }
 
         if (totalValid === 0) return null;
 
-        // 4. Calculate Real Win Rate
         const winRate = (logicalMoves / totalValid) * 100;
-        
         let signal = 'NEUTRAL';
-        if (winRate > 65) signal = 'FOLLOW_NEWS'; // High reliability
-        if (winRate < 35) signal = 'INVERSE_NEWS'; // Market usually does the opposite!
+        if (winRate > 65) signal = 'FOLLOW_NEWS';
+        if (winRate < 35) signal = 'INVERSE_NEWS';
 
         return {
             signal: signal === 'FOLLOW_NEWS' ? 'HIGH RELIABILITY' : 'CAUTION',
             probability: Math.round(winRate),
-            reason: `Analyzed ${totalValid} past events. The market followed the news logic ${Math.round(winRate)}% of the time.`,
+            reason: `Analyzed ${totalValid} past events.\nMarket followed news logic ${Math.round(winRate)}% of the time.`,
             eventName: targetEvent,
             stats: { wins: logicalMoves, losses: fakeouts }
         };
@@ -131,74 +67,154 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 };
 
 // ==========================================
+// 🧠 PATTERN RECOGNITION ENGINE
+// ==========================================
+const detectAdvancedPatterns = (opens, highs, lows, closes) => {
+    let signals = [];
+
+    // 1. FOREX STRUCTURES (M & W Patterns)
+    const doubleTop = TI.doubletop({ input: { highs, lows, close: closes, period: 20 } });
+    const doubleBottom = TI.doublebottom({ input: { highs, lows, close: closes, period: 20 } });
+    
+    if (doubleTop) signals.push({ name: 'Double Top (M-Pattern)', type: 'BEARISH', strength: 85 });
+    if (doubleBottom) signals.push({ name: 'Double Bottom (W-Pattern)', type: 'BULLISH', strength: 85 });
+
+    // 2. HEAD AND SHOULDERS
+    const hs = TI.headandshoulders({ input: { highs, lows, close: closes, period: 30 } });
+    const invHs = TI.inverseheadandshoulders({ input: { highs, lows, close: closes, period: 30 } });
+    
+    if (hs) signals.push({ name: 'Head & Shoulders', type: 'BEARISH', strength: 90 });
+    if (invHs) signals.push({ name: 'Inv. Head & Shoulders', type: 'BULLISH', strength: 90 });
+
+    // 3. CANDLESTICK PATTERNS (The "Micro" View)
+    // We analyze the last 5 candles for immediate signals
+    const last5Open = opens.slice(-5);
+    const last5High = highs.slice(-5);
+    const last5Low = lows.slice(-5);
+    const last5Close = closes.slice(-5);
+    const input = { open: last5Open, high: last5High, low: last5Low, close: last5Close };
+
+    if (TI.bullishengulfingpattern(input)) signals.push({ name: 'Bullish Engulfing', type: 'BULLISH', strength: 70 });
+    if (TI.bearishengulfingpattern(input)) signals.push({ name: 'Bearish Engulfing', type: 'BEARISH', strength: 70 });
+    if (TI.hammerpattern(input)) signals.push({ name: 'Hammer (Rejection)', type: 'BULLISH', strength: 65 });
+    if (TI.shootingstarpattern(input)) signals.push({ name: 'Shooting Star', type: 'BEARISH', strength: 65 });
+
+    return signals;
+};
+
+// ==========================================
 // 🚀 MAIN CONTROLLER
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
-        // Now accepting eventName and currency from Frontend
-        const { currentPattern, timeframe, eventName, currency } = req.body;
+        const { timeframe, eventName, currency } = req.body;
 
-        // ----------------------------------------------------
-        // STEP 1: RUN REAL HISTORICAL ANALYSIS (If Event Selected)
-        // ----------------------------------------------------
-        let newsStrategy = null;
+        // ------------------------------------
+        // PATH A: NEWS EVENT ANALYSIS
+        // ------------------------------------
         if (eventName) {
-            newsStrategy = await analyzeNewsImpact(eventName, currency || 'USD');
+            const newsStrategy = await analyzeNewsImpact(eventName, currency || 'USD');
+            if (newsStrategy && newsStrategy.probability > 60) {
+                return res.json({
+                    signal: newsStrategy.probability > 60 ? 'STRONG CORRELATION' : 'WEAK',
+                    confidence: newsStrategy.probability,
+                    pattern: 'Historical News Bias',
+                    trend: 'News Driven',
+                    reason: newsStrategy.reason,
+                    newsContext: `Stats: ${newsStrategy.stats.wins} Wins / ${newsStrategy.stats.losses} Losses`
+                });
+            }
         }
 
-        // If we found a strong news correlation, return that immediately
-        if (newsStrategy && newsStrategy.probability > 60) {
-            return res.json({
-                signal: newsStrategy.probability > 60 ? 'STRONG CORRELATION' : 'WEAK',
-                confidence: newsStrategy.probability,
-                pattern: 'Historical News Bias',
-                trend: 'News Driven',
-                reason: newsStrategy.reason,
-                newsContext: `Stats: ${newsStrategy.stats.wins} Wins / ${newsStrategy.stats.losses} Losses`
-            });
-        }
-
-        // ----------------------------------------------------
-        // STEP 2: TECHNICAL ANALYSIS (The Fallback)
-        // ----------------------------------------------------
-        // This runs if there is no news event OR if the news correlation is weak
+        // ------------------------------------
+        // PATH B: TECHNICAL ANALYSIS (Fallback)
+        // ------------------------------------
         
+        // 1. GET DATA (Need 100+ candles for indicators to work)
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
                                         .sort({ time: -1 })
-                                        .limit(60);
-        
+                                        .limit(150);
+
         if (rawCandles.length < 50) {
-            return res.json({ signal: 'NEUTRAL', reason: 'Not enough candle data.' });
+            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: 'Not enough data.' });
         }
 
-        const candles = rawCandles.reverse(); // Need oldest -> newest for calcs
+        // 2. PREPARE DATA (Reverse to Oldest -> Newest)
+        const candles = rawCandles.reverse();
+        const opens = candles.map(c => c.open);
+        const highs = candles.map(c => c.high);
+        const lows = candles.map(c => c.low);
+        const closes = candles.map(c => c.close);
 
-        const analysis = detectPattern(candles);
-        const sma50 = calculateSMA(candles, 50);
-        const currentPrice = candles[candles.length - 1].close;
-        const trend = currentPrice > sma50 ? 'UP' : 'DOWN';
+        // 3. INDICATORS
+        // Trend (EMA)
+        const ema50 = TI.EMA.calculate({ period: 50, values: closes });
+        const ema200 = TI.EMA.calculate({ period: 200, values: closes });
+        
+        const lastEma50 = ema50[ema50.length - 1];
+        const lastEma200 = ema200[ema200.length - 1];
+        let trend = lastEma50 > lastEma200 ? 'UPTREND' : 'DOWNTREND';
 
-        // Boost score if Pattern matches Trend
-        if (analysis.bias === 'BUY' && trend === 'UP') {
-            analysis.strength += 10; 
-            analysis.reason = `Strong ${analysis.type} in Uptrend`;
-        } else if (analysis.bias === 'SELL' && trend === 'DOWN') {
-            analysis.strength += 10;
-            analysis.reason = `Strong ${analysis.type} in Downtrend`;
-        } else if (analysis.bias !== 'NEUTRAL') {
-            analysis.strength -= 20; 
-            analysis.reason = `Weak ${analysis.type} (Counter-trend)`;
+        // Momentum (RSI)
+        const rsiArray = TI.RSI.calculate({ period: 14, values: closes });
+        const lastRsi = rsiArray[rsiArray.length - 1];
+
+        // 4. PATTERN RECOGNITION
+        const patterns = detectAdvancedPatterns(opens, highs, lows, closes);
+
+        // 5. CALCULATE SCORE
+        let confidence = 0;
+        let reasoning = [];
+        let finalSignal = 'NEUTRAL';
+
+        // A. Trend Score
+        if (trend === 'UPTREND') {
+            confidence += 30;
+            reasoning.push("📈 Market Structure: Uptrend (EMA 50 > 200)");
         } else {
-            analysis.reason = "Market is ranging. No clear technical setup.";
+            confidence += 30;
+            reasoning.push("📉 Market Structure: Downtrend (EMA 50 < 200)");
         }
+
+        // B. RSI Score
+        if (lastRsi > 70) {
+            confidence -= 10; 
+            reasoning.push("⚠️ RSI Overbought (>70). Risk of reversal.");
+        } else if (lastRsi < 30) {
+            confidence -= 10;
+            reasoning.push("⚠️ RSI Oversold (<30). Risk of reversal.");
+        } else {
+            reasoning.push(`ℹ️ RSI is Neutral (${lastRsi.toFixed(1)})`);
+        }
+
+        // C. Pattern Score
+        if (patterns.length > 0) {
+            const bestPattern = patterns[patterns.length - 1]; // Most recent pattern
+            reasoning.push(`✨ Pattern Detected: ${bestPattern.name}`);
+            
+            if (bestPattern.type === 'BULLISH') {
+                if (trend === 'UPTREND') confidence += bestPattern.strength; // Pattern matches Trend
+                else confidence += (bestPattern.strength / 2); // Counter-trend trade
+                finalSignal = 'BUY';
+            } else {
+                if (trend === 'DOWNTREND') confidence += bestPattern.strength;
+                else confidence += (bestPattern.strength / 2);
+                finalSignal = 'SELL';
+            }
+        } else {
+            reasoning.push("No clear chart patterns detected.");
+        }
+
+        // Cap Confidence
+        confidence = Math.min(98, Math.max(0, confidence));
+        if (confidence < 45) finalSignal = 'NEUTRAL';
 
         res.json({
-            signal: analysis.bias,
-            confidence: analysis.strength,
-            pattern: analysis.type,
+            signal: finalSignal,
+            confidence: Math.round(confidence),
             trend: trend,
-            reason: analysis.reason,
-            newsContext: "Technical Analysis Only (No News Event Selected)"
+            reason: reasoning.join('\n'), // Send as multi-line text
+            pattern: patterns.length > 0 ? patterns[patterns.length - 1].name : 'None'
         });
 
     } catch (error) {
