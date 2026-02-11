@@ -5,7 +5,7 @@ import axios from 'axios';
 // ☁️ LIVE SERVER ADDRESS
 const API_URL = 'https://aura-trade.onrender.com';
 
-const SignalCard = ({ chartData = [] }) => {
+const SignalCard = () => {
   // --- STATE ---
   const [analysis, setAnalysis] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -14,19 +14,16 @@ const SignalCard = ({ chartData = [] }) => {
   const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
-  // --- 1. THE BRAIN: Fetch Analysis (Phase 2 Connected) ---
+  // --- 1. THE BRAIN: Fetch Analysis ---
   const fetchAnalysis = async (newsEvent = null) => {
     setLoading(true);
     try {
       console.log("🧠 AI Brain: Requesting Analysis...");
       
-      // Determine what to ask the backend
-      // If we found 'High Impact News' (newsEvent), we tell the backend to analyze IT.
-      // Otherwise, we just ask for standard technical analysis.
       const payload = {
         timeframe: '1h',
         currency: 'USD',
-        eventName: newsEvent ? newsEvent.event : null // <--- KEY: Triggers Historical Analysis
+        eventName: newsEvent ? newsEvent.event : null 
       };
 
       const res = await axios.post(`${API_URL}/api/analyze`, payload);
@@ -49,10 +46,9 @@ const SignalCard = ({ chartData = [] }) => {
           const today = new Date().toDateString(); 
 
           // 🚨 THE SNIPER FILTER 🚨
-          // Find the most critical UPCOMING event for today
           const criticalEvent = res.data.find(n => {
-              const newsDate = new Date(n.time * 1000).toDateString(); // Ensure n.time is handled correctly (sec vs ms)
-              const eventTime = new Date(n.time * 1000); // MongoDB usually stores seconds
+              const newsDate = new Date(n.time * 1000).toDateString();
+              const eventTime = new Date(n.time * 1000);
               const isFuture = eventTime > new Date();
               
               return (
@@ -66,11 +62,9 @@ const SignalCard = ({ chartData = [] }) => {
           if (criticalEvent) {
             console.log("🚨 Sniper Alert:", criticalEvent.event);
             setNextNews(criticalEvent);
-            // If we found news, immediately run analysis on it!
             fetchAnalysis(criticalEvent); 
           } else {
             setNextNews(null);
-            // If no news, run standard analysis
             fetchAnalysis(null);
           }
 
@@ -83,7 +77,6 @@ const SignalCard = ({ chartData = [] }) => {
   useEffect(() => {
     if (!nextNews) return;
 
-    // Handle timestamp conversion (Seconds vs Milliseconds)
     const eventTime = nextNews.time > 2000000000 ? nextNews.time : nextNews.time * 1000;
     const targetDate = new Date(eventTime);
     
@@ -94,7 +87,7 @@ const SignalCard = ({ chartData = [] }) => {
       if (diff <= 0) {
         setNextNews(null); 
         setNewsCountdown("");
-        fetchAnalysis(null); // Re-run analysis now that news passed
+        fetchAnalysis(null); 
         return;
       }
 
@@ -110,15 +103,10 @@ const SignalCard = ({ chartData = [] }) => {
 
   // --- TRIGGERS ---
   useEffect(() => {
-      // On Mount: Check News -> Then Check Analysis
       fetchDailyNews();
-      
-      const interval = setInterval(() => { 
-          fetchDailyNews(); 
-      }, 60000); // Re-check every minute
-      
+      const interval = setInterval(fetchDailyNews, 60000); 
       return () => clearInterval(interval);
-  }, []); // Run once on mount
+  }, []); 
 
   // --- HELPERS ---
   const getSignalColor = (signal) => {
@@ -137,14 +125,13 @@ const SignalCard = ({ chartData = [] }) => {
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (confidence / 100) * circumference;
 
-  // 🔴 VISUAL CUE: Border turns RED if high impact news is coming
   const cardBorder = nextNews ? '1px solid #ef5350' : '1px solid rgba(255, 255, 255, 0.08)';
 
   return (
     <div style={{
       backgroundColor: 'rgba(21, 25, 32, 0.8)', 
       backdropFilter: 'blur(12px)',
-      border: cardBorder, // <--- DYNAMIC BORDER
+      border: cardBorder, 
       borderRadius: '16px',
       padding: '20px',
       height: '100%',
@@ -213,7 +200,7 @@ const SignalCard = ({ chartData = [] }) => {
                 </div>
             </div>
 
-            {/* 2. LOGIC / REASONING (Expanded & Scrollable) */}
+            {/* 2. LOGIC / REASONING (Fixed Array Display) */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: `3px solid ${signalColor}` }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: signalColor, fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> STRATEGY LOGIC
@@ -222,11 +209,15 @@ const SignalCard = ({ chartData = [] }) => {
                     fontSize: '12px', 
                     color: '#d1d5db', 
                     lineHeight: '1.5',
-                    maxHeight: '100px', // Allow text to grow
-                    overflowY: 'auto',  // Scroll if text is huge
-                    whiteSpace: 'pre-wrap' // Preserve formatting
+                    maxHeight: '100px', 
+                    overflowY: 'auto', 
+                    whiteSpace: 'pre-wrap' 
                 }}>
-                    {analysis?.reason ? analysis.reason : "Scanning market structure..."}
+                    {/* 👇 THIS IS THE FIX: Handle Array or String */}
+                    {analysis?.reasoning && Array.isArray(analysis.reasoning) 
+                        ? analysis.reasoning.join('\n') 
+                        : (analysis?.reason || "Scanning market structure...")
+                    }
                 </div>
             </div>
 
@@ -251,16 +242,16 @@ const SignalCard = ({ chartData = [] }) => {
             {/* 4. CONTEXT / TREND */}
             {confidence > 0 && analysis.trend && (
                 <div style={{ display: 'flex', gap: '8px', marginTop: 'auto' }}>
-                     <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
-                         <div style={{ fontSize: '9px', color: '#9ca3af' }}>MARKET BIAS</div>
-                         <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff' }}>{analysis.trend}</div>
-                     </div>
-                     {analysis.pattern && (
+                      <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
+                          <div style={{ fontSize: '9px', color: '#9ca3af' }}>MARKET BIAS</div>
+                          <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff' }}>{analysis.trend}</div>
+                      </div>
+                      {analysis.pattern && (
                         <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
                             <div style={{ fontSize: '9px', color: '#9ca3af' }}>PATTERN</div>
                             <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff' }}>{analysis.pattern}</div>
                         </div>
-                     )}
+                      )}
                 </div>
             )}
 
@@ -286,4 +277,4 @@ const SignalCard = ({ chartData = [] }) => {
   );
 };
 
-export default SignalCard;  
+export default SignalCard;
