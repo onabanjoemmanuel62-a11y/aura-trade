@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
+// ⚠️ CRITICAL UPDATE: Use your NEW Render Monolith URL here
+const API_URL = 'https://aura-trade-v1.onrender.com';
+
 const HistoryTable = () => {
   const [trades, setTrades] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -8,7 +11,8 @@ const HistoryTable = () => {
   useEffect(() => {
     const fetchTrades = async () => {
       try {
-        const response = await axios.get('https://aura-trade.onrender.com/api/trades');
+        // ✅ UPDATED: Use the variable instead of hardcoding
+        const response = await axios.get(`${API_URL}/api/trades`);
         setTrades(response.data);
       } catch (error) {
         console.error("Error fetching trades:", error);
@@ -31,15 +35,17 @@ const HistoryTable = () => {
 
   // --- STYLES ---
   const styles = {
+    // ... (Your styles remain exactly the same) ...
+    // I am omitting them here to save space, but DO NOT delete them from your file!
     container: {
       width: '100%',
-      backgroundColor: '#131722', // Dark background matching your screenshot
+      backgroundColor: '#131722', 
       borderRadius: '8px',
       border: '1px solid #2a2e39',
       padding: '20px',
       marginTop: '20px',
       boxShadow: '0 4px 6px rgba(0, 0, 0, 0.3)',
-      overflowX: 'auto' // Handle scrolling on small screens
+      overflowX: 'auto' 
     },
     headerText: {
       color: '#d1d5db',
@@ -55,19 +61,18 @@ const HistoryTable = () => {
       textAlign: 'left'
     },
     th: {
-      color: '#6b7280', // Gray header text
+      color: '#6b7280', 
       textTransform: 'uppercase',
       fontSize: '12px',
       fontWeight: '600',
-      padding: '12px 16px', // PADDING: Prevents squishing
+      padding: '12px 16px', 
       borderBottom: '1px solid #2a2e39'
     },
     td: {
-      padding: '16px', // PADDING: This is the key fix for spacing
-      color: '#d1d5db', // Default text color
+      padding: '16px', 
+      color: '#d1d5db', 
       borderBottom: '1px solid #2a2e39'
     },
-    // Status Badges
     badgeWin: {
       backgroundColor: 'rgba(16, 185, 129, 0.1)',
       color: '#34d399',
@@ -125,33 +130,21 @@ const HistoryTable = () => {
 
               return (
                 <tr key={index} style={{ borderBottom: '1px solid #2a2e39' }}>
-                  
-                  {/* Date: Added whiteSpace nowrap to prevent wrapping */}
                   <td style={{ ...styles.td, whiteSpace: 'nowrap', fontWeight: '500' }}>
                     {formatDate(trade.timestamp)}
                   </td>
-
-                  {/* Pair */}
                   <td style={{ ...styles.td, color: '#9ca3af' }}>
                     {trade.pair}
                   </td>
-
-                  {/* Type */}
                   <td style={{ ...styles.td, color: isBuy ? '#34d399' : '#fb7185', fontWeight: 'bold' }}>
                     {trade.action}
                   </td>
-
-                  {/* Entry */}
                   <td style={styles.td}>
                     {trade.entry}
                   </td>
-
-                  {/* Profit */}
                   <td style={{ ...styles.td, color: trade.profit > 0 ? '#34d399' : '#fb7185', fontWeight: 'bold' }}>
                     {trade.profit > 0 ? '+' : ''}{trade.profit}
                   </td>
-
-                  {/* Status */}
                   <td style={{ ...styles.td, textAlign: 'right' }}>
                     <span style={isWin ? styles.badgeWin : styles.badgeLoss}>
                       {trade.result}
