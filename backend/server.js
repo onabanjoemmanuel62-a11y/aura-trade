@@ -16,7 +16,7 @@ const Candle = require('./models/Candle');
 // 2. IMPORT ROUTES
 const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
-const analysisRoutes = require('./routes/analysisRoutes'); // ⚠️ This imports the object { router, analyzeMarket }
+// const analysisRoutes = require('./routes/analysisRoutes'); // ❌ REMOVED: Old Logic
 const newsRoutes = require('./routes/newsRoutes');
 
 // ISP Bypass: DNS Setup
@@ -47,19 +47,37 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 5000;
 
+// 🔗 INTERNAL BRAIN CONNECTION (Docker Monolith)
+// Node talks to Python via Localhost on port 8000
+const BRAIN_URL = 'http://127.0.0.1:8000';
+
 // 3. REGISTER ROUTES
 app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
-
-// ✅ FIX: Use .router here because we exported an object { router, analyzeMarket }
-app.use('/api/analyze', analysisRoutes.router); 
-
 app.use('/api/news', newsRoutes);
+
+// ✅ NEW: Proxy Request to Python Brain
+app.post('/api/analyze', async (req, res) => {
+    try {
+        // Forward the request to the internal Python Service
+        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
+        res.json(response.data);
+    } catch (error) {
+        console.error("🧠 Brain Error:", error.message);
+        // Fallback if Python is restarting or busy
+        res.status(500).json({ 
+            signal: "HOLD", 
+            confidence: 0, 
+            trend: "NEUTRAL",
+            reasoning: ["AI Brain is initializing..."] 
+        });
+    }
+});
 
 // Health Check Route
 app.get('/healthcheck', (req, res) => res.status(200).send('OK'));
 
-app.get('/', (req, res) => res.send('API is Running'));
+app.get('/', (req, res) => res.send('AuraTrade API is Running'));
 
 io.on('connection', (socket) => {
   console.log('⚡ Frontend Client Connected:', socket.id);
@@ -83,16 +101,12 @@ cron.schedule('0 */6 * * *', () => {
 // 🛡️ HELPER: WEEKEND DETECTOR
 // ==========================================
 const isMarketClosed = (timestampInSeconds) => {
-    // Basic Weekend Check (Not perfect for all markets, but good for crypto/forex standard breaks)
     const date = new Date(timestampInSeconds * 1000);
     const day = date.getUTCDay(); // 0 = Sunday, 6 = Saturday
     const hour = date.getUTCHours(); 
   
-    // Closed Saturday
     if (day === 6) return true; 
-    // Closing Friday Night (after 10PM UTC)
     if (day === 5 && hour >= 22) return true; 
-    // Opening Sunday Night (before 10PM UTC)
     if (day === 0 && hour < 22) return true; 
   
     return false; 
@@ -111,24 +125,21 @@ const getBucketTime = (timestamp, timeframe) => {
 // 🛡️ CORE LOGIC: HANDLE NEW TICK
 // ==========================================
 const handleNewTick = async (data) => {
-  // We need to pass data to update DB
   try {
     const price = data.close;
     const weekendFlag = isMarketClosed(data.time);
     const targetTimeframes = ['1h', '4h'];
 
-    // Update DB
     const updatePromises = targetTimeframes.map(async (tf) => {
       const bucketTime = getBucketTime(data.time, tf);
       const query = { time: bucketTime, timeframe: tf };
 
-      // Standard High/Low/Close Logic
       const update = {
         $max: { high: data.high },
         $min: { low: data.low },
         $set: { 
           close: data.close,
-          isWeekend: weekendFlag // Mark weekend candles
+          isWeekend: weekendFlag 
         },
         $setOnInsert: { 
           open: data.open, 
@@ -141,8 +152,6 @@ const handleNewTick = async (data) => {
     });
 
     await Promise.all(updatePromises);
-
-    // Notify Frontend
     io.emit('price-update', data);
 
   } catch (err) {
@@ -165,7 +174,6 @@ let failureCount = 0;
 let binanceWs = null;
 
 const connectBinanceStream = () => {
-  // Rotate endpoints if needed
   if (currentEndpointIndex >= BINANCE_ENDPOINTS.length) currentEndpointIndex = 0;
   const currentUrl = BINANCE_ENDPOINTS[currentEndpointIndex];
   
@@ -194,12 +202,9 @@ const connectBinanceStream = () => {
           close: parseFloat(k.c),
         };
 
-        // Process Data
         await handleNewTick(candlePayload);
 
-      } catch (err) {
-         // Silent fail for JSON parse errors
-      }
+      } catch (err) { }
     });
 
     binanceWs.on('error', (err) => {
@@ -219,14 +224,11 @@ const connectBinanceStream = () => {
 
 const handleDisconnection = () => {
   failureCount++;
-  // Retry same endpoint 3 times before switching
   if (failureCount < 3) {
       console.log(`⏳ Retrying same endpoint in 3s... (${failureCount}/3)`);
       setTimeout(connectBinanceStream, 3000);
       return;
   }
-  
-  // Switch Endpoint
   console.log(`🚫 Endpoint ${BINANCE_ENDPOINTS[currentEndpointIndex]} seems blocked.`);
   currentEndpointIndex++;
   console.log(`🔀 Switching to fallback...`);
@@ -237,14 +239,16 @@ const handleDisconnection = () => {
 connectBinanceStream();
 
 // ==========================================
-// 💓 KEEP ALIVE PING (For Render Free Tier)
+// 💓 KEEP ALIVE PING (Monolith Edition)
 // ==========================================
+// Since Node and Python are in the same container, 
+// keeping Node awake keeps Python awake too.
 if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://aura-trade.onrender.com';
   
   setInterval(() => {
     axios.get(`${RENDER_URL}/healthcheck`)
-      .then(() => console.log('💓 Self-Ping: Keeping the brain awake...'))
+      .then(() => console.log('💓 Self-Ping: Keeping the Monolith awake...'))
       .catch((err) => console.error(`⚠️ Ping failed: ${err.message}`));
   }, 300000); // 5 Minutes
 }
