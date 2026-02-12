@@ -5,20 +5,28 @@ import axios from 'axios';
 // ☁️ LIVE SERVER ADDRESS
 const API_URL = 'https://aura-trade.onrender.com';
 
-const SignalCard = () => {
+const SignalCard = ({ externalData, loading, onRefresh }) => {
   // --- STATE ---
   const [analysis, setAnalysis] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [newsLoading, setNewsLoading] = useState(false);
   
   // 📰 Real News State
   const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
-  // --- 1. THE BRAIN: Fetch Analysis ---
-  const fetchAnalysis = async (newsEvent = null) => {
-    setLoading(true);
+  // --- 1. BRIDGE: Sync with App.js ---
+  // This is the "synapse" that connects App.js brain to this card
+  useEffect(() => {
+    if (externalData) {
+      setAnalysis(externalData);
+    }
+  }, [externalData]);
+
+  // --- 2. INTERNAL BRAIN: Fetch Analysis (For News Events Only) ---
+  const fetchLocalAnalysis = async (newsEvent = null) => {
+    setNewsLoading(true);
     try {
-      console.log("🧠 AI Brain: Requesting Analysis...");
+      console.log("🧠 SignalCard: Checking News Impact...");
       
       const payload = {
         timeframe: '1h',
@@ -29,17 +37,17 @@ const SignalCard = () => {
       const res = await axios.post(`${API_URL}/api/analyze`, payload);
       
       if (res.data) {
-          console.log("🧠 Brain Result:", res.data);
+          console.log("🧠 Brain Result (News):", res.data);
           setAnalysis(res.data);
       }
     } catch (err) {
       console.error("❌ AI Analysis Failed:", err);
     } finally {
-      setLoading(false);
+      setNewsLoading(false);
     }
   };
 
-  // --- 2. THE FILTER: Find "Sniper" News Only ---
+  // --- 3. THE FILTER: Find "Sniper" News Only ---
   const fetchDailyNews = async () => {
       try {
           const res = await axios.get(`${API_URL}/api/news`);
@@ -62,10 +70,11 @@ const SignalCard = () => {
           if (criticalEvent) {
             console.log("🚨 Sniper Alert:", criticalEvent.event);
             setNextNews(criticalEvent);
-            fetchAnalysis(criticalEvent); 
+            // If news is found, we trigger a specific News Analysis which OVERRIDES the main one
+            fetchLocalAnalysis(criticalEvent); 
           } else {
             setNextNews(null);
-            fetchAnalysis(null);
+            // If no news, we rely on the App.js loop (externalData)
           }
 
       } catch (err) {
@@ -73,7 +82,7 @@ const SignalCard = () => {
       }
   };
 
-  // --- 3. COUNTDOWN TIMER ---
+  // --- 4. COUNTDOWN TIMER ---
   useEffect(() => {
     if (!nextNews) return;
 
@@ -87,7 +96,7 @@ const SignalCard = () => {
       if (diff <= 0) {
         setNextNews(null); 
         setNewsCountdown("");
-        fetchAnalysis(null); 
+        onRefresh(); // Trigger main app refresh when news passes
         return;
       }
 
@@ -99,7 +108,7 @@ const SignalCard = () => {
     }, 1000);
 
     return () => clearInterval(timer);
-  }, [nextNews]);
+  }, [nextNews, onRefresh]);
 
   // --- TRIGGERS ---
   useEffect(() => {
@@ -125,6 +134,9 @@ const SignalCard = () => {
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (confidence / 100) * circumference;
 
+  // Visual Loading State (Either App is loading OR Local News check is loading)
+  const isBusy = loading || newsLoading;
+
   const cardBorder = nextNews ? '1px solid #ef5350' : '1px solid rgba(255, 255, 255, 0.08)';
 
   return (
@@ -148,21 +160,22 @@ const SignalCard = () => {
         <h2 style={{ fontSize: '15px', margin: 0, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: '600' }}>
              <Activity size={16} color={signalColor} /> AI BRAIN
         </h2>
+        {/* REFRESH BUTTON: Uses the App.js function */}
         <button 
-            onClick={() => fetchAnalysis(nextNews)}
-            disabled={loading}
+            onClick={onRefresh}
+            disabled={isBusy}
             style={{ 
                 background: 'rgba(255,255,255,0.05)', border: 'none', 
                 color: '#9ca3af', borderRadius: '6px', cursor: 'pointer', padding: '6px',
                 display: 'flex', alignItems: 'center', justifyContent: 'center'
             }}
         >
-            <RefreshCw size={14} className={loading ? "spin" : ""} />
+            <RefreshCw size={14} className={isBusy ? "spin" : ""} />
             <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
         </button>
       </div>
 
-      {loading && !analysis ? (
+      {isBusy && !analysis ? (
           <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '8px', color: '#6b7280' }}>
               <RefreshCw size={20} className="spin" />
               <span style={{fontSize: '12px'}}>Simulating Outcomes...</span>
@@ -200,7 +213,7 @@ const SignalCard = () => {
                 </div>
             </div>
 
-            {/* 2. LOGIC / REASONING (Fixed Array Display) */}
+            {/* 2. LOGIC / REASONING (Robust Display) */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: `3px solid ${signalColor}` }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: signalColor, fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> STRATEGY LOGIC
@@ -211,12 +224,15 @@ const SignalCard = () => {
                     lineHeight: '1.5',
                     maxHeight: '100px', 
                     overflowY: 'auto', 
-                    whiteSpace: 'pre-wrap' 
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace' // Easier to read list items
                 }}>
-                    {/* 👇 THIS IS THE FIX: Handle Array or String */}
-                    {analysis?.reasoning && Array.isArray(analysis.reasoning) 
-                        ? analysis.reasoning.join('\n') 
-                        : (analysis?.reason || "Scanning market structure...")
+                    {/* Handles both Arrays (Lists) and Strings */}
+                    {analysis?.reasoning ? (
+                        Array.isArray(analysis.reasoning) 
+                            ? analysis.reasoning.map((r, i) => <div key={i}>• {r}</div>) 
+                            : analysis.reasoning
+                        ) : (analysis?.reason || "Scanning market structure...")
                     }
                 </div>
             </div>
@@ -270,7 +286,6 @@ const SignalCard = () => {
                     "Market is Quiet. Waiting for Setup..."
                 </div>
             )}
-
         </>
       )}
     </div>
