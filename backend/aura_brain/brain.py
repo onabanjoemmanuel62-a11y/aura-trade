@@ -7,58 +7,49 @@ from pydantic import BaseModel
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import pearsonr
 import logging
+from contextlib import asynccontextmanager
 
 # ✅ CORRECT IMPORTS
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator 
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # ⚙️ SETTINGS
-CSV_FILENAME = "1h.csv"  
+CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
-class AnalysisRequest(BaseModel):
-    timeframe: str = "1h"
-    currency: str = "USD"
+# 🧠 GLOBAL MEMORY (The Cache)
+# We will store the data here so we don't read the file 1000 times
+MARKET_MEMORY = {"df": None}
 
-# --- 1. DATA ENGINE (CSV MODE) ---
-def fetch_local_data():
+# --- 1. DATA ENGINE (OPTIMIZED) ---
+def load_data_into_memory():
+    """Loads CSV once and stores it in RAM"""
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
-        logger.info(f"📂 Loading local database from: {file_path}")
+        logger.info(f"📂 Pre-loading database from: {file_path}")
 
         if not os.path.exists(file_path):
             if os.path.exists(CSV_FILENAME):
                 file_path = CSV_FILENAME
             else:
-                raise FileNotFoundError(f"Database file {CSV_FILENAME} not found!")
+                logger.error(f"❌ File not found: {CSV_FILENAME}")
+                return None
 
-        # 📖 READ CSV (ROBUST MODE)
+        # READ CSV
         try:
-            # Try reading with semi-colon
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2:
                 df = pd.read_csv(file_path, sep=',')
-        except Exception:
+        except:
             df = pd.read_csv(file_path, sep=',')
         
-        # Normalize Column Names
+        # CLEANUP
         df.columns = [c.lower().strip() for c in df.columns]
-        
         rename_map = {
             'close': 'Close', 'c': 'Close', '<close>': 'Close',
             'high': 'High', 'h': 'High', '<high>': 'High',
@@ -68,32 +59,50 @@ def fetch_local_data():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # ⚠️ CRITICAL FIX: CLEAN THE NUMBERS
-        # This converts "1,234" (Text) -> 1234.0 (Number)
+        # CONVERT NUMBERS (Fix "1,23" -> 1.23)
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
-                # 1. Force to string first
-                df[col] = df[col].astype(str)
-                # 2. Replace comma with dot (if European format)
-                df[col] = df[col].str.replace(',', '.')
-                # 3. Convert to Number (Coerce errors to NaN)
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.replace(',', '.')
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Drop rows where conversion failed (removes bad data)
         df.dropna(subset=numeric_cols, inplace=True)
 
-        # Handle Date Index
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
+            df.sort_index(inplace=True) # Ensure chronological order
 
-        logger.info(f"✅ Loaded {len(df)} candles from local database.")
+        logger.info(f"✅ CACHED {len(df)} candles in RAM.")
         return df
 
     except Exception as e:
-        logger.error(f"❌ Database Load Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
+        logger.error(f"❌ Cache Init Failed: {e}")
+        return None
+
+# --- LIFECYCLE MANAGER ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # STARTUP: Load Data
+    MARKET_MEMORY["df"] = load_data_into_memory()
+    yield
+    # SHUTDOWN: Clear Data
+    MARKET_MEMORY["df"] = None
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], 
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AnalysisRequest(BaseModel):
+    timeframe: str = "1h"
+    currency: str = "USD"
 
 # --- 2. FRACTAL PATTERN RECOGNITION ---
 def find_fractals(df):
@@ -126,15 +135,22 @@ def find_fractals(df):
 # --- 3. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
+    # ⚡ FAST ACCESS: Get from Memory
+    df = MARKET_MEMORY["df"]
+    
+    if df is None or df.empty:
+        raise HTTPException(status_code=503, detail="System initializing data... please wait.")
+
     try:
-        df = fetch_local_data()
         current_price = df['Close'].iloc[-1]
         
+        # Technicals
         ema_200 = EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1]
         rsi = RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1]
         
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
+        # Fractals
         matches = find_fractals(df)
         total_matches = len(matches)
         
@@ -152,6 +168,7 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_wins / total_matches) * 100
             
+            # Penalties
             if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
                 confidence -= 15
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
@@ -163,7 +180,7 @@ async def analyze(req: AnalysisRequest):
             "trend": trend,
             "pattern": f"Deep Scan ({total_matches} Hist. Matches)",
             "reasoning": [
-                f"Analyzed internal database ({len(df)} candles).",
+                f"Instant Memory Scan ({len(df)} candles).",
                 f"Identified {total_matches} identical historical fractals.",
                 f"{int(confidence)}% statistical probability.",
                 f"Trend Filter: {trend}."
