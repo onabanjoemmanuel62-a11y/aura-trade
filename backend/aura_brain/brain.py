@@ -23,8 +23,8 @@ app.add_middleware(
 )
 
 # ⚙️ SETTINGS
-CSV_FILENAME = "1h.csv"  # The file in your backend folder
-PATTERN_SIZE = 60       # Look at last 60 candles
+CSV_FILENAME = "1h.csv"  
+PATTERN_SIZE = 60       
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
@@ -36,7 +36,6 @@ class AnalysisRequest(BaseModel):
 # --- 1. DATA ENGINE (CSV MODE) ---
 def fetch_local_data():
     try:
-        # 📍 LOCATE THE FILE
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
@@ -69,18 +68,19 @@ def fetch_local_data():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # ⚠️ CRITICAL FIX: Convert "1,23" strings to "1.23" floats
-        # This prevents the math from crashing on European formatted CSVs
+        # ⚠️ CRITICAL FIX: CLEAN THE NUMBERS
+        # This converts "1,234" (Text) -> 1234.0 (Number)
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
-                # If column is text (object), replace comma with dot
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(',', '.')
-                # Convert to Number
+                # 1. Force to string first
+                df[col] = df[col].astype(str)
+                # 2. Replace comma with dot (if European format)
+                df[col] = df[col].str.replace(',', '.')
+                # 3. Convert to Number (Coerce errors to NaN)
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Drop any rows that failed conversion (bad data)
+        # Drop rows where conversion failed (removes bad data)
         df.dropna(subset=numeric_cols, inplace=True)
 
         # Handle Date Index
@@ -108,7 +108,7 @@ def find_fractals(df):
     matches = []
     history_limit = len(prices) - PATTERN_SIZE - 24 
     
-    # Optimization: Scan every 2nd candle to save CPU
+    # Optimization: Scan every 2nd candle
     for i in range(0, history_limit, 2):
         candidate = prices[i : i + PATTERN_SIZE]
         candidate_norm = scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
