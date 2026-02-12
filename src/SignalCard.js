@@ -5,24 +5,41 @@ import axios from 'axios';
 // ☁️ LIVE SERVER ADDRESS
 const API_URL = 'https://aura-trade.onrender.com';
 
-// 🧠 AI PERSONALITY SETTINGS (The "Smart Lock" Logic)
-const ENTRY_THRESHOLD = 75;  // Must be this sure to ENTER a trade
+// 🧠 AI PERSONALITY SETTINGS
+const ENTRY_THRESHOLD = 75;  // Must be this sure to ENTER
 const EXIT_THRESHOLD = 60;   // Must drop below this to EXIT
-const FLIP_THRESHOLD = 85;   // Must be this overwhelming to flip immediately (Buy -> Sell)
+const FLIP_THRESHOLD = 85;   // Must be this overwhelming to FLIP sides
+const LOCK_EXPIRY_HOURS = 4; // How long to remember a trade (prevents stale locks)
 
 const SignalCard = ({ externalData, loading, onRefresh }) => {
   // --- STATE ---
   const [analysis, setAnalysis] = useState(null);
   const [newsLoading, setNewsLoading] = useState(false);
   
-  // 🔒 SMART LOCK ENGINE
-  // "activeSignalRef" remembers the current trade state between renders so it doesn't flicker
-  const activeSignalRef = useRef({ type: 'NEUTRAL', confidence: 0 }); 
-  const [displayState, setDisplayState] = useState({ type: 'NEUTRAL', confidence: 0 });
-
   // 📰 Real News State
   const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
+
+  // 🔒 PERSISTENT SMART LOCK ENGINE
+  // We initialize state from LocalStorage so it survives page reloads
+  const getSavedLock = () => {
+    try {
+      const saved = localStorage.getItem('aura_ai_lock');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // Check if the lock is too old (expired)
+        const ageHours = (Date.now() - parsed.timestamp) / (1000 * 60 * 60);
+        if (ageHours < LOCK_EXPIRY_HOURS) {
+          return parsed; // Return valid saved lock
+        }
+      }
+    } catch (e) { console.error("Storage Read Error", e); }
+    return { type: 'NEUTRAL', confidence: 0, timestamp: Date.now() };
+  };
+
+  // The "Truth" is stored in this ref, initialized from storage
+  const activeSignalRef = useRef(getSavedLock()); 
+  const [displayState, setDisplayState] = useState(activeSignalRef.current);
 
   // --- 1. BRIDGE: Sync & Stabilize ---
   useEffect(() => {
@@ -31,17 +48,15 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     }
   }, [externalData]);
 
-  // --- ⚙️ THE LOGIC ENGINE (Replaces simple updates) ---
+  // --- ⚙️ THE PERSISTENT LOGIC ENGINE ---
   const processNewData = (newData) => {
     const rawConf = Math.max(0, newData.confidence || 0);
     const rawSignal = (newData.signal || 'NEUTRAL').toUpperCase();
     
-    let currentLock = activeSignalRef.current.type; // currently 'BUY', 'SELL', or 'NEUTRAL'
-
-    // LOGIC: DETERMINE NEXT STATE
+    let currentLock = activeSignalRef.current.type; 
     let nextState = 'NEUTRAL';
 
-    // 1. If we are currently NEUTRAL, we look for a strong entry (>75%)
+    // 1. NEUTRAL STATE: Look for fresh entry
     if (currentLock === 'NEUTRAL') {
       if (rawConf >= ENTRY_THRESHOLD) {
         nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
@@ -49,34 +64,42 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         nextState = 'NEUTRAL';
       }
     } 
-    // 2. If we are already in a trade, we HOLD it unless it crashes (<60%)
+    // 2. LOCKED STATE: Defend the position
     else {
-      // Check for a massive reversal (Flip)
+      // Check for Flip (Buy -> Sell)
       const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) || 
                          (currentLock === 'SELL' && rawSignal.includes('BUY'));
       
       if (isOpposite && rawConf >= FLIP_THRESHOLD) {
-        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; // Instant Flip
+        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; // Hard Flip
       } 
       else if (rawConf < EXIT_THRESHOLD) {
-        nextState = 'NEUTRAL'; // Stop Loss / Exit
+        nextState = 'NEUTRAL'; // Stop Loss
       } 
       else {
-        nextState = currentLock; // STAY THE COURSE (Ignore noise)
+        nextState = currentLock; // HOLD THE LINE
       }
     }
 
-    // Update Memory & UI
-    activeSignalRef.current = { type: nextState, confidence: rawConf };
+    // SAVE DECISION TO STORAGE (Persistence)
+    const newLockState = { 
+      type: nextState, 
+      confidence: rawConf, 
+      timestamp: Date.now() // Update timestamp so it stays fresh
+    };
+    
+    activeSignalRef.current = newLockState;
+    localStorage.setItem('aura_ai_lock', JSON.stringify(newLockState));
+    
+    // Update UI
     setAnalysis(newData);
-    setDisplayState({ type: nextState, confidence: rawConf });
+    setDisplayState(newLockState);
   };
 
   // --- 2. INTERNAL BRAIN: Fetch Analysis (For News) ---
   const fetchLocalAnalysis = async (newsEvent = null) => {
     setNewsLoading(true);
     try {
-      console.log("🧠 SignalCard: Checking News Impact...");
       const payload = {
         timeframe: '1h',
         currency: 'USD',
@@ -84,9 +107,8 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       };
 
       const res = await axios.post(`${API_URL}/api/analyze`, payload);
-      
       if (res.data) {
-          processNewData(res.data); // Use the smart logic here too
+          processNewData(res.data);
       }
     } catch (err) {
       console.error("❌ AI Analysis Failed:", err);
@@ -113,9 +135,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           } else {
             setNextNews(null);
           }
-      } catch (err) {
-          console.error("News Fetch Failed:", err);
-      }
+      } catch (err) { console.error("News Fetch Failed:", err); }
   };
 
   // --- 4. COUNTDOWN TIMER ---
@@ -141,17 +161,15 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const getSignalColor = (type) => {
       if (type === 'BUY') return '#00E676'; 
       if (type === 'SELL') return '#FF1744'; 
-      return '#FFC107'; // Neutral Yellow
+      return '#FFC107'; 
   };
 
   const signalColor = getSignalColor(displayState.type);
   const isLocked = displayState.type !== 'NEUTRAL';
   
-  // Gauge Visuals
   const radius = 36;
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - (displayState.confidence / 100) * circumference;
-
   const isBusy = loading || newsLoading;
   const cardBorder = nextNews ? '1px solid #ef5350' : `1px solid ${isLocked ? signalColor : 'rgba(255,255,255,0.08)'}`;
 
@@ -177,7 +195,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
              <Activity size={16} color={signalColor} /> AI BRAIN
         </h2>
         <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
-           {/* LOCK BADGE: Shows when the AI is committed */}
+           {/* LOCK BADGE */}
            {isLocked && (
              <div style={{fontSize:'10px', background: `${signalColor}20`, color: signalColor, padding:'2px 8px', borderRadius:'4px', display:'flex', alignItems:'center', gap:'4px', fontWeight:'bold', border: `1px solid ${signalColor}40`}}>
                <Lock size={10} /> LOCKED
