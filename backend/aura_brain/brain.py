@@ -16,15 +16,15 @@ from ta.momentum import RSIIndicator
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
+MAX_SCAN_LIMIT = 20000  # ⚡ NEW: Only scan last 20k candles (approx 3 years) for speed
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
-# 🧠 GLOBAL MEMORY (The Cache)
-# We will store the data here so we don't read the file 1000 times
+# 🧠 GLOBAL MEMORY
 MARKET_MEMORY = {"df": None}
 
-# --- 1. DATA ENGINE (OPTIMIZED) ---
+# --- 1. DATA ENGINE ---
 def load_data_into_memory():
     """Loads CSV once and stores it in RAM"""
     try:
@@ -40,7 +40,7 @@ def load_data_into_memory():
                 logger.error(f"❌ File not found: {CSV_FILENAME}")
                 return None
 
-        # READ CSV
+        # READ CSV (With Semicolon Fix)
         try:
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2:
@@ -59,7 +59,7 @@ def load_data_into_memory():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # CONVERT NUMBERS (Fix "1,23" -> 1.23)
+        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
@@ -72,7 +72,7 @@ def load_data_into_memory():
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
-            df.sort_index(inplace=True) # Ensure chronological order
+            df.sort_index(inplace=True)
 
         logger.info(f"✅ CACHED {len(df)} candles in RAM.")
         return df
@@ -81,13 +81,11 @@ def load_data_into_memory():
         logger.error(f"❌ Cache Init Failed: {e}")
         return None
 
-# --- LIFECYCLE MANAGER ---
+# --- LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # STARTUP: Load Data
     MARKET_MEMORY["df"] = load_data_into_memory()
     yield
-    # SHUTDOWN: Clear Data
     MARKET_MEMORY["df"] = None
 
 app = FastAPI(lifespan=lifespan)
@@ -104,9 +102,13 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "USD"
 
-# --- 2. FRACTAL PATTERN RECOGNITION ---
+# --- 2. FRACTAL PATTERN RECOGNITION (OPTIMIZED) ---
 def find_fractals(df):
-    prices = df['Close'].values
+    # ⚡ SPEED OPTIMIZATION: Only take the last N candles
+    # This prevents scanning 124,000 candles which causes Timeout
+    recent_data = df.tail(MAX_SCAN_LIMIT + PATTERN_SIZE) 
+    prices = recent_data['Close'].values
+    
     if len(prices) < PATTERN_SIZE + 24:
         return []
 
@@ -122,6 +124,7 @@ def find_fractals(df):
         candidate = prices[i : i + PATTERN_SIZE]
         candidate_norm = scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
         
+        # Fast Correlation Check
         corr, _ = pearsonr(current_norm, candidate_norm)
         
         if corr > 0.85:
@@ -135,11 +138,10 @@ def find_fractals(df):
 # --- 3. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    # ⚡ FAST ACCESS: Get from Memory
     df = MARKET_MEMORY["df"]
     
     if df is None or df.empty:
-        raise HTTPException(status_code=503, detail="System initializing data... please wait.")
+        raise HTTPException(status_code=503, detail="System initializing...")
 
     try:
         current_price = df['Close'].iloc[-1]
@@ -168,7 +170,6 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_wins / total_matches) * 100
             
-            # Penalties
             if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
                 confidence -= 15
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
@@ -178,9 +179,9 @@ async def analyze(req: AnalysisRequest):
             "signal": signal,
             "confidence": int(max(0, min(99, confidence))),
             "trend": trend,
-            "pattern": f"Deep Scan ({total_matches} Hist. Matches)",
+            "pattern": f"Deep Scan ({total_matches} Matches)",
             "reasoning": [
-                f"Instant Memory Scan ({len(df)} candles).",
+                f"Scanned {MAX_SCAN_LIMIT} recent candles (Speed Optimized).",
                 f"Identified {total_matches} identical historical fractals.",
                 f"{int(confidence)}% statistical probability.",
                 f"Trend Filter: {trend}."

@@ -38,11 +38,25 @@ connectDB();
 const app = express();
 const server = http.createServer(app);
 
-app.use(cors({ origin: "*" }));
+// 🛡️ UPDATED CORS: Fix for "Network Error" / Access-Control-Allow-Origin
+app.use(cors({
+    origin: true, // 👈 ALLOW ALL ORIGINS (Vercel, Localhost, etc.)
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept']
+}));
+
+// Enable Pre-flight checks for all routes
+app.options('*', cors());
+
 app.use(express.json());
 
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { 
+      origin: "*", 
+      methods: ["GET", "POST"],
+      credentials: true 
+  }
 });
 
 const PORT = process.env.PORT || 5000;
