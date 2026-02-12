@@ -1,35 +1,82 @@
-import React, { useState, useEffect } from 'react';
-import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, ShieldAlert } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, ShieldAlert, Lock } from 'lucide-react';
 import axios from 'axios';
 
 // ☁️ LIVE SERVER ADDRESS
 const API_URL = 'https://aura-trade.onrender.com';
 
-// 🔒 SECURITY SETTING: The AI must be this sure to show a signal
-const MIN_CONFIDENCE_THRESHOLD = 70;
+// 🧠 AI PERSONALITY SETTINGS (The "Smart Lock" Logic)
+const ENTRY_THRESHOLD = 75;  // Must be this sure to ENTER a trade
+const EXIT_THRESHOLD = 60;   // Must drop below this to EXIT
+const FLIP_THRESHOLD = 85;   // Must be this overwhelming to flip immediately (Buy -> Sell)
 
 const SignalCard = ({ externalData, loading, onRefresh }) => {
   // --- STATE ---
   const [analysis, setAnalysis] = useState(null);
   const [newsLoading, setNewsLoading] = useState(false);
   
+  // 🔒 SMART LOCK ENGINE
+  // "activeSignalRef" remembers the current trade state between renders so it doesn't flicker
+  const activeSignalRef = useRef({ type: 'NEUTRAL', confidence: 0 }); 
+  const [displayState, setDisplayState] = useState({ type: 'NEUTRAL', confidence: 0 });
+
   // 📰 Real News State
   const [nextNews, setNextNews] = useState(null); 
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
-  // --- 1. BRIDGE: Sync with App.js ---
+  // --- 1. BRIDGE: Sync & Stabilize ---
   useEffect(() => {
     if (externalData) {
-      setAnalysis(externalData);
+      processNewData(externalData);
     }
   }, [externalData]);
 
-  // --- 2. INTERNAL BRAIN: Fetch Analysis (For News Events Only) ---
+  // --- ⚙️ THE LOGIC ENGINE (Replaces simple updates) ---
+  const processNewData = (newData) => {
+    const rawConf = Math.max(0, newData.confidence || 0);
+    const rawSignal = (newData.signal || 'NEUTRAL').toUpperCase();
+    
+    let currentLock = activeSignalRef.current.type; // currently 'BUY', 'SELL', or 'NEUTRAL'
+
+    // LOGIC: DETERMINE NEXT STATE
+    let nextState = 'NEUTRAL';
+
+    // 1. If we are currently NEUTRAL, we look for a strong entry (>75%)
+    if (currentLock === 'NEUTRAL') {
+      if (rawConf >= ENTRY_THRESHOLD) {
+        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
+      } else {
+        nextState = 'NEUTRAL';
+      }
+    } 
+    // 2. If we are already in a trade, we HOLD it unless it crashes (<60%)
+    else {
+      // Check for a massive reversal (Flip)
+      const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) || 
+                         (currentLock === 'SELL' && rawSignal.includes('BUY'));
+      
+      if (isOpposite && rawConf >= FLIP_THRESHOLD) {
+        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; // Instant Flip
+      } 
+      else if (rawConf < EXIT_THRESHOLD) {
+        nextState = 'NEUTRAL'; // Stop Loss / Exit
+      } 
+      else {
+        nextState = currentLock; // STAY THE COURSE (Ignore noise)
+      }
+    }
+
+    // Update Memory & UI
+    activeSignalRef.current = { type: nextState, confidence: rawConf };
+    setAnalysis(newData);
+    setDisplayState({ type: nextState, confidence: rawConf });
+  };
+
+  // --- 2. INTERNAL BRAIN: Fetch Analysis (For News) ---
   const fetchLocalAnalysis = async (newsEvent = null) => {
     setNewsLoading(true);
     try {
       console.log("🧠 SignalCard: Checking News Impact...");
-      
       const payload = {
         timeframe: '1h',
         currency: 'USD',
@@ -39,7 +86,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       const res = await axios.post(`${API_URL}/api/analyze`, payload);
       
       if (res.data) {
-          setAnalysis(res.data);
+          processNewData(res.data); // Use the smart logic here too
       }
     } catch (err) {
       console.error("❌ AI Analysis Failed:", err);
@@ -53,19 +100,11 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       try {
           const res = await axios.get(`${API_URL}/api/news`);
           const today = new Date().toDateString(); 
-
-          // 🚨 THE SNIPER FILTER 🚨
           const criticalEvent = res.data.find(n => {
               const newsDate = new Date(n.time * 1000).toDateString();
               const eventTime = new Date(n.time * 1000);
               const isFuture = eventTime > new Date();
-              
-              return (
-                  newsDate === today &&       // Must be today
-                  n.impact === 'High' &&      // Must be High Impact
-                  n.currency === 'USD' &&     // Must be USD
-                  isFuture                    // Must be in future
-              );
+              return (newsDate === today && n.impact === 'High' && n.currency === 'USD' && isFuture);
           });
 
           if (criticalEvent) {
@@ -74,7 +113,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           } else {
             setNextNews(null);
           }
-
       } catch (err) {
           console.error("News Fetch Failed:", err);
       }
@@ -83,68 +121,39 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   // --- 4. COUNTDOWN TIMER ---
   useEffect(() => {
     if (!nextNews) return;
-
     const eventTime = nextNews.time > 2000000000 ? nextNews.time : nextNews.time * 1000;
     const targetDate = new Date(eventTime);
     
     const timer = setInterval(() => {
-      const now = new Date();
-      const diff = targetDate - now;
-
-      if (diff <= 0) {
-        setNextNews(null); 
-        setNewsCountdown("");
-        onRefresh(); 
-        return;
-      }
-
+      const diff = targetDate - new Date();
+      if (diff <= 0) { setNextNews(null); setNewsCountdown(""); onRefresh(); return; }
       const h = Math.floor((diff / (1000 * 60 * 60)) % 24);
       const m = Math.floor((diff / (1000 * 60)) % 60);
       const s = Math.floor((diff / 1000) % 60);
-
       setNewsCountdown(`${h}h ${m}m ${s}s`);
     }, 1000);
-
     return () => clearInterval(timer);
   }, [nextNews, onRefresh]);
 
-  // --- TRIGGERS ---
-  useEffect(() => {
-      fetchDailyNews();
-      const interval = setInterval(fetchDailyNews, 60000); 
-      return () => clearInterval(interval);
-  }, []); 
+  useEffect(() => { fetchDailyNews(); setInterval(fetchDailyNews, 60000); }, []); 
 
-  // --- 🛡️ LOGIC GATE: FILTER WEAK SIGNALS ---
-  
-  // 1. Get raw confidence
-  const rawConfidence = Math.max(0, analysis?.confidence || 0);
-
-  // 2. Apply Threshold Logic
-  const isStrongSignal = rawConfidence >= MIN_CONFIDENCE_THRESHOLD;
-  
-  // 3. Determine Final Display Values
-  const displaySignal = isStrongSignal ? (analysis?.signal || 'NEUTRAL') : 'HOLD';
-  const displayConfidence = isStrongSignal ? rawConfidence : rawConfidence; // We still show the % but dim the UI
-
-  // 4. Color Logic
-  const getSignalColor = (signal) => {
-      if (!signal || signal === 'HOLD' || signal === 'NEUTRAL') return '#FFC107'; // Yellow/Gold for Hold
-      const s = signal.toUpperCase();
-      if (s.includes('BUY') || s.includes('STRONG')) return '#00E676'; // Green
-      if (s.includes('SELL') || s.includes('WEAK')) return '#FF1744'; // Red
-      return '#FFC107'; 
+  // --- UI HELPERS ---
+  const getSignalColor = (type) => {
+      if (type === 'BUY') return '#00E676'; 
+      if (type === 'SELL') return '#FF1744'; 
+      return '#FFC107'; // Neutral Yellow
   };
 
-  const signalColor = getSignalColor(displaySignal);
+  const signalColor = getSignalColor(displayState.type);
+  const isLocked = displayState.type !== 'NEUTRAL';
   
-  // SVG Gauge Math
+  // Gauge Visuals
   const radius = 36;
   const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (displayConfidence / 100) * circumference;
+  const strokeDashoffset = circumference - (displayState.confidence / 100) * circumference;
 
   const isBusy = loading || newsLoading;
-  const cardBorder = nextNews ? '1px solid #ef5350' : '1px solid rgba(255, 255, 255, 0.08)';
+  const cardBorder = nextNews ? '1px solid #ef5350' : `1px solid ${isLocked ? signalColor : 'rgba(255,255,255,0.08)'}`;
 
   return (
     <div style={{
@@ -158,7 +167,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       display: 'flex',
       flexDirection: 'column',
       gap: '16px',
-      boxShadow: nextNews ? '0 0 15px rgba(239, 83, 80, 0.2)' : '0 4px 20px rgba(0,0,0,0.2)',
+      boxShadow: isLocked ? `0 0 15px ${signalColor}20` : '0 4px 20px rgba(0,0,0,0.2)',
       transition: 'border 0.3s ease'
     }}>
       
@@ -167,18 +176,18 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         <h2 style={{ fontSize: '15px', margin: 0, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: '600' }}>
              <Activity size={16} color={signalColor} /> AI BRAIN
         </h2>
-        <button 
-            onClick={onRefresh}
-            disabled={isBusy}
-            style={{ 
-                background: 'rgba(255,255,255,0.05)', border: 'none', 
-                color: '#9ca3af', borderRadius: '6px', cursor: 'pointer', padding: '6px',
-                display: 'flex', alignItems: 'center', justifyContent: 'center'
-            }}
-        >
-            <RefreshCw size={14} className={isBusy ? "spin" : ""} />
-            <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
-        </button>
+        <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
+           {/* LOCK BADGE: Shows when the AI is committed */}
+           {isLocked && (
+             <div style={{fontSize:'10px', background: `${signalColor}20`, color: signalColor, padding:'2px 8px', borderRadius:'4px', display:'flex', alignItems:'center', gap:'4px', fontWeight:'bold', border: `1px solid ${signalColor}40`}}>
+               <Lock size={10} /> LOCKED
+             </div>
+           )}
+           <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: '6px', cursor: 'pointer', padding: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+              <RefreshCw size={14} className={isBusy ? "spin" : ""} />
+              <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
+           </button>
+        </div>
       </div>
 
       {isBusy && !analysis ? (
@@ -193,10 +202,10 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 <div style={{ display: 'flex', flexDirection: 'column' }}>
                     <span style={{ fontSize: '11px', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Probability</span>
                     <span style={{ fontSize: '28px', fontWeight: '900', color: signalColor, lineHeight: '1' }}>
-                        {displayConfidence}%
+                        {displayState.confidence}%
                     </span>
-                    <span style={{ fontSize: '10px', color: signalColor, opacity: 0.8, marginTop: '4px', fontWeight: 'bold' }}>
-                        {displaySignal}
+                    <span style={{ fontSize: '10px', color: signalColor, opacity: 0.8, marginTop: '4px', fontWeight: 'bold', letterSpacing: '1px' }}>
+                        {displayState.type}
                     </span>
                 </div>
                 
@@ -214,8 +223,9 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                         />
                     </svg>
                     <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: '#FFF' }}>
-                        {/* Icon Changes based on Threshold */}
-                        {isStrongSignal ? <TrendingUp size={18} /> : <ShieldAlert size={18} />}
+                         {displayState.type === 'BUY' ? <TrendingUp size={18} /> : 
+                          displayState.type === 'SELL' ? <TrendingUp size={18} style={{transform:'scaleY(-1)'}} /> : 
+                          <ShieldAlert size={18} />}
                     </div>
                 </div>
             </div>
@@ -225,22 +235,12 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: signalColor, fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> STRATEGY LOGIC
                 </div>
-                <div style={{ 
-                    fontSize: '12px', 
-                    color: '#d1d5db', 
-                    lineHeight: '1.5',
-                    maxHeight: '100px', 
-                    overflowY: 'auto', 
-                    whiteSpace: 'pre-wrap',
-                    fontFamily: 'monospace' 
-                }}>
-                    {!isStrongSignal ? (
+                <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.5', maxHeight: '100px', overflowY: 'auto', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
+                    {!isLocked ? (
                       <span style={{color: '#fbbf24'}}>
-                        {/* FIXED: Replaced '>' with '&gt;' to fix the syntax error */}
-                        Signal weak ({rawConfidence}%). Waiting for &gt;{MIN_CONFIDENCE_THRESHOLD}% confirmation to trade.
+                        Signal weak. Waiting for &gt;{ENTRY_THRESHOLD}% confidence to enter.
                       </span>
                     ) : (
-                      // Show actual reasoning if signal is strong
                       analysis?.reasoning ? (
                           Array.isArray(analysis.reasoning) 
                               ? analysis.reasoning.map((r, i) => <div key={i}>• {r}</div>) 
@@ -250,26 +250,20 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
             </div>
 
-            {/* 3. IMPACT ALERT (Sniper Mode) */}
+            {/* 3. IMPACT ALERT */}
             {nextNews && (
                 <div style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)', animation: 'pulse 2s infinite' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ef5350', fontSize: '11px', fontWeight: 'bold' }}>
-                            <AlertTriangle size={14} /> NEWS ALERT
-                        </div>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ef5350', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold' }}>
-                            <Clock size={12} /> {newsCountdown}
-                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ef5350', fontSize: '11px', fontWeight: 'bold' }}><AlertTriangle size={14} /> NEWS ALERT</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ef5350', fontSize: '12px', fontFamily: 'monospace', fontWeight: 'bold' }}><Clock size={12} /> {newsCountdown}</div>
                     </div>
-                    <div style={{ fontSize: '11px', color: '#ff8a80', marginTop: '4px' }}>
-                        Upcoming: <b>{nextNews.title || nextNews.event || "High Impact News"}</b>
-                    </div>
+                    <div style={{ fontSize: '11px', color: '#ff8a80', marginTop: '4px' }}>Upcoming: <b>{nextNews.title || nextNews.event || "High Impact News"}</b></div>
                     <style>{`@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(239, 83, 80, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0); } }`}</style>
                 </div>
             )}
 
             {/* 4. CONTEXT / TREND */}
-            {isStrongSignal && analysis.trend && (
+            {isLocked && analysis?.trend && (
                 <div style={{ display: 'flex', gap: '8px', marginTop: 'auto' }}>
                       <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
                           <div style={{ fontSize: '9px', color: '#9ca3af' }}>MARKET BIAS</div>
@@ -285,19 +279,9 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             )}
 
             {/* 5. QUIET STATE */}
-            {!isStrongSignal && (
-                <div style={{ 
-                    marginTop: 'auto', 
-                    padding: '15px', 
-                    textAlign: 'center', 
-                    border: '1px dashed #374357', 
-                    borderRadius: '8px',
-                    color: '#fbbf24', // Warning Yellow
-                    fontSize: '12px',
-                    fontStyle: 'italic',
-                    backgroundColor: 'rgba(251, 191, 36, 0.05)'
-                }}>
-                    "Analyzing... Confidence is below 70% threshold."
+            {!isLocked && (
+                <div style={{ marginTop: 'auto', padding: '15px', textAlign: 'center', border: '1px dashed #374357', borderRadius: '8px', color: '#fbbf24', fontSize: '12px', fontStyle: 'italic', backgroundColor: 'rgba(251, 191, 36, 0.05)' }}>
+                    "Analyzing... Confidence is below {ENTRY_THRESHOLD}% threshold."
                 </div>
             )}
         </>
