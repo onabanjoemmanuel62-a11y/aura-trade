@@ -4,9 +4,9 @@ import axios from 'axios';
 import io from 'socket.io-client';
 
 // ☁️ LIVE CLOUD SERVER ADDRESS
-const API_URL = 'https://aura-trade.onrender.com';
+const API_URL = 'https://aura-trade-v1.onrender.com';
 
-const ChartComponent = () => {
+const ChartComponent = ({ levels }) => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
