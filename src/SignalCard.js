@@ -236,7 +236,8 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 }}>
                     {!isStrongSignal ? (
                       <span style={{color: '#fbbf24'}}>
-                        Signal weak ({rawConfidence}%). Waiting for >{MIN_CONFIDENCE_THRESHOLD}% confirmation to trade.
+                        {/* FIXED: Replaced '>' with '&gt;' to fix the syntax error */}
+                        Signal weak ({rawConfidence}%). Waiting for &gt;{MIN_CONFIDENCE_THRESHOLD}% confirmation to trade.
                       </span>
                     ) : (
                       // Show actual reasoning if signal is strong
