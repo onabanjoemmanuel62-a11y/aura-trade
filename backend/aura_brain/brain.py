@@ -9,7 +9,8 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from ta.trend import EMAIndicator, RSIIndicator
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
 from scipy.stats import pearsonr
 import uvicorn
 import logging
