@@ -92,7 +92,6 @@ const HistoryTable = () => {
 
   return (
     <div style={styles.container}>
-      <h2 style={styles.headerText}>Verified AI Performance</h2>
       
       <table style={styles.table}>
         <thead>
