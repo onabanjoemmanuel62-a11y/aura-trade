@@ -38,8 +38,7 @@ def fetch_local_data():
     try:
         # 📍 LOCATE THE FILE
         # We are in /app/aura_brain/brain.py
-        # CSV is in /app/1h.csv
-        # So we look 1 level up ("..")
+        # CSV is in /app/1h.csv (one level up)
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
@@ -52,21 +51,29 @@ def fetch_local_data():
             else:
                 raise FileNotFoundError(f"Database file {CSV_FILENAME} not found!")
 
-        # 📖 READ CSV
-        # We assume standard headers: Date, Open, High, Low, Close, Volume
-        # We accept 'Date', 'time', or 'timestamp' as the index
-        df = pd.read_csv(file_path)
+        # 📖 READ CSV (ROBUST MODE)
+        # Attempt to read with semi-colon first (Common in MT4/MT5 exports)
+        try:
+            df = pd.read_csv(file_path, sep=';')
+            # If that failed (read as 1 column), try comma
+            if len(df.columns) < 2:
+                logger.info("⚠️ Semi-colon read failed (columns < 2), switching to comma...")
+                df = pd.read_csv(file_path, sep=',')
+        except Exception:
+            # Fallback catch-all
+            df = pd.read_csv(file_path, sep=',')
         
-        # Normalize Column Names (lowercase for safety, then capitalize needed ones)
-        df.columns = [c.lower() for c in df.columns]
+        # Normalize Column Names (lowercase + strip spaces)
+        df.columns = [c.lower().strip() for c in df.columns]
         
         # Map common names to what we need: 'Close', 'High', 'Low'
+        # Handles various formats like '<close>', 'close', 'c', etc.
         rename_map = {
-            'close': 'Close', 'c': 'Close',
-            'high': 'High', 'h': 'High',
-            'low': 'Low', 'l': 'Low',
-            'open': 'Open', 'o': 'Open',
-            'date': 'Date', 'time': 'Date', 'timestamp': 'Date'
+            'close': 'Close', 'c': 'Close', '<close>': 'Close',
+            'high': 'High', 'h': 'High', '<high>': 'High',
+            'low': 'Low', 'l': 'Low', '<low>': 'Low',
+            'open': 'Open', 'o': 'Open', '<open>': 'Open',
+            'date': 'Date', 'time': 'Date', 'timestamp': 'Date', '<date>': 'Date'
         }
         df.rename(columns=rename_map, inplace=True)
         
