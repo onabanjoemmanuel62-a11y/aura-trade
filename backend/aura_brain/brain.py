@@ -37,37 +37,29 @@ class AnalysisRequest(BaseModel):
 def fetch_local_data():
     try:
         # 📍 LOCATE THE FILE
-        # We are in /app/aura_brain/brain.py
-        # CSV is in /app/1h.csv (one level up)
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
         logger.info(f"📂 Loading local database from: {file_path}")
 
         if not os.path.exists(file_path):
-            # Fallback: Try current directory (useful for local testing)
             if os.path.exists(CSV_FILENAME):
                 file_path = CSV_FILENAME
             else:
                 raise FileNotFoundError(f"Database file {CSV_FILENAME} not found!")
 
         # 📖 READ CSV (ROBUST MODE)
-        # Attempt to read with semi-colon first (Common in MT4/MT5 exports)
         try:
+            # Try reading with semi-colon
             df = pd.read_csv(file_path, sep=';')
-            # If that failed (read as 1 column), try comma
             if len(df.columns) < 2:
-                logger.info("⚠️ Semi-colon read failed (columns < 2), switching to comma...")
                 df = pd.read_csv(file_path, sep=',')
         except Exception:
-            # Fallback catch-all
             df = pd.read_csv(file_path, sep=',')
         
-        # Normalize Column Names (lowercase + strip spaces)
+        # Normalize Column Names
         df.columns = [c.lower().strip() for c in df.columns]
         
-        # Map common names to what we need: 'Close', 'High', 'Low'
-        # Handles various formats like '<close>', 'close', 'c', etc.
         rename_map = {
             'close': 'Close', 'c': 'Close', '<close>': 'Close',
             'high': 'High', 'h': 'High', '<high>': 'High',
@@ -77,12 +69,21 @@ def fetch_local_data():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # Ensure we have the required columns
-        required = ['Close', 'High', 'Low']
-        if not all(col in df.columns for col in required):
-            raise ValueError(f"CSV is missing columns. Found: {df.columns}")
+        # ⚠️ CRITICAL FIX: Convert "1,23" strings to "1.23" floats
+        # This prevents the math from crashing on European formatted CSVs
+        numeric_cols = ['Open', 'High', 'Low', 'Close']
+        for col in numeric_cols:
+            if col in df.columns:
+                # If column is text (object), replace comma with dot
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.replace(',', '.')
+                # Convert to Number
+                df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Handle Date Index if possible
+        # Drop any rows that failed conversion (bad data)
+        df.dropna(subset=numeric_cols, inplace=True)
+
+        # Handle Date Index
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
@@ -100,24 +101,21 @@ def find_fractals(df):
     if len(prices) < PATTERN_SIZE + 24:
         return []
 
-    # The "Current Pattern" is the very end of your CSV data
     current_pattern = prices[-PATTERN_SIZE:]
-    
     scaler = MinMaxScaler()
     current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
     
     matches = []
-    # Stop scanning before we hit the 'current' pattern itself
     history_limit = len(prices) - PATTERN_SIZE - 24 
     
-    # Scan entire history
+    # Optimization: Scan every 2nd candle to save CPU
     for i in range(0, history_limit, 2):
         candidate = prices[i : i + PATTERN_SIZE]
         candidate_norm = scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
         
         corr, _ = pearsonr(current_norm, candidate_norm)
         
-        if corr > 0.85: # High precision match
+        if corr > 0.85:
             future_price = prices[i + PATTERN_SIZE + 24]
             entry_price = prices[i + PATTERN_SIZE]
             outcome = "BULLISH" if future_price > entry_price else "BEARISH"
@@ -129,17 +127,14 @@ def find_fractals(df):
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     try:
-        # Load Local Data
         df = fetch_local_data()
         current_price = df['Close'].iloc[-1]
         
-        # Technicals
         ema_200 = EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1]
         rsi = RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1]
         
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # Fractals
         matches = find_fractals(df)
         total_matches = len(matches)
         
@@ -157,7 +152,6 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_wins / total_matches) * 100
             
-            # Penalties
             if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
                 confidence -= 15
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
