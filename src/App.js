@@ -1,12 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import axios from 'axios'; // We need axios here now!
+import axios from 'axios'; 
 import ChartComponent from './ChartComponent';
 import SignalCard from './SignalCard';
 import HistoryTable from './HistoryTable';
 import './App.css';
 
-// ☁️ API URL
-const API_URL = 'https://aura-trade.onrender.com';
+// ⚠️ CRITICAL UPDATE: Use the URL from your Render Dashboard
+// Based on your logs, it is likely this one:
+const API_URL = 'https://aura-trade-v1.onrender.com'; 
 
 function App() {
   // 1. STATE: Lifted up so both Chart and SignalCard can use it
@@ -18,7 +19,7 @@ function App() {
     setLoading(true);
     try {
       console.log("🧠 App: Ping AI...");
-      // We ask the backend to scan the market
+      // This hits your Node server, which proxies to Python internally
       const res = await axios.post(`${API_URL}/api/analyze`, {
         timeframe: '1h',
         currency: 'USD'
@@ -63,7 +64,6 @@ function App() {
           
           {/* Chart Area */}
           <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden' }}>
-            {/* 👇 PASSING THE 'EYES' (Key Levels) TO THE CHART */}
             <ChartComponent 
                levels={aiData?.keyLevels || []} 
             />
@@ -71,7 +71,6 @@ function App() {
 
           {/* Signal Area */}
           <div className="signal-card" style={{ flex: 0.3 }}>
-            {/* 👇 PASSING THE 'BRAIN' (Analysis) TO THE CARD */}
             <SignalCard 
                externalData={aiData} 
                onRefresh={runAnalysis} 

@@ -3,7 +3,7 @@ import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, ShieldA
 import axios from 'axios';
 
 // ☁️ LIVE SERVER ADDRESS
-const API_URL = 'https://aura-trade.onrender.com';
+const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // 🧠 AI PERSONALITY SETTINGS
 const ENTRY_THRESHOLD = 75;  // Must be this sure to ENTER
