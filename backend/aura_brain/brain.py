@@ -1,13 +1,15 @@
 import os
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import pearsonr
 import logging
 from contextlib import asynccontextmanager
+import httpx
+from starlette.responses import Response
 
 # ✅ CORRECT IMPORTS
 from ta.trend import EMAIndicator
@@ -16,7 +18,8 @@ from ta.momentum import RSIIndicator
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
-MAX_SCAN_LIMIT = 20000  # ⚡ NEW: Only scan last 20k candles (approx 3 years) for speed
+MAX_SCAN_LIMIT = 20000
+NODE_URL = "http://127.0.0.1:10000"  # ⚡ NEW: Node.js internal URL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
@@ -40,7 +43,6 @@ def load_data_into_memory():
                 logger.error(f"❌ File not found: {CSV_FILENAME}")
                 return None
 
-        # READ CSV (With Semicolon Fix)
         try:
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2:
@@ -48,7 +50,6 @@ def load_data_into_memory():
         except:
             df = pd.read_csv(file_path, sep=',')
         
-        # CLEANUP
         df.columns = [c.lower().strip() for c in df.columns]
         rename_map = {
             'close': 'Close', 'c': 'Close', '<close>': 'Close',
@@ -59,7 +60,6 @@ def load_data_into_memory():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
@@ -81,7 +81,6 @@ def load_data_into_memory():
         logger.error(f"❌ Cache Init Failed: {e}")
         return None
 
-# --- LIFECYCLE ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     MARKET_MEMORY["df"] = load_data_into_memory()
@@ -102,10 +101,7 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "USD"
 
-# --- 2. FRACTAL PATTERN RECOGNITION (OPTIMIZED) ---
 def find_fractals(df):
-    # ⚡ SPEED OPTIMIZATION: Only take the last N candles
-    # This prevents scanning 124,000 candles which causes Timeout
     recent_data = df.tail(MAX_SCAN_LIMIT + PATTERN_SIZE) 
     prices = recent_data['Close'].values
     
@@ -119,12 +115,10 @@ def find_fractals(df):
     matches = []
     history_limit = len(prices) - PATTERN_SIZE - 24 
     
-    # Optimization: Scan every 2nd candle
     for i in range(0, history_limit, 2):
         candidate = prices[i : i + PATTERN_SIZE]
         candidate_norm = scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
         
-        # Fast Correlation Check
         corr, _ = pearsonr(current_norm, candidate_norm)
         
         if corr > 0.85:
@@ -146,13 +140,11 @@ async def analyze(req: AnalysisRequest):
     try:
         current_price = df['Close'].iloc[-1]
         
-        # Technicals
         ema_200 = EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1]
         rsi = RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1]
         
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # Fractals
         matches = find_fractals(df)
         total_matches = len(matches)
         
@@ -195,4 +187,43 @@ async def analyze(req: AnalysisRequest):
 
     except Exception as e:
         logger.error(f"Analysis Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ⚡ NEW: PROXY ALL OTHER REQUESTS TO NODE.JS
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
+async def proxy_to_node(path: str, request: Request):
+    """
+    Forward all requests (except /api/analyze) to Node.js server
+    This handles: /, /api/candles, /api/news, /api/trades, Socket.io
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            url = f"{NODE_URL}/{path}"
+            
+            # Build query string
+            query_string = str(request.url.query)
+            if query_string:
+                url = f"{url}?{query_string}"
+            
+            # Forward the request
+            response = await client.request(
+                method=request.method,
+                url=url,
+                headers={k: v for k, v in request.headers.items() 
+                        if k.lower() not in ['host', 'content-length']},
+                content=await request.body() if request.method in ["POST", "PUT"] else None
+            )
+            
+            # Return response from Node.js
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
+            
+    except httpx.ConnectError:
+        logger.error(f"❌ Cannot connect to Node.js at {NODE_URL}")
+        raise HTTPException(status_code=503, detail="Node.js service unavailable")
+    except Exception as e:
+        logger.error(f"❌ Proxy error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
