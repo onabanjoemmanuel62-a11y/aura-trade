@@ -16,7 +16,6 @@ const Candle = require('./models/Candle');
 // 2. IMPORT ROUTES
 const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
-// const analysisRoutes = require('./routes/analysisRoutes'); // ❌ REMOVED: Old Logic
 const newsRoutes = require('./routes/newsRoutes');
 
 // ISP Bypass: DNS Setup
@@ -38,9 +37,10 @@ connectDB();
 const app = express();
 const server = http.createServer(app);
 
-// 🛡️ UPDATED CORS: Fix for "Network Error" / Access-Control-Allow-Origin
+// 🛡️ 1. GLOBAL CORS FIX (Crucial for Vercel/Production)
+// This ensures that your frontend at Vercel can talk to Render without being blocked.
 app.use(cors({
-    origin: true, // 👈 ALLOW ALL ORIGINS (Vercel, Localhost, etc.)
+    origin: true, // Dynamically allow the origin of the requester
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept']
@@ -51,21 +51,22 @@ app.options('*', cors());
 
 app.use(express.json());
 
+// 🛡️ 2. SOCKET.IO SETUP (Fixes 403 Forbidden & Connection Rejected)
 const io = new Server(server, {
   cors: { 
-      origin: "*", 
+      origin: "*", // Allow all origins for WebSockets
       methods: ["GET", "POST"],
       credentials: true 
-  }
+  },
+  transports: ['websocket', 'polling'] // Explicitly enable both for stability
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 10000; // Render standard port is 10000
 
 // 🔗 INTERNAL BRAIN CONNECTION (Docker Monolith)
-// Node talks to Python via Localhost on port 8000
 const BRAIN_URL = 'http://127.0.0.1:8000';
 
-// 3. REGISTER ROUTES
+// 3. REGISTER NODE ROUTES (Must be defined BEFORE the catch-all proxy)
 app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
@@ -73,17 +74,18 @@ app.use('/api/news', newsRoutes);
 // ✅ NEW: Proxy Request to Python Brain
 app.post('/api/analyze', async (req, res) => {
     try {
-        // Forward the request to the internal Python Service
+        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
+        // Forward the request to the internal Python Service on port 8000
         const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
         res.json(response.data);
     } catch (error) {
-        console.error("🧠 Brain Error:", error.message);
+        console.error("🧠 Brain Connection Error:", error.message);
         // Fallback if Python is restarting or busy
         res.status(500).json({ 
             signal: "HOLD", 
             confidence: 0, 
             trend: "NEUTRAL",
-            reasoning: ["AI Brain is initializing..."] 
+            reasoning: ["AI Brain is initializing or under high load..."] 
         });
     }
 });
@@ -91,11 +93,12 @@ app.post('/api/analyze', async (req, res) => {
 // Health Check Route
 app.get('/healthcheck', (req, res) => res.status(200).send('OK'));
 
-app.get('/', (req, res) => res.send('AuraTrade API is Running'));
+app.get('/', (req, res) => res.send('AuraTrade Monolith API is Live 🚀'));
 
+// 4. SOCKET LOGIC
 io.on('connection', (socket) => {
-  console.log('⚡ Frontend Client Connected:', socket.id);
-  socket.on('disconnect', () => console.log('❌ Frontend Client Disconnected:', socket.id));
+  console.log('⚡ Client Connected:', socket.id);
+  socket.on('disconnect', () => console.log('❌ Client Disconnected:', socket.id));
 });
 
 // ==========================================
@@ -140,7 +143,6 @@ const getBucketTime = (timestamp, timeframe) => {
 // ==========================================
 const handleNewTick = async (data) => {
   try {
-    const price = data.close;
     const weekendFlag = isMarketClosed(data.time);
     const targetTimeframes = ['1h', '4h'];
 
@@ -255,8 +257,6 @@ connectBinanceStream();
 // ==========================================
 // 💓 KEEP ALIVE PING (Monolith Edition)
 // ==========================================
-// Since Node and Python are in the same container, 
-// keeping Node awake keeps Python awake too.
 if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://aura-trade.onrender.com';
   
@@ -267,6 +267,6 @@ if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   }, 300000); // 5 Minutes
 }
 
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Monolith Server running on port ${PORT}`);
 });
