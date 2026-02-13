@@ -46,9 +46,6 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept']
 }));
 
-// Enable Pre-flight checks for all routes
-app.options('*', cors());
-
 app.use(express.json());
 
 // 🛡️ 2. SOCKET.IO SETUP (Fixes 403 Forbidden & Connection Rejected)
