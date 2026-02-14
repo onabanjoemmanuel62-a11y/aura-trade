@@ -14,6 +14,9 @@ const ChartComponent = ({ levels }) => {
   // 1. SAFE REF NAME
   const candleSeriesRef = useRef(null); 
   
+  // 2. ⚡ NEW: REF FOR TRENDLINES (To track and remove them)
+  const linesRef = useRef({ resistance: null, support: null, ema: null });
+  
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
   const timeframeRef = useRef('1h'); 
@@ -71,6 +74,64 @@ const ChartComponent = ({ levels }) => {
     renderLoop();
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
+
+  // --- ⚡ NEW: DRAW TRENDLINES & LEVELS ---
+  useEffect(() => {
+    // Wait for chart series to be ready and data to exist
+    if (!candleSeriesRef.current || !levels) return;
+
+    // 1. Helper to clear old lines
+    const clearLine = (key) => {
+        if (linesRef.current[key]) {
+            candleSeriesRef.current.removePriceLine(linesRef.current[key]);
+            linesRef.current[key] = null;
+        }
+    };
+
+    // Clear everything first
+    clearLine('resistance');
+    clearLine('support');
+    clearLine('ema');
+
+    // 2. Parse Data (Handle both Array and Object formats for safety)
+    let resPrice, supPrice, emaPrice;
+
+    if (Array.isArray(levels)) {
+        resPrice = levels[0];
+        supPrice = levels[1];
+        emaPrice = levels[2];
+    } else if (levels && typeof levels === 'object') {
+        resPrice = levels.resistance;
+        supPrice = levels.support;
+        emaPrice = levels.ema;
+    }
+
+    // 3. Helper to create new lines
+    const createLine = (price, color, title, style = 2, width = 2) => {
+        if (price && !isNaN(parseFloat(price)) && parseFloat(price) > 0) {
+            return candleSeriesRef.current.createPriceLine({
+                price: parseFloat(price),
+                color: color,
+                lineWidth: width,
+                lineStyle: style, // 2 = Dashed, 0 = Solid
+                axisLabelVisible: true,
+                title: title,
+            });
+        }
+        return null;
+    };
+
+    // 4. Draw the lines
+    // Resistance = RED (Dashed)
+    linesRef.current.resistance = createLine(resPrice, '#ef5350', 'RESISTANCE', 2, 2);
+    // Support = GREEN (Dashed)
+    linesRef.current.support = createLine(supPrice, '#26a69a', 'SUPPORT', 2, 2);
+    // EMA = YELLOW (Solid)
+    linesRef.current.ema = createLine(emaPrice, '#FFD700', '200 EMA', 0, 1);
+
+    console.log("📊 Chart Updated Lines:", { resPrice, supPrice, emaPrice });
+
+  }, [levels]); // Re-run whenever 'levels' prop changes
 
   // --- 📰 STEP 1: FETCH NEWS DATA ---
   useEffect(() => {
