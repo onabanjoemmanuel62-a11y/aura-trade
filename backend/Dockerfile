@@ -10,8 +10,8 @@ RUN apt-get install -y nodejs
 WORKDIR /app
 
 # 4. Install Python Dependencies (The Brain)
-COPY aura_brain/requirements.txt ./aura_brain/requirements.txt
-RUN pip install --no-cache-dir -r aura_brain/requirements.txt
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 5. Install Node Dependencies (The Server)
 COPY package*.json ./
