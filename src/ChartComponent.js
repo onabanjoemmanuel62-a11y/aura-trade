@@ -325,13 +325,13 @@ const ChartComponent = ({ levels }) => {
 
   // --- EFFECT 3: SOCKET (403 & CORS BYPASS MODE) ---
   useEffect(() => {
-    // 🛡️ CRITICAL FIX: FORCE POLLING + REMOVE CREDENTIALS
-    // 1. 'polling' bypasses the Python Proxy's limited WebSocket support.
+    // 🛡️ CRITICAL FIX: FORCE POLLING + DISABLE CREDENTIALS
+    // 1. 'polling' bypasses Proxy issues.
     // 2. 'withCredentials: false' fixes the CORS "Wildcard" error.
     const socket = io(API_URL, { 
         transports: ['polling'], 
         reconnection: true,
-        withCredentials: false, // 👈 FIXED: Must be false when server uses origin "*"
+        withCredentials: false, // 👈 FIXED: Must be FALSE to allow CORS '*'
         path: '/socket.io/', 
     });
     
