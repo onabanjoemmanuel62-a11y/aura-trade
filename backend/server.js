@@ -78,9 +78,26 @@ app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
 
-// ✅ REMOVED: /api/analyze route (This is now handled by Python brain)
-// The Python FastAPI server handles /api/analyze directly
-// No need to proxy it here since Python is the public-facing server
+// ✅ RESTORED: PYTHON BRIDGE 
+// Fixes 404 Error if the request hits Node.js instead of Python
+app.post('/api/analyze', async (req, res) => {
+    try {
+        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
+        // Forward the request to the internal Python Service on port 8000
+        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
+        res.json(response.data);
+    } catch (error) {
+        console.error("🧠 Brain Connection Error:", error.message);
+        // Fallback if Python is restarting or busy (Prevents Frontend Crash)
+        res.status(200).json({ 
+            signal: "HOLD", 
+            confidence: 0, 
+            trend: "NEUTRAL",
+            reasoning: ["AI Brain is initializing or unreachable..."],
+            keyLevels: { resistance: 0, support: 0, ema: 0 }
+        });
+    }
+});
 
 // Health Check Route
 app.get('/healthcheck', (req, res) => {
