@@ -86,7 +86,8 @@ def load_data_into_memory():
         df.dropna(subset=numeric_cols, inplace=True)
 
         if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'])
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df.dropna(subset=['Date'], inplace=True)
             df.set_index('Date', inplace=True)
             df.sort_index(inplace=True)
 
@@ -117,40 +118,90 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "USD"
 
-# --- 2. FRACTAL PATTERN RECOGNITION (SAFE) ---
+# --- 2. FRACTAL PATTERN RECOGNITION (BULLETPROOF) ---
 def find_fractals(df):
+    """
+    🛡️ CRASH-PROOF FRACTAL SCANNER
+    Returns empty list if anything goes wrong, never raises exceptions
+    """
     try:
         # Use simple tail to avoid index issues
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
         prices = recent_data['Close'].values
         
         if len(prices) < PATTERN_SIZE + 24:
+            logger.warning(f"⚠️ Not enough data for fractals: {len(prices)} candles")
             return []
 
+        # 🛡️ SAFE ARRAY OPERATIONS
         current_pattern = prices[-PATTERN_SIZE:]
+        
+        # Check for NaN or Inf in current pattern
+        if np.any(np.isnan(current_pattern)) or np.any(np.isinf(current_pattern)):
+            logger.warning("⚠️ Invalid values in current pattern")
+            return []
+        
         scaler = MinMaxScaler()
-        current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
+        try:
+            current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
+        except Exception as e:
+            logger.error(f"⚠️ Normalization failed: {e}")
+            return []
         
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
         # Scan every 2nd candle
         for i in range(0, history_limit, 2):
-            candidate = prices[i : i + PATTERN_SIZE]
-            candidate_norm = scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
-            
-            # Simple correlation check
-            if len(current_norm) != len(candidate_norm): continue
-            
-            corr, _ = pearsonr(current_norm, candidate_norm)
-            
-            if corr > 0.85: 
-                future_price = prices[i + PATTERN_SIZE + 24]
-                entry_price = prices[i + PATTERN_SIZE]
-                outcome = "BULLISH" if future_price > entry_price else "BEARISH"
-                matches.append({"outcome": outcome, "similarity": safe_float(corr)})
+            try:
+                candidate = prices[i : i + PATTERN_SIZE]
                 
+                # Skip if wrong length
+                if len(candidate) != PATTERN_SIZE:
+                    continue
+                
+                # Skip if contains NaN/Inf
+                if np.any(np.isnan(candidate)) or np.any(np.isinf(candidate)):
+                    continue
+                
+                # 🛡️ SAFE NORMALIZATION
+                candidate_scaler = MinMaxScaler()
+                candidate_norm = candidate_scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
+                
+                # 🛡️ SAFE CORRELATION
+                if len(current_norm) != len(candidate_norm):
+                    continue
+                
+                # Check for constant arrays (would cause correlation error)
+                if np.std(current_norm) == 0 or np.std(candidate_norm) == 0:
+                    continue
+                
+                corr, p_value = pearsonr(current_norm, candidate_norm)
+                
+                # Skip if correlation is NaN
+                if math.isnan(corr) or math.isinf(corr):
+                    continue
+                
+                if corr > 0.85: 
+                    # Ensure we have enough data for future price
+                    if i + PATTERN_SIZE + 24 < len(prices):
+                        future_price = safe_float(prices[i + PATTERN_SIZE + 24])
+                        entry_price = safe_float(prices[i + PATTERN_SIZE])
+                        
+                        if future_price > 0 and entry_price > 0:
+                            outcome = "BULLISH" if future_price > entry_price else "BEARISH"
+                            matches.append({
+                                "outcome": outcome, 
+                                "similarity": safe_float(corr),
+                                "future_change": safe_float((future_price - entry_price) / entry_price * 100)
+                            })
+            except Exception as inner_e:
+                # Skip this candidate and continue
+                continue
+                
+        logger.info(f"✅ Fractal scan complete: {len(matches)} matches found")
         return matches
+        
     except Exception as e:
         logger.error(f"⚠️ Fractal Scan Error: {e}")
         return []
@@ -169,22 +220,40 @@ async def analyze(req: AnalysisRequest):
         }
 
     try:
-        # 🛡️ LEVEL 2: SAFE CALCULATIONS
+        # 🛡️ SAFE CALCULATIONS
         current_price = safe_float(df['Close'].iloc[-1])
+        
+        # Initialize fallback values
+        ema_200 = current_price
+        rsi = 50.0
         
         # Calculate Technicals (Wrap in Try/Except)
         try:
             ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
+            ema_200 = safe_float(ema_series.iloc[-1], current_price)
+        except Exception as e:
+            logger.warning(f"⚠️ EMA calculation failed: {e}")
+            ema_200 = current_price
+        
+        try:
             rsi_series = RSIIndicator(close=df['Close'], window=14).rsi()
-            ema_200 = safe_float(ema_series.iloc[-1])
-            rsi = safe_float(rsi_series.iloc[-1])
-        except:
-            ema_200 = current_price # Fallback
+            rsi = safe_float(rsi_series.iloc[-1], 50.0)
+        except Exception as e:
+            logger.warning(f"⚠️ RSI calculation failed: {e}")
             rsi = 50.0
 
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # Fractals
+        # 🛡️ SAFE KEY LEVELS (Calculate BEFORE fractals)
+        try:
+            recent_high = safe_float(df['High'].tail(50).max(), current_price * 1.02)
+            recent_low = safe_float(df['Low'].tail(50).min(), current_price * 0.98)
+        except Exception as e:
+            logger.warning(f"⚠️ Key levels calculation failed: {e}")
+            recent_high = current_price * 1.02
+            recent_low = current_price * 0.98
+        
+        # Fractals (Safe - returns empty list on error)
         matches = find_fractals(df)
         total_matches = len(matches)
         
@@ -202,14 +271,11 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_wins / total_matches) * 100
             
+            # Adjust confidence based on trend
             if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
                 confidence -= 15
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
                 confidence -= 10
-
-        # SAFE KEY LEVELS
-        recent_high = safe_float(df['High'].tail(50).max())
-        recent_low = safe_float(df['Low'].tail(50).min())
 
         return {
             "signal": signal,
@@ -222,7 +288,7 @@ async def analyze(req: AnalysisRequest):
                 f"Trend: {trend} (EMA: {round(ema_200, 2)}).",
                 f"RSI: {round(rsi, 2)}."
             ],
-            # 📊 KEY LEVELS FOR CHART (Res, Sup, EMA)
+            # 📊 KEY LEVELS FOR CHART (Will never be 0 now)
             "keyLevels": {
                 "resistance": recent_high,
                 "support": recent_low,
@@ -231,15 +297,27 @@ async def analyze(req: AnalysisRequest):
         }
 
     except Exception as e:
-        logger.error(f"❌ Analysis Crash: {e}")
-        # 🛡️ LEVEL 3: FAILSAFE RESPONSE (Never return 500)
+        logger.error(f"❌ Analysis Crash: {e}", exc_info=True)
+        # 🛡️ FAILSAFE RESPONSE (Never return 500)
+        # Return reasonable fallback values
+        try:
+            fallback_price = safe_float(df['Close'].iloc[-1], 5000.0)
+        except:
+            fallback_price = 5000.0
+            
         return {
-            "signal": "NEUTRAL", "confidence": 0, "trend": "NEUTRAL",
-            "reasoning": [f"Analysis Rebooting... ({str(e)})"], 
-            "keyLevels": {"resistance": 0, "support": 0, "ema": 0}
+            "signal": "NEUTRAL", 
+            "confidence": 0, 
+            "trend": "NEUTRAL",
+            "reasoning": [f"Analysis temporarily unavailable. System recovering..."], 
+            "keyLevels": {
+                "resistance": fallback_price * 1.02, 
+                "support": fallback_price * 0.98, 
+                "ema": fallback_price
+            }
         }
 
-# ⚡ NEW: PROXY ALL OTHER REQUESTS TO NODE.JS
+# ⚡ PROXY ALL OTHER REQUESTS TO NODE.JS
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     """
@@ -247,33 +325,64 @@ async def proxy_to_node(path: str, request: Request):
     This handles: /, /api/candles, /api/news, /api/trades, Socket.io
     """
     try:
+        # Build full URL
+        url = f"{NODE_URL}/{path}"
+        
+        # Build query string
+        query_string = str(request.url.query)
+        if query_string:
+            url = f"{url}?{query_string}"
+        
+        logger.info(f"🔄 Proxying {request.method} {path} -> {url}")
+        
+        # Get request body
+        body = None
+        if request.method in ["POST", "PUT", "PATCH"]:
+            try:
+                body = await request.body()
+            except:
+                body = None
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            url = f"{NODE_URL}/{path}"
-            
-            # Build query string
-            query_string = str(request.url.query)
-            if query_string:
-                url = f"{url}?{query_string}"
-            
             # Forward the request
             response = await client.request(
                 method=request.method,
                 url=url,
                 headers={k: v for k, v in request.headers.items() 
                         if k.lower() not in ['host', 'content-length']},
-                content=await request.body() if request.method in ["POST", "PUT"] else None
+                content=body
             )
             
             # Return response from Node.js
             return Response(
                 content=response.content,
                 status_code=response.status_code,
-                headers=dict(response.headers)
+                headers={k: v for k, v in dict(response.headers).items()
+                        if k.lower() not in ['content-encoding', 'transfer-encoding', 'connection']}
             )
             
     except httpx.ConnectError:
         logger.error(f"❌ Cannot connect to Node.js at {NODE_URL}")
         raise HTTPException(status_code=503, detail="Node.js service unavailable")
     except Exception as e:
-        logger.error(f"❌ Proxy error: {e}")
+        logger.error(f"❌ Proxy error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+# 💓 HEALTH CHECK
+@app.get("/health")
+async def health():
+    """Health check for both Python and Node.js"""
+    node_status = "unknown"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{NODE_URL}/healthcheck")
+            node_status = "healthy" if response.status_code == 200 else "unhealthy"
+    except:
+        node_status = "unreachable"
+    
+    return {
+        "python_brain": "healthy",
+        "node_server": node_status,
+        "data_loaded": MARKET_MEMORY["df"] is not None,
+        "candles_in_memory": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0
+    }

@@ -37,25 +37,35 @@ connectDB();
 const app = express();
 const server = http.createServer(app);
 
-// 🛡️ 1. GLOBAL CORS FIX (Crucial for Vercel/Production)
-// This ensures that your frontend at Vercel can talk to Render without being blocked.
+// 🛡️ 1. GLOBAL CORS FIX (Crucial for Vercel/Production + Proxy Compatibility)
 app.use(cors({
     origin: true, // Dynamically allow the origin of the requester
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept']
+    allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept', 'X-Requested-With']
 }));
 
 app.use(express.json());
 
-// 🛡️ 2. SOCKET.IO SETUP (Fixes 403 Forbidden & Connection Rejected)
+// 🛡️ 2. SOCKET.IO SETUP (Fixed for Proxy + 403 Prevention)
 const io = new Server(server, {
   cors: { 
-      origin: "*", // Allow all origins for WebSockets
+      origin: "*", // Allow all origins (Python proxy strips original origin)
       methods: ["GET", "POST"],
-      credentials: true 
+      credentials: true,
+      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"]
   },
-  transports: ['websocket', 'polling'] // Explicitly enable both for stability
+  transports: ['websocket', 'polling'], // Support both transports
+  allowEIO3: true, // Support older Socket.io clients
+  pingTimeout: 60000, // 60 seconds before considering connection dead
+  pingInterval: 25000, // Send ping every 25 seconds
+  upgradeTimeout: 30000, // Time to wait for upgrade
+  maxHttpBufferSize: 1e6, // 1MB max message size
+  // 🔑 KEY FIX: Allow requests from proxy
+  allowRequest: (req, callback) => {
+    // Always allow - proxy strips origin info
+    callback(null, true);
+  }
 });
 
 const PORT = process.env.PORT || 10000; // Render standard port is 10000
@@ -68,34 +78,53 @@ app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
 
-// ✅ NEW: Proxy Request to Python Brain
-app.post('/api/analyze', async (req, res) => {
-    try {
-        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
-        // Forward the request to the internal Python Service on port 8000
-        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
-        res.json(response.data);
-    } catch (error) {
-        console.error("🧠 Brain Connection Error:", error.message);
-        // Fallback if Python is restarting or busy
-        res.status(500).json({ 
-            signal: "HOLD", 
-            confidence: 0, 
-            trend: "NEUTRAL",
-            reasoning: ["AI Brain is initializing or under high load..."] 
-        });
-    }
-});
+// ✅ REMOVED: /api/analyze route (This is now handled by Python brain)
+// The Python FastAPI server handles /api/analyze directly
+// No need to proxy it here since Python is the public-facing server
 
 // Health Check Route
-app.get('/healthcheck', (req, res) => res.status(200).send('OK'));
+app.get('/healthcheck', (req, res) => {
+  res.status(200).json({ 
+    status: 'OK', 
+    service: 'node-backend',
+    timestamp: new Date().toISOString()
+  });
+});
 
 app.get('/', (req, res) => res.send('AuraTrade Monolith API is Live 🚀'));
 
-// 4. SOCKET LOGIC
+// 4. SOCKET LOGIC (Enhanced Logging)
 io.on('connection', (socket) => {
   console.log('⚡ Client Connected:', socket.id);
-  socket.on('disconnect', () => console.log('❌ Client Disconnected:', socket.id));
+  console.log('   Transport:', socket.conn.transport.name);
+  console.log('   IP:', socket.handshake.address);
+  
+  // Send initial connection confirmation
+  socket.emit('connected', { 
+    socketId: socket.id, 
+    timestamp: new Date().toISOString() 
+  });
+  
+  socket.on('disconnect', (reason) => {
+    console.log('❌ Client Disconnected:', socket.id, '- Reason:', reason);
+  });
+  
+  socket.on('error', (error) => {
+    console.error('🔴 Socket Error:', socket.id, error);
+  });
+  
+  // Handle ping/pong for connection health
+  socket.on('ping', () => {
+    socket.emit('pong', { timestamp: Date.now() });
+  });
+});
+
+// Monitor Socket.io connection errors
+io.engine.on('connection_error', (err) => {
+  console.error('⚠️ Socket.io Connection Error:');
+  console.error('   Code:', err.code);
+  console.error('   Message:', err.message);
+  console.error('   Context:', err.context);
 });
 
 // ==========================================
@@ -165,6 +194,8 @@ const handleNewTick = async (data) => {
     });
 
     await Promise.all(updatePromises);
+    
+    // Emit price update to all connected Socket.io clients
     io.emit('price-update', data);
 
   } catch (err) {
@@ -199,6 +230,9 @@ const connectBinanceStream = () => {
     binanceWs.on('open', () => {
       console.log('✅ Connected to Binance! Stream is live.');
       failureCount = 0;
+      
+      // Notify Socket.io clients that data stream is connected
+      io.emit('stream-status', { connected: true, source: 'Binance' });
     });
 
     binanceWs.on('message', async (raw) => {
@@ -217,7 +251,9 @@ const connectBinanceStream = () => {
 
         await handleNewTick(candlePayload);
 
-      } catch (err) { }
+      } catch (err) { 
+        // Ignore parse errors for non-critical data
+      }
     });
 
     binanceWs.on('error', (err) => {
@@ -226,6 +262,10 @@ const connectBinanceStream = () => {
 
     binanceWs.on('close', () => {
       console.log('⚠️ Binance Disconnected.');
+      
+      // Notify Socket.io clients that stream is disconnected
+      io.emit('stream-status', { connected: false, source: 'Binance' });
+      
       handleDisconnection();
     });
 
@@ -264,6 +304,14 @@ if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   }, 300000); // 5 Minutes
 }
 
+// ==========================================
+// 🚀 START SERVER
+// ==========================================
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Monolith Server running on port ${PORT}`);
+  console.log(`🚀 Node.js Server running on port ${PORT}`);
+  console.log(`🔌 Socket.io initialized with proxy-compatible CORS`);
+  console.log(`🧠 Ready to receive requests from Python gateway (Port 8000)`);
 });
+
+// Export for testing
+module.exports = { app, server, io };
