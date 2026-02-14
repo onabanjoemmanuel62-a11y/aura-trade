@@ -6,7 +6,6 @@ import HistoryTable from './HistoryTable';
 import './App.css';
 
 // ⚠️ CRITICAL UPDATE: Use the URL from your Render Dashboard
-// Based on your logs, it is likely this one:
 const API_URL = 'https://aura-trade-v1.onrender.com'; 
 
 function App() {
@@ -65,7 +64,7 @@ function App() {
           {/* Chart Area */}
           <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden' }}>
             <ChartComponent 
-               levels={aiData?.keyLevels || []} 
+               levels={aiData?.keyLevels || { resistance: 0, support: 0, ema: 0 }} 
             />
           </div>
 
