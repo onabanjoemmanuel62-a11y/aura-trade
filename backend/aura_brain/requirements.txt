@@ -1,8 +1,10 @@
 fastapi
 uvicorn
-yfinance
 pandas
 numpy
 scikit-learn
-ta
 scipy
+ta
+httpx
+requests
+python-multipart

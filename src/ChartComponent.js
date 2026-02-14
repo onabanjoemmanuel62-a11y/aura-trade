@@ -14,7 +14,7 @@ const ChartComponent = ({ levels }) => {
   // 1. SAFE REF NAME
   const candleSeriesRef = useRef(null); 
   
-  // 2. ⚡ NEW: REF FOR TRENDLINES (To track and remove them)
+  // 2. REF FOR TRENDLINES (To track and remove them)
   const linesRef = useRef({ resistance: null, support: null, ema: null });
   
   const currentBarRef = useRef(null);
@@ -129,7 +129,10 @@ const ChartComponent = ({ levels }) => {
     // EMA = YELLOW (Solid)
     linesRef.current.ema = createLine(emaPrice, '#FFD700', '200 EMA', 0, 1);
 
-    console.log("📊 Chart Updated Lines:", { resPrice, supPrice, emaPrice });
+    // Only log if we actually drew something
+    if (resPrice || supPrice || emaPrice) {
+        console.log("📊 Chart Updated Lines:", { resPrice, supPrice, emaPrice });
+    }
 
   }, [levels]); // Re-run whenever 'levels' prop changes
 
@@ -320,12 +323,24 @@ const ChartComponent = ({ levels }) => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET ---
+  // --- EFFECT 3: SOCKET (403 BYPASS MODE) ---
   useEffect(() => {
-    const socket = io(API_URL, { transports: ['websocket'], reconnection: true });
+    // 🛡️ CRITICAL FIX: FORCE POLLING
+    // This bypasses the Python Proxy's inability to upgrade WebSockets perfectly
+    const socket = io(API_URL, { 
+        transports: ['polling'], 
+        reconnection: true,
+        withCredentials: true,
+        path: '/socket.io/', // Ensure standard path
+    });
+    
     socketRef.current = socket;
 
-    socket.on('connect', () => setConnectionStatus('Connected'));
+    socket.on('connect', () => {
+        setConnectionStatus('Connected');
+        console.log("✅ Socket Connected via Polling!");
+    });
+    
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
 
     socket.on('price-update', (data) => {
