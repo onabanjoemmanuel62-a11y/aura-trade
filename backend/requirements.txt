@@ -8,3 +8,4 @@ ta
 httpx
 requests
 python-multipart
+pydantic

@@ -1,21 +1,23 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
+import { createChart, ColorType, CandlestickSeries, LineSeries } from 'lightweight-charts';
 import axios from 'axios';
 import io from 'socket.io-client';
 
 // ☁️ LIVE CLOUD SERVER ADDRESS
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-const ChartComponent = ({ levels }) => {
+// ⚠️ UPDATED: Now accepts 'visuals' prop for the AI data
+const ChartComponent = ({ levels, visuals }) => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   
-  // 1. SAFE REF NAME
+  // 1. SAFE REF NAMES
   const candleSeriesRef = useRef(null); 
+  const fractalSeriesRef = useRef(null); // 👻 NEW: For the Ghost Pattern
   
-  // 2. REF FOR TRENDLINES (To track and remove them)
-  const linesRef = useRef({ resistance: null, support: null, ema: null });
+  // 2. REF FOR TRENDLINES (Updated to store arrays of lines)
+  const linesRef = useRef([]); 
   
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
@@ -75,66 +77,70 @@ const ChartComponent = ({ levels }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- ⚡ NEW: DRAW TRENDLINES & LEVELS ---
+  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES & LEVELS ---
   useEffect(() => {
-    // Wait for chart series to be ready and data to exist
-    if (!candleSeriesRef.current || !levels) return;
+    if (!candleSeriesRef.current) return;
 
-    // 1. Helper to clear old lines
-    const clearLine = (key) => {
-        if (linesRef.current[key]) {
-            candleSeriesRef.current.removePriceLine(linesRef.current[key]);
-            linesRef.current[key] = null;
-        }
-    };
+    // 1. Clear OLD Lines
+    linesRef.current.forEach(line => candleSeriesRef.current.removePriceLine(line));
+    linesRef.current = [];
 
-    // Clear everything first
-    clearLine('resistance');
-    clearLine('support');
-    clearLine('ema');
-
-    // 2. Parse Data (Handle both Array and Object formats for safety)
-    let resPrice, supPrice, emaPrice;
-
-    if (Array.isArray(levels)) {
-        resPrice = levels[0];
-        supPrice = levels[1];
-        emaPrice = levels[2];
-    } else if (levels && typeof levels === 'object') {
-        resPrice = levels.resistance;
-        supPrice = levels.support;
-        emaPrice = levels.ema;
-    }
-
-    // 3. Helper to create new lines
-    const createLine = (price, color, title, style = 2, width = 2) => {
-        if (price && !isNaN(parseFloat(price)) && parseFloat(price) > 0) {
-            return candleSeriesRef.current.createPriceLine({
+    // 2. Helper to create lines
+    const addLine = (price, color, title, style = 2) => {
+        if (price && !isNaN(parseFloat(price))) {
+            const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price),
                 color: color,
-                lineWidth: width,
+                lineWidth: 2,
                 lineStyle: style, // 2 = Dashed, 0 = Solid
                 axisLabelVisible: true,
                 title: title,
             });
+            linesRef.current.push(line);
         }
-        return null;
     };
 
-    // 4. Draw the lines
-    // Resistance = RED (Dashed)
-    linesRef.current.resistance = createLine(resPrice, '#ef5350', 'RESISTANCE', 2, 2);
-    // Support = GREEN (Dashed)
-    linesRef.current.support = createLine(supPrice, '#26a69a', 'SUPPORT', 2, 2);
-    // EMA = YELLOW (Solid)
-    linesRef.current.ema = createLine(emaPrice, '#FFD700', '200 EMA', 0, 1);
-
-    // Only log if we actually drew something
-    if (resPrice || supPrice || emaPrice) {
-        console.log("📊 Chart Updated Lines:", { resPrice, supPrice, emaPrice });
+    // 3. Draw Lines from 'visuals' (The Smart Lines)
+    if (visuals && visuals.lines && visuals.lines.length > 0) {
+        visuals.lines.forEach(line => {
+            const color = line.type === 'RESISTANCE' ? '#ef5350' : '#26a69a';
+            addLine(line.price, color, line.type);
+        });
+    } 
+    // Fallback to basic 'levels' if no smart lines
+    else if (levels) {
+        addLine(levels.resistance, '#ef5350', 'RESISTANCE');
+        addLine(levels.support, '#26a69a', 'SUPPORT');
     }
 
-  }, [levels]); // Re-run whenever 'levels' prop changes
+    // Always draw EMA if available
+    if (levels && levels.ema) {
+        addLine(levels.ema, '#FFD700', '200 EMA', 0);
+    }
+
+  }, [levels, visuals]); 
+
+  // --- 👻 NEW: DRAW THE GHOST PATTERN (FRACTAL) ---
+  useEffect(() => {
+    if (!fractalSeriesRef.current || !visuals?.fractal || !currentBarRef.current) return;
+
+    const { plot_data } = visuals.fractal;
+    if (!plot_data || plot_data.length === 0) return;
+
+    // Calculate start time for the ghost (Right after current candle)
+    const currentTime = currentBarRef.current.time;
+    const interval = timeframeRef.current === '1h' ? 3600 : 14400; // Seconds
+
+    // Map the price data to future timestamps
+    const ghostData = plot_data.map((price, index) => ({
+        time: currentTime + ((index + 1) * interval),
+        value: price
+    }));
+
+    fractalSeriesRef.current.setData(ghostData);
+    console.log(`👻 Ghost Pattern Projected: ${ghostData.length} candles into future`);
+
+  }, [visuals, timeframe]); // Re-draw when AI visuals update
 
   // --- 📰 STEP 1: FETCH NEWS DATA ---
   useEffect(() => {
@@ -175,9 +181,6 @@ const ChartComponent = ({ levels }) => {
         try {
             if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
-                console.log(`✅ Pinned ${markers.length} News Flags to the Chart`);
-            } else {
-                console.warn("⚠️ Chart Series not fully ready for markers yet.");
             }
         } catch (err) {
             console.error("❌ Failed to set markers:", err);
@@ -235,11 +238,12 @@ const ChartComponent = ({ levels }) => {
       grid: { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
       width: chartContainerRef.current.clientWidth,
       height: 500,
-      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 15, barSpacing: 12, minBarSpacing: 5 },
+      timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 20, barSpacing: 12, minBarSpacing: 5 },
       rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 }, borderVisible: false, autoScale: true },
       crosshair: { mode: 1, vertLine: { labelVisible: true }, horzLine: { labelVisible: true, labelBackgroundColor: '#4CAF50' } }
     });
 
+    // 1. CANDLESTICK SERIES
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645',
       borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645',
@@ -247,8 +251,20 @@ const ChartComponent = ({ levels }) => {
       priceLineWidth: 1, priceLineStyle: 2,
     });
 
+    // 2. GHOST SERIES (Fractal)
+    const ghostSeries = chart.addSeries(LineSeries, {
+        color: '#a855f7', // 🔮 PURPLE GHOST COLOR
+        lineWidth: 2,
+        lineStyle: 2, // Dashed
+        crosshairMarkerVisible: false,
+        lastValueVisible: false,
+        priceLineVisible: false,
+        title: 'AI PROJECTION'
+    });
+
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
+    fractalSeriesRef.current = ghostSeries; // Save ref for data updates
 
     const onVisibleLogicalRangeChanged = (newVisibleLogicalRange) => {
         if (newVisibleLogicalRange === null) return;
@@ -323,15 +339,12 @@ const ChartComponent = ({ levels }) => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- EFFECT 3: SOCKET (403 & CORS BYPASS MODE) ---
+  // --- EFFECT 3: SOCKET ---
   useEffect(() => {
-    // 🛡️ CRITICAL FIX: FORCE POLLING + DISABLE CREDENTIALS
-    // 1. 'polling' bypasses Proxy issues.
-    // 2. 'withCredentials: false' fixes the CORS "Wildcard" error.
     const socket = io(API_URL, { 
         transports: ['polling'], 
         reconnection: true,
-        withCredentials: false, // 👈 FIXED: Must be FALSE to allow CORS '*'
+        withCredentials: false,
         path: '/socket.io/', 
     });
     
@@ -402,16 +415,15 @@ const ChartComponent = ({ levels }) => {
       setTimeframe(newTf);
       timeframeRef.current = newTf; 
       isHistoryLoaded.current = false;
+      
+      // Clear Ghost on Timeframe Change
+      if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]);
   };
 
-  // 🚀 FIXED: HARD SNAP RESET
   const handleReset = () => {
     if (chartRef.current) {
-        // 1. Instant Jump (false = no animation)
         chartRef.current.timeScale().scrollToPosition(0, false);
-        // 2. Reset Zoom
         chartRef.current.timeScale().applyOptions({ barSpacing: 12 });
-        // 3. Fix Scaling
         chartRef.current.priceScale('right').applyOptions({ autoScale: true });
     }
   };
@@ -433,7 +445,6 @@ const ChartComponent = ({ levels }) => {
         onMouseEnter={() => setIsHoveringControls(true)} 
         onMouseLeave={() => setIsHoveringControls(false)}
     >
-      
       {/* LOADING SPINNER */}
       {isLoading && (
         <div style={{

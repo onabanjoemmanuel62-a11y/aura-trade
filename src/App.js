@@ -63,8 +63,10 @@ function App() {
           
           {/* Chart Area */}
           <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden' }}>
+            {/* ⚠️ UPDATED: Passing 'visuals' so the Ghost Pattern and Trendlines appear */}
             <ChartComponent 
                levels={aiData?.keyLevels || { resistance: 0, support: 0, ema: 0 }} 
+               visuals={aiData?.visuals || {}}
             />
           </div>
 
