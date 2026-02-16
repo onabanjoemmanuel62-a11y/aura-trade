@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 import httpx
 from starlette.responses import Response
 
-# ✅ CORRECT IMPORTS
+# ✅ TECHNICAL ANALYSIS LIBRARY
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator 
 
@@ -31,16 +31,16 @@ MARKET_MEMORY = {"df": None}
 
 # --- HELPER: SAFE NUMBER ---
 def safe_float(value, default=0.0):
+    """Converts anything to a float. Returns default if it fails."""
     try:
         if value is None: return default
         num = float(value)
-        if math.isnan(num) or math.isinf(num):
-            return default
+        if math.isnan(num) or math.isinf(num): return default
         return num
     except:
         return default
 
-# --- 1. DATA ENGINE (UNCHANGED) ---
+# --- 1. DATA ENGINE ---
 def load_data_into_memory():
     """Loads CSV once and stores it in RAM"""
     try:
@@ -56,25 +56,22 @@ def load_data_into_memory():
                 logger.error(f"❌ File not found: {CSV_FILENAME}")
                 return None
 
-        # READ CSV (Robust)
+        # READ CSV
         try:
             df = pd.read_csv(file_path, sep=';')
-            if len(df.columns) < 2:
-                df = pd.read_csv(file_path, sep=',')
+            if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',')
         except:
             df = pd.read_csv(file_path, sep=',')
         
         # CLEANUP
         df.columns = [c.lower().strip() for c in df.columns]
         rename_map = {
-            'close': 'Close', 'c': 'Close', '<close>': 'Close',
-            'high': 'High', 'h': 'High', '<high>': 'High',
-            'low': 'Low', 'l': 'Low', '<low>': 'Low',
-            'open': 'Open', 'o': 'Open', '<open>': 'Open',
-            'date': 'Date', 'time': 'Date', 'timestamp': 'Date', '<date>': 'Date'
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 
+            'date': 'Date', 'time': 'Date', 'timestamp': 'Date'
         }
         df.rename(columns=rename_map, inplace=True)
         
+        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
@@ -117,126 +114,146 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "USD"
 
-# --- 2. SMART TRENDLINE ENGINE (TIGHTER & CLOSER) ---
+# --- 2. SMART TRENDLINE ENGINE ---
 def detect_key_levels(df):
-    """
-    Finds PIVOT points relative to CURRENT price.
-    Only keeps lines within 5% of current price to avoid 'Lagging Lines'.
-    """
     try:
-        if df.empty: return []
-        
         work_df = df.reset_index()
         close_prices = work_df['Close'].values
-        current_price = close_prices[-1]
-        last_index = len(close_prices) - 1
-        
-        # Order=5 means local peak for 5 candles (Finds tighter, closer pivots)
-        order = 5 
+        order = 15 
         
         resistance_idxs = argrelextrema(close_prices, np.greater, order=order)[0]
         support_idxs = argrelextrema(close_prices, np.less, order=order)[0]
         
         lines = []
+        last_index = len(close_prices) - 1
 
-        # 1. RESISTANCE (Above Price & Within 5% range)
-        valid_res = [i for i in resistance_idxs if close_prices[i] > current_price and close_prices[i] < current_price * 1.05]
-        valid_res.sort(key=lambda i: close_prices[i]) # Closest first
-        
-        for idx in valid_res[:2]: # Top 2 closest
-            lines.append({
-                "type": "RESISTANCE",
-                "price": float(close_prices[idx]),
-                "start_index": int(idx),
-                "end_index": int(last_index)
-            })
+        for idx in resistance_idxs[-3:]: 
+            lines.append({"type": "RESISTANCE", "price": float(close_prices[idx])})
 
-        # 2. SUPPORT (Below Price & Within 5% range)
-        valid_sup = [i for i in support_idxs if close_prices[i] < current_price and close_prices[i] > current_price * 0.95]
-        valid_sup.sort(key=lambda i: close_prices[i], reverse=True) # Closest first
-        
-        for idx in valid_sup[:2]: # Top 2 closest
-            lines.append({
-                "type": "SUPPORT",
-                "price": float(close_prices[idx]),
-                "start_index": int(idx),
-                "end_index": int(last_index)
-            })
+        for idx in support_idxs[-3:]:
+            lines.append({"type": "SUPPORT", "price": float(close_prices[idx])})
             
         return lines
     except Exception as e:
         logger.warning(f"⚠️ Trendline detection failed: {e}")
         return []
 
-# --- 3. FRACTAL PATTERN RECOGNITION (NORMALIZED) ---
+# --- 3. FRACTAL PATTERN RECOGNITION (FIXED NORMALIZATION) ---
 def find_fractals(df):
     """
-    Finds historical matches and PROJECTS them onto current price.
-    Fixes the 'Wild Jump' by normalizing the ghost line to start at current price.
+    Finds historical patterns and projects them onto current price.
     """
     try:
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
         prices = recent_data['Close'].values
-        current_price_level = prices[-1] # The live price right now
+        current_price = prices[-1] # Crucial for normalization
         
         if len(prices) < PATTERN_SIZE + 24: return []
+
         current_pattern = prices[-PATTERN_SIZE:]
         
+        # Validate data
         if np.any(np.isnan(current_pattern)) or np.any(np.isinf(current_pattern)): return []
         
         scaler = MinMaxScaler()
-        try:
-            current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
-        except: return []
+        current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
         
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
-        # Scan every 3rd candle
-        for i in range(0, history_limit, 3):
+        for i in range(0, history_limit, 2):
             try:
                 candidate = prices[i : i + PATTERN_SIZE]
-                if len(candidate) != PATTERN_SIZE: continue
-                
                 candidate_scaler = MinMaxScaler()
                 candidate_norm = candidate_scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
                 
                 corr, _ = pearsonr(current_norm, candidate_norm)
                 
-                if corr > 0.80: 
-                    # SHORTEN HORIZON: Only project next 15 candles (Clean Forecast)
-                    forecast_horizon = 15
-                    if i + PATTERN_SIZE + forecast_horizon < len(prices):
-                        
-                        # RAW Historical Data
-                        hist_start_price = prices[i + PATTERN_SIZE - 1] # Price at end of matched pattern
-                        raw_ghost_slice = prices[i + PATTERN_SIZE : i + PATTERN_SIZE + forecast_horizon]
-                        
-                        # 🧠 NORMALIZE: Shift the ghost to attach to CURRENT price
-                        # Formula: (Historical_Point - Historical_Start) + Current_Price
-                        price_diff = current_price_level - hist_start_price
-                        normalized_ghost = [p + price_diff for p in raw_ghost_slice]
+                if corr > 0.85: 
+                    # --- 🛡️ NORMALIZATION MAGIC HAPPENS HERE ---
+                    future_start_idx = i + PATTERN_SIZE
+                    future_end_idx = i + PATTERN_SIZE + 24
+                    
+                    hist_entry_price = prices[future_start_idx - 1]
+                    future_slice = prices[future_start_idx : future_end_idx]
+                    
+                    # Calculate percentage moves from history and apply to current price
+                    normalized_ghost = []
+                    for hist_price in future_slice:
+                        percent_change = (hist_price - hist_entry_price) / hist_entry_price
+                        projected_price = current_price * (1 + percent_change)
+                        normalized_ghost.append(projected_price)
 
-                        future_price_change = (raw_ghost_slice[-1] - hist_start_price) / hist_start_price
-                        outcome = "BULLISH" if future_price_change > 0 else "BEARISH"
-                        
-                        matches.append({
-                            "outcome": outcome, 
-                            "similarity": safe_float(corr),
-                            "future_change": safe_float(future_price_change * 100),
-                            "start_date": str(recent_data.index[i]),
-                            "plot_data": normalized_ghost # <--- SENDING SHIFTED DATA
-                        })
-            except: continue
+                    future_price = normalized_ghost[-1]
+                    
+                    outcome = "BULLISH" if future_price > current_price else "BEARISH"
+                    
+                    matches.append({
+                        "outcome": outcome, 
+                        "similarity": safe_float(corr),
+                        "future_change": safe_float((future_price - current_price) / current_price * 100),
+                        "start_date": str(recent_data.index[i]), 
+                        "plot_data": normalized_ghost # ✅ Send NORMALIZED data
+                    })
+            except:
+                continue
                 
-        matches.sort(key=lambda x: x['similarity'], reverse=True)
-        return matches[:5]
+        logger.info(f"✅ Fractal scan complete: {len(matches)} matches found")
+        return matches
         
     except Exception as e:
         logger.error(f"⚠️ Fractal Scan Error: {e}")
         return []
 
-# --- 4. API ENDPOINT (DYNAMIC SCOREBOARD) ---
+# --- 4. TRADE SETUP CALCULATOR ---
+def calculate_trade_levels(current_price, signal, support, resistance, atr_value=None):
+    """Calculates Entry, SL, TP based on market structure and volatility"""
+    try:
+        if atr_value is None or atr_value == 0:
+            atr_value = current_price * 0.01 # Default to 1% if ATR fails
+        
+        entry = current_price
+        stop_loss = 0.0
+        take_profit = 0.0
+
+        if signal == "BUY":
+            # SL below support, TP at resistance
+            stop_loss = support if support > 0 else current_price - (atr_value * 1.5)
+            take_profit = resistance if resistance > 0 else current_price + (atr_value * 2.0)
+            
+            # Safety checks (don't let SL be too close)
+            if (entry - stop_loss) < atr_value * 0.5:
+                stop_loss = entry - (atr_value * 1.5)
+            if (take_profit - entry) < atr_value:
+                take_profit = entry + (atr_value * 2.0)
+                
+        elif signal == "SELL":
+            # SL above resistance, TP at support
+            stop_loss = resistance if resistance > 0 else current_price + (atr_value * 1.5)
+            take_profit = support if support > 0 else current_price - (atr_value * 2.0)
+            
+            if (stop_loss - entry) < atr_value * 0.5:
+                stop_loss = entry + (atr_value * 1.5)
+            if (entry - take_profit) < atr_value:
+                take_profit = entry - (atr_value * 2.0)
+        else:
+            return None # No trade
+        
+        risk = abs(entry - stop_loss)
+        reward = abs(take_profit - entry)
+        rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+        return {
+            "entry": round(entry, 2),
+            "stop_loss": round(stop_loss, 2),
+            "take_profit": round(take_profit, 2),
+            "risk_reward": f"1:{rr_ratio}"
+        }
+    except Exception as e:
+        logger.error(f"Trade levels calc failed: {e}")
+        return None
+
+# --- 5. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     df = MARKET_MEMORY["df"]
@@ -251,83 +268,94 @@ async def analyze(req: AnalysisRequest):
     try:
         current_price = safe_float(df['Close'].iloc[-1])
         
-        # A. Technicals
-        try:
-            ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
-            ema_200 = safe_float(ema_series.iloc[-1], current_price)
-        except: ema_200 = current_price
+        # --- INDICATORS ---
+        ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
+        ema_200 = safe_float(ema_series.iloc[-1], current_price)
         
+        rsi_series = RSIIndicator(close=df['Close'], window=14).rsi()
+        rsi = safe_float(rsi_series.iloc[-1], 50.0)
+
+        # Volatility (ATR Approximation: High - Low)
         try:
-            rsi_series = RSIIndicator(close=df['Close'], window=14).rsi()
-            rsi = safe_float(rsi_series.iloc[-1], 50.0)
-        except: rsi = 50.0
+            atr_series = df['High'] - df['Low']
+            atr = safe_float(atr_series.tail(14).mean(), current_price * 0.01)
+        except:
+            atr = current_price * 0.01
 
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # B. Get Visuals
+        # --- AI SCANS ---
         trendlines = detect_key_levels(df)
         matches = find_fractals(df)
         
-        # C. Scoreboard
-        bull_score = 50
-        bear_score = 50
-        
-        if current_price > ema_200: bull_score += 10
-        else: bear_score += 10
-        
-        if rsi < 30: bull_score += 15 
-        elif rsi > 70: bear_score += 15 
-        
+        # --- SIGNAL LOGIC ---
+        total_matches = len(matches)
+        signal = "NEUTRAL"
+        confidence = 0
         best_match = None
-        if matches:
+
+        if total_matches >= 1:
+            matches.sort(key=lambda x: x['similarity'], reverse=True)
             best_match = matches[0]
-            sim_bonus = 20 * best_match['similarity']
-            if best_match['outcome'] == "BULLISH": bull_score += sim_bonus
-            else: bear_score += sim_bonus
 
-        final_signal = "HOLD"
-        final_confidence = 0
-        
-        if bull_score > bear_score:
-            final_signal = "BUY"
-            final_confidence = bull_score
-        elif bear_score > bull_score:
-            final_signal = "SELL"
-            final_confidence = bear_score
+        if total_matches >= 3:
+            bull_votes = len([m for m in matches if m['outcome'] == "BULLISH"])
+            bear_votes = len([m for m in matches if m['outcome'] == "BEARISH"])
             
-        final_confidence = min(98, int(final_confidence))
+            if bull_votes > bear_votes:
+                signal = "BUY"
+                confidence = (bull_votes / total_matches) * 100
+            elif bear_votes > bull_votes:
+                signal = "SELL"
+                confidence = (bear_votes / total_matches) * 100
+            
+            # Confidence Adjustments
+            if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
+                confidence -= 15
+            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
+                confidence -= 10
 
+        # --- TRADE SETUP GENERATION ---
+        # Find nearest S/R levels
+        res_level = next((l['price'] for l in trendlines if l['type'] == 'RESISTANCE' and l['price'] > current_price), 0)
+        sup_level = next((l['price'] for l in trendlines if l['type'] == 'SUPPORT' and l['price'] < current_price), 0)
+
+        trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
+
+        # --- FINAL RESPONSE ---
         return {
-            "signal": final_signal,
-            "confidence": final_confidence,
+            "signal": signal,
+            "confidence": int(max(0, min(99, confidence))),
             "trend": trend,
-            "pattern": f"Deep Scan ({len(matches)} Matches)",
+            "pattern": f"Deep Scan ({total_matches} Matches)",
             "reasoning": [
-                f"Trend: {trend} (EMA 200)",
+                f"Trend: {trend} (EMA: {round(ema_200, 2)})",
                 f"RSI: {round(rsi, 2)}",
-                f"History: {int(best_match['similarity']*100)}% match found" if best_match else "No match",
-                f"Projection: {best_match['outcome']}" if best_match else "Flat"
+                f"Fractal Memory: Found {total_matches} similar historical setups."
             ],
             "keyLevels": {
-                "resistance": trendlines[0]['price'] if trendlines else current_price * 1.02,
-                "support": trendlines[-1]['price'] if trendlines else current_price * 0.98,
+                "resistance": res_level if res_level > 0 else current_price * 1.02,
+                "support": sup_level if sup_level > 0 else current_price * 0.98,
                 "ema": ema_200
             },
             "visuals": {
                 "lines": trendlines,
                 "fractal": best_match
-            }
+            },
+            "tradeSetup": trade_setup
         }
 
     except Exception as e:
         logger.error(f"❌ Analysis Crash: {e}", exc_info=True)
         return {
-            "signal": "NEUTRAL", "confidence": 0, "trend": "NEUTRAL", 
-            "reasoning": ["Error calculating signals"],
+            "signal": "ERROR", 
+            "confidence": 0, 
+            "trend": "NEUTRAL",
+            "reasoning": ["Internal Analysis Error"],
             "keyLevels": {"resistance": 0, "support": 0, "ema": 0}
         }
 
-# ⚡ PROXY (UNCHANGED)
+# ⚡ PROXY ROUTE (UNCHANGED)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     try:
@@ -335,26 +363,23 @@ async def proxy_to_node(path: str, request: Request):
         query_string = str(request.url.query)
         if query_string: url = f"{url}?{query_string}"
         
-        body = None
-        if request.method in ["POST", "PUT", "PATCH"]:
-            try: body = await request.body()
-            except: body = None
+        logger.info(f"🔄 Proxying {request.method} {path} -> {url}")
+        
+        body = await request.body() if request.method in ["POST", "PUT"] else None
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
-                method=request.method,
-                url=url,
+                method=request.method, url=url,
                 headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
                 content=body
             )
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers={k: v for k, v in dict(response.headers).items() if k.lower() not in ['content-encoding', 'transfer-encoding', 'connection']}
-            )
-    except:
-        raise HTTPException(status_code=502, detail="Gateway Error")
+            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
+            
+    except Exception as e:
+        logger.error(f"❌ Proxy Error: {e}")
+        raise HTTPException(status_code=503, detail="Service Unavailable")
 
+# 💓 HEALTH CHECK (UNCHANGED)
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "candles_loaded": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0}
+    return {"status": "ok", "candles": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0}

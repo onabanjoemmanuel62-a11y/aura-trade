@@ -6,8 +6,8 @@ import io from 'socket.io-client';
 // ☁️ LIVE CLOUD SERVER ADDRESS
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// ⚠️ UPDATED: Accepts 'visuals' for dynamic trendlines & fractals
-const ChartComponent = ({ levels, visuals }) => {
+// ⚠️ UPDATED: Now accepts 'tradeSetup' to draw Entry/TP/SL lines
+const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
@@ -77,21 +77,21 @@ const ChartComponent = ({ levels, visuals }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES (SMART ENGINE) ---
+  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES + TRADE SETUP ---
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
-    // 1. Clear OLD Lines to prevent duplicates/lag
+    // 1. Clear OLD Lines to prevent duplicates
     linesRef.current.forEach(line => candleSeriesRef.current.removePriceLine(line));
     linesRef.current = [];
 
     // 2. Helper to create Clean Lines
-    const addLine = (price, color, title, isDashed = false) => {
+    const addLine = (price, color, title, isDashed = false, width = 2) => {
         if (price && !isNaN(parseFloat(price))) {
             const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price),
                 color: color,
-                lineWidth: 2,
+                lineWidth: width,
                 lineStyle: isDashed ? 2 : 0, // 0 = Solid, 2 = Dashed
                 axisLabelVisible: true,
                 title: title,
@@ -110,29 +110,35 @@ const ChartComponent = ({ levels, visuals }) => {
             }
         });
     } 
-    // Fallback if AI hasn't loaded dynamic lines yet
+    // Fallback
     else if (levels) {
         if (levels.resistance) addLine(levels.resistance, '#ef5350', 'RES', true);
         if (levels.support) addLine(levels.support, '#26a69a', 'SUP', true);
     }
 
-    // 4. Always Draw EMA (Solid Gold)
+    // 4. 💰 DRAW TRADE SETUP (NEW LOGIC)
+    if (tradeSetup) {
+        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); // Bright Green
+        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     // Bright Red
+        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          // Blue Dotted
+    }
+
+    // 5. Always Draw EMA (Solid Gold)
     if (levels && levels.ema) {
         addLine(levels.ema, '#FFD700', '200 EMA', false);
     }
 
-  }, [levels, visuals]); 
+  }, [levels, visuals, tradeSetup]); // ✅ Re-run when tradeSetup changes
 
-  // --- 👻 NEW: DRAW THE GHOST PATTERN (FRACTAL) ---
+  // --- 👻 DRAW THE GHOST PATTERN (FRACTAL) ---
   useEffect(() => {
     if (!fractalSeriesRef.current || !visuals?.fractal || !currentBarRef.current) return;
 
     const { plot_data } = visuals.fractal;
     if (!plot_data || plot_data.length === 0) return;
 
-    // Calculate start time for the ghost (Right after current candle)
     const currentTime = currentBarRef.current.time;
-    const interval = timeframeRef.current === '1h' ? 3600 : 14400; // Seconds
+    const interval = timeframeRef.current === '1h' ? 3600 : 14400; 
 
     // Map the price data to future timestamps
     const ghostData = plot_data.map((price, index) => ({
@@ -141,7 +147,6 @@ const ChartComponent = ({ levels, visuals }) => {
     }));
 
     fractalSeriesRef.current.setData(ghostData);
-    // console.log(`👻 Ghost Pattern Projected: ${ghostData.length} candles into future`);
 
   }, [visuals, timeframe]); 
 
@@ -149,7 +154,6 @@ const ChartComponent = ({ levels, visuals }) => {
   useEffect(() => {
       const fetchNews = async () => {
           try {
-              // console.log("📡 Fetching News from Cloud...");
               const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) {
                   const formattedData = res.data.map(n => ({...n, time: n.time}));
@@ -162,7 +166,7 @@ const ChartComponent = ({ levels, visuals }) => {
       fetchNews();
   }, []);
 
-  // --- 📰 STEP 2: ROBUST MARKER RENDERING ---
+  // --- 📰 STEP 2: MARKER RENDERING ---
   useEffect(() => {
     if (newsData.length > 0 && candleSeriesRef.current) {
         const markers = newsData
@@ -199,7 +203,6 @@ const ChartComponent = ({ levels, visuals }) => {
       const oldestTime = allDataRef.current[0].time; 
       
       try {
-          // console.log("⚡ Fetching older history...");
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { 
                   limit: 500, 
@@ -242,11 +245,11 @@ const ChartComponent = ({ levels, visuals }) => {
       width: chartContainerRef.current.clientWidth,
       height: 500,
       timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 20, barSpacing: 12, minBarSpacing: 5 },
-      rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 }, borderVisible: false, autoScale: true },
+      // ⚠️ UPDATED: More padding on the right for TP/SL Labels
+      rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
       crosshair: { mode: 1, vertLine: { labelVisible: true }, horzLine: { labelVisible: true, labelBackgroundColor: '#4CAF50' } }
     });
 
-    // 1. CANDLESTICK SERIES
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645',
       borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645',
@@ -254,11 +257,10 @@ const ChartComponent = ({ levels, visuals }) => {
       priceLineWidth: 1, priceLineStyle: 2,
     });
 
-    // 2. GHOST SERIES (Fractal)
     const ghostSeries = chart.addSeries(LineSeries, {
-        color: '#a855f7', // 🔮 PURPLE GHOST COLOR
+        color: '#a855f7', 
         lineWidth: 2,
-        lineStyle: 2, // Dashed
+        lineStyle: 2, 
         crosshairMarkerVisible: false,
         lastValueVisible: false,
         priceLineVisible: false,
@@ -301,7 +303,6 @@ const ChartComponent = ({ levels, visuals }) => {
       allDataRef.current = [];
       
       try {
-        // console.log("⚡ Fetching initial data...");
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 500, timestamp: Date.now() }
         });
@@ -355,7 +356,6 @@ const ChartComponent = ({ levels, visuals }) => {
 
     socket.on('connect', () => {
         setConnectionStatus('Connected');
-        // console.log("✅ Socket Connected via Polling!");
     });
     
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
@@ -418,8 +418,6 @@ const ChartComponent = ({ levels, visuals }) => {
       setTimeframe(newTf);
       timeframeRef.current = newTf; 
       isHistoryLoaded.current = false;
-      
-      // Clear Ghost on Timeframe Change
       if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]);
   };
 
