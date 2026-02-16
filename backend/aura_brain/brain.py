@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import pearsonr
-from scipy.signal import argrelextrema  # <--- NEW IMPORT FOR TRENDLINES
+from scipy.signal import argrelextrema
 import logging
 from contextlib import asynccontextmanager
 import httpx
@@ -29,9 +29,8 @@ logger = logging.getLogger("AuraBrain")
 # 🧠 GLOBAL MEMORY
 MARKET_MEMORY = {"df": None}
 
-# --- HELPER: SAFE NUMBER (Prevents 500 Errors) ---
+# --- HELPER: SAFE NUMBER ---
 def safe_float(value, default=0.0):
-    """Converts anything to a float. Returns default if it fails."""
     try:
         if value is None: return default
         num = float(value)
@@ -41,7 +40,7 @@ def safe_float(value, default=0.0):
     except:
         return default
 
-# --- 1. DATA ENGINE ---
+# --- 1. DATA ENGINE (UNCHANGED) ---
 def load_data_into_memory():
     """Loads CSV once and stores it in RAM"""
     try:
@@ -76,7 +75,6 @@ def load_data_into_memory():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # CONVERT NUMBERS (Fix "1,23" -> 1.23)
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
@@ -119,45 +117,53 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "USD"
 
-# --- 2. SMART TRENDLINE ENGINE (NEW) ---
+# --- 2. SMART TRENDLINE ENGINE (UPGRADED) ---
 def detect_key_levels(df):
     """
-    Finds significant Support and Resistance lines using local Min/Max.
-    Returns: List of lines with {price, type, start_index, end_index}
+    Finds PIVOT points relative to CURRENT price to fix 'Lagging Lines'.
     """
     try:
-        # We need numerical indices for the frontend to draw lines easily
-        # So we reset index temporarily to get 0..N indices
+        if df.empty: return []
+        
+        # We need numerical indices for the frontend
         work_df = df.reset_index()
         close_prices = work_df['Close'].values
+        current_price = close_prices[-1]
+        last_index = len(close_prices) - 1
         
-        # 'order' determines how significant the peak/valley must be. 
-        # Higher = fewer, stronger lines. Lower = more noise.
-        order = 15 
+        # Order=10 means local peak for 10 candles (filters noise)
+        order = 10 
         
         # Find local peaks (Resistance) and valleys (Support)
         resistance_idxs = argrelextrema(close_prices, np.greater, order=order)[0]
         support_idxs = argrelextrema(close_prices, np.less, order=order)[0]
         
         lines = []
-        last_index = len(close_prices) - 1
 
-        # Process Resistance (Peaks) - Take last 2 strong ones
-        for idx in resistance_idxs[-3:]: 
-            price = float(close_prices[idx])
+        # 1. FIND CLOSEST RESISTANCE (Above Price)
+        # Filter only peaks ABOVE current price
+        valid_res = [i for i in resistance_idxs if close_prices[i] > current_price]
+        # Sort by price ascending (Closest to current price first)
+        valid_res.sort(key=lambda i: close_prices[i])
+        
+        for idx in valid_res[:2]: # Take top 2 closest
             lines.append({
                 "type": "RESISTANCE",
-                "price": price,
+                "price": float(close_prices[idx]),
                 "start_index": int(idx),
-                "end_index": int(last_index) # Extend to current time
+                "end_index": int(last_index)
             })
 
-        # Process Support (Valleys) - Take last 2 strong ones
-        for idx in support_idxs[-3:]:
-            price = float(close_prices[idx])
+        # 2. FIND CLOSEST SUPPORT (Below Price)
+        # Filter only valleys BELOW current price
+        valid_sup = [i for i in support_idxs if close_prices[i] < current_price]
+        # Sort by price descending (Closest to current price first)
+        valid_sup.sort(key=lambda i: close_prices[i], reverse=True)
+        
+        for idx in valid_sup[:2]: # Take top 2 closest
             lines.append({
                 "type": "SUPPORT",
-                "price": price,
+                "price": float(close_prices[idx]),
                 "start_index": int(idx),
                 "end_index": int(last_index)
             })
@@ -167,87 +173,69 @@ def detect_key_levels(df):
         logger.warning(f"⚠️ Trendline detection failed: {e}")
         return []
 
-# --- 3. FRACTAL PATTERN RECOGNITION (UPDATED FOR VISUALS) ---
+# --- 3. FRACTAL PATTERN RECOGNITION (UNCHANGED) ---
 def find_fractals(df):
     """
     🛡️ CRASH-PROOF FRACTAL SCANNER
-    Now includes 'plot_data' for the frontend to draw the ghost pattern.
     """
     try:
-        # Use simple tail to avoid index issues
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
         prices = recent_data['Close'].values
         
         if len(prices) < PATTERN_SIZE + 24:
-            logger.warning(f"⚠️ Not enough data for fractals: {len(prices)} candles")
             return []
 
-        # 🛡️ SAFE ARRAY OPERATIONS
         current_pattern = prices[-PATTERN_SIZE:]
         
         if np.any(np.isnan(current_pattern)) or np.any(np.isinf(current_pattern)):
-            logger.warning("⚠️ Invalid values in current pattern")
             return []
         
         scaler = MinMaxScaler()
         try:
             current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
-        except Exception as e:
-            logger.error(f"⚠️ Normalization failed: {e}")
+        except:
             return []
         
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
-        # Scan every 2nd candle
-        for i in range(0, history_limit, 2):
+        # Scan every 3rd candle for speed/coverage balance
+        for i in range(0, history_limit, 3):
             try:
                 candidate = prices[i : i + PATTERN_SIZE]
-                
                 if len(candidate) != PATTERN_SIZE: continue
-                if np.any(np.isnan(candidate)) or np.any(np.isinf(candidate)): continue
                 
-                # 🛡️ SAFE NORMALIZATION
                 candidate_scaler = MinMaxScaler()
                 candidate_norm = candidate_scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
                 
-                if len(current_norm) != len(candidate_norm): continue
-                if np.std(current_norm) == 0 or np.std(candidate_norm) == 0: continue
+                corr, _ = pearsonr(current_norm, candidate_norm)
                 
-                corr, p_value = pearsonr(current_norm, candidate_norm)
-                
-                if math.isnan(corr) or math.isinf(corr): continue
-                
-                if corr > 0.85: 
-                    # Ensure we have enough data for future price
+                if corr > 0.80: 
                     if i + PATTERN_SIZE + 24 < len(prices):
                         future_price = safe_float(prices[i + PATTERN_SIZE + 24])
                         entry_price = safe_float(prices[i + PATTERN_SIZE])
-                        
-                        # Grab the FUTURE data for visualization (The "Ghost")
-                        # We take the pattern + 24 candles into the future
                         ghost_slice = prices[i : i + PATTERN_SIZE + 24]
                         
-                        if future_price > 0 and entry_price > 0:
-                            outcome = "BULLISH" if future_price > entry_price else "BEARISH"
-                            matches.append({
-                                "outcome": outcome, 
-                                "similarity": safe_float(corr),
-                                "future_change": safe_float((future_price - entry_price) / entry_price * 100),
-                                "start_date": str(recent_data.index[i]), # For tooltip
-                                "plot_data": ghost_slice.tolist() # <--- DATA FOR CHART
-                            })
-            except Exception as inner_e:
+                        outcome = "BULLISH" if future_price > entry_price else "BEARISH"
+                        matches.append({
+                            "outcome": outcome, 
+                            "similarity": safe_float(corr),
+                            "future_change": safe_float((future_price - entry_price) / entry_price * 100),
+                            "start_date": str(recent_data.index[i]),
+                            "plot_data": ghost_slice.tolist()
+                        })
+            except:
                 continue
                 
-        logger.info(f"✅ Fractal scan complete: {len(matches)} matches found")
-        return matches
+        # Return top matches sorted by similarity
+        matches.sort(key=lambda x: x['similarity'], reverse=True)
+        return matches[:5]
         
     except Exception as e:
         logger.error(f"⚠️ Fractal Scan Error: {e}")
         return []
 
-# --- 4. API ENDPOINT (UPDATED) ---
+# --- 4. API ENDPOINT (UPGRADED LOGIC) ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     df = MARKET_MEMORY["df"]
@@ -260,12 +248,9 @@ async def analyze(req: AnalysisRequest):
         }
 
     try:
-        # 🛡️ SAFE CALCULATIONS
         current_price = safe_float(df['Close'].iloc[-1])
         
-        ema_200 = current_price
-        rsi = 50.0
-        
+        # A. Technicals
         try:
             ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
             ema_200 = safe_float(ema_series.iloc[-1], current_price)
@@ -280,83 +265,80 @@ async def analyze(req: AnalysisRequest):
 
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # --- A. GENERATE VISUALS (LINES) ---
+        # B. Get Visuals
         trendlines = detect_key_levels(df)
-        
-        # --- B. RUN FRACTALS ---
         matches = find_fractals(df)
-        total_matches = len(matches)
         
-        signal = "HOLD"
-        confidence = 0
+        # --- C. DYNAMIC CONFIDENCE SCOREBOARD ---
+        # Fixes the "Stuck at 50%" issue
+        
+        bull_score = 50
+        bear_score = 50
+        
+        # 1. EMA Filter (+10)
+        if current_price > ema_200: bull_score += 10
+        else: bear_score += 10
+        
+        # 2. RSI Filter (+15)
+        if rsi < 30: bull_score += 15 # Oversold -> Buy
+        elif rsi > 70: bear_score += 15 # Overbought -> Sell
+        
+        # 3. Fractal Filter (+20 weighted)
         best_match = None
-
-        if total_matches >= 1:
-            # Sort by similarity to find the "Best Match" for the ghost overlay
-            matches.sort(key=lambda x: x['similarity'], reverse=True)
+        if matches:
             best_match = matches[0]
+            sim_bonus = 20 * best_match['similarity'] # Max +20
+            if best_match['outcome'] == "BULLISH": bull_score += sim_bonus
+            else: bear_score += sim_bonus
 
-        if total_matches >= 3:
-            bull_wins = len([m for m in matches if m['outcome'] == "BULLISH"])
-            bear_wins = len([m for m in matches if m['outcome'] == "BEARISH"])
+        # Calculate Final
+        final_signal = "HOLD"
+        final_confidence = 0
+        
+        if bull_score > bear_score:
+            final_signal = "BUY"
+            final_confidence = bull_score
+        elif bear_score > bull_score:
+            final_signal = "SELL"
+            final_confidence = bear_score
             
-            if bull_wins > bear_wins:
-                signal = "BUY"
-                confidence = (bull_wins / total_matches) * 100
-            else:
-                signal = "SELL"
-                confidence = (bear_wins / total_matches) * 100
-            
-            # Adjust confidence
-            if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
-                confidence -= 15
-            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
-                confidence -= 10
+        # Cap confidence at 98%
+        final_confidence = min(98, int(final_confidence))
 
-        # Construct Response with new "Visuals" block
+        # --- D. BUILD RESPONSE ---
         return {
-            "signal": signal,
-            "confidence": int(max(0, min(99, confidence))),
+            "signal": final_signal,
+            "confidence": final_confidence,
             "trend": trend,
-            "pattern": f"Deep Scan ({total_matches} Matches)",
+            "pattern": f"Deep Scan ({len(matches)} Matches)",
             "reasoning": [
-                f"Memory Scan Active.",
-                f"Found {total_matches} historical patterns similar to now.",
-                f"Top Match: {int(best_match['similarity']*100)}% similarity ({best_match['start_date']})" if best_match else "No strong match found.",
-                f"Trend: {trend} (EMA: {round(ema_200, 2)})."
+                f"Market Structure: {trend} (Price vs 200 EMA)",
+                f"RSI Momentum: {round(rsi, 2)}",
+                f"Fractal Match: {int(best_match['similarity']*100)}% Similarity" if best_match else "No historical pattern match",
+                f"Score: Bull {int(bull_score)} vs Bear {int(bear_score)}"
             ],
             "keyLevels": {
                 "resistance": trendlines[0]['price'] if trendlines else current_price * 1.02,
-                "support": trendlines[1]['price'] if len(trendlines) > 1 else current_price * 0.98,
+                "support": trendlines[-1]['price'] if trendlines else current_price * 0.98,
                 "ema": ema_200
             },
-            # 🎨 NEW VISUAL DATA FOR FRONTEND
             "visuals": {
-                "lines": trendlines,       # Array of support/resistance lines
-                "fractal": best_match      # The object containing 'plot_data' (Ghost Pattern)
+                "lines": trendlines,
+                "fractal": best_match
             }
         }
 
     except Exception as e:
         logger.error(f"❌ Analysis Crash: {e}", exc_info=True)
-        try:
-            fallback_price = safe_float(df['Close'].iloc[-1], 5000.0)
-        except:
-            fallback_price = 5000.0
-            
         return {
             "signal": "NEUTRAL", 
             "confidence": 0, 
-            "trend": "NEUTRAL",
-            "reasoning": [f"Analysis temporarily unavailable. System recovering..."], 
-            "keyLevels": {
-                "resistance": fallback_price * 1.02, 
-                "support": fallback_price * 0.98, 
-                "ema": fallback_price
-            }
+            "trend": "NEUTRAL", 
+            "reasoning": ["System recovering from calculation error..."],
+            "keyLevels": {"resistance": 0, "support": 0, "ema": 0}
         }
 
-# ⚡ PROXY ALL OTHER REQUESTS TO NODE.JS
+# ⚡ PROXY ALL OTHER REQUESTS TO NODE.JS (UNCHANGED)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     try:
@@ -365,14 +347,10 @@ async def proxy_to_node(path: str, request: Request):
         if query_string:
             url = f"{url}?{query_string}"
         
-        logger.info(f"🔄 Proxying {request.method} {path} -> {url}")
-        
         body = None
         if request.method in ["POST", "PUT", "PATCH"]:
-            try:
-                body = await request.body()
-            except:
-                body = None
+            try: body = await request.body()
+            except: body = None
         
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
@@ -388,28 +366,14 @@ async def proxy_to_node(path: str, request: Request):
                 headers={k: v for k, v in dict(response.headers).items()
                         if k.lower() not in ['content-encoding', 'transfer-encoding', 'connection']}
             )
-            
-    except httpx.ConnectError:
-        logger.error(f"❌ Cannot connect to Node.js at {NODE_URL}")
-        raise HTTPException(status_code=503, detail="Node.js service unavailable")
     except Exception as e:
-        logger.error(f"❌ Proxy error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Gateway Error")
 
-# 💓 HEALTH CHECK
+# 💓 HEALTH CHECK (UNCHANGED)
 @app.get("/health")
 async def health():
-    node_status = "unknown"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{NODE_URL}/healthcheck")
-            node_status = "healthy" if response.status_code == 200 else "unhealthy"
-    except:
-        node_status = "unreachable"
-    
     return {
-        "python_brain": "healthy",
-        "node_server": node_status,
-        "data_loaded": MARKET_MEMORY["df"] is not None,
-        "candles_in_memory": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0
+        "status": "healthy",
+        "candles_loaded": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0
     }

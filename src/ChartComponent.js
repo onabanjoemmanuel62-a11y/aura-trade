@@ -6,17 +6,17 @@ import io from 'socket.io-client';
 // ☁️ LIVE CLOUD SERVER ADDRESS
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// ⚠️ UPDATED: Now accepts 'visuals' prop for the AI data
+// ⚠️ UPDATED: Accepts 'visuals' for dynamic trendlines & fractals
 const ChartComponent = ({ levels, visuals }) => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   
-  // 1. SAFE REF NAMES
+  // 1. SERIES REFS
   const candleSeriesRef = useRef(null); 
-  const fractalSeriesRef = useRef(null); // 👻 NEW: For the Ghost Pattern
+  const fractalSeriesRef = useRef(null); // 👻 For the Ghost Pattern
   
-  // 2. REF FOR TRENDLINES (Updated to store arrays of lines)
+  // 2. TRENDLINE REFS (Stores array of active lines to clear them later)
   const linesRef = useRef([]); 
   
   const currentBarRef = useRef(null);
@@ -77,22 +77,22 @@ const ChartComponent = ({ levels, visuals }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES & LEVELS ---
+  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES (SMART ENGINE) ---
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
-    // 1. Clear OLD Lines
+    // 1. Clear OLD Lines to prevent duplicates/lag
     linesRef.current.forEach(line => candleSeriesRef.current.removePriceLine(line));
     linesRef.current = [];
 
-    // 2. Helper to create lines
-    const addLine = (price, color, title, style = 2) => {
+    // 2. Helper to create Clean Lines
+    const addLine = (price, color, title, isDashed = false) => {
         if (price && !isNaN(parseFloat(price))) {
             const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price),
                 color: color,
                 lineWidth: 2,
-                lineStyle: style, // 2 = Dashed, 0 = Solid
+                lineStyle: isDashed ? 2 : 0, // 0 = Solid, 2 = Dashed
                 axisLabelVisible: true,
                 title: title,
             });
@@ -100,22 +100,25 @@ const ChartComponent = ({ levels, visuals }) => {
         }
     };
 
-    // 3. Draw Lines from 'visuals' (The Smart Lines)
+    // 3. Draw Smart Lines from 'visuals'
     if (visuals && visuals.lines && visuals.lines.length > 0) {
         visuals.lines.forEach(line => {
-            const color = line.type === 'RESISTANCE' ? '#ef5350' : '#26a69a';
-            addLine(line.price, color, line.type);
+            if (line.type === 'RESISTANCE') {
+                addLine(line.price, '#ef5350', 'RES', true); // Red Dashed
+            } else if (line.type === 'SUPPORT') {
+                addLine(line.price, '#26a69a', 'SUP', true);   // Green Dashed
+            }
         });
     } 
-    // Fallback to basic 'levels' if no smart lines
+    // Fallback if AI hasn't loaded dynamic lines yet
     else if (levels) {
-        addLine(levels.resistance, '#ef5350', 'RESISTANCE');
-        addLine(levels.support, '#26a69a', 'SUPPORT');
+        if (levels.resistance) addLine(levels.resistance, '#ef5350', 'RES', true);
+        if (levels.support) addLine(levels.support, '#26a69a', 'SUP', true);
     }
 
-    // Always draw EMA if available
+    // 4. Always Draw EMA (Solid Gold)
     if (levels && levels.ema) {
-        addLine(levels.ema, '#FFD700', '200 EMA', 0);
+        addLine(levels.ema, '#FFD700', '200 EMA', false);
     }
 
   }, [levels, visuals]); 
@@ -138,15 +141,15 @@ const ChartComponent = ({ levels, visuals }) => {
     }));
 
     fractalSeriesRef.current.setData(ghostData);
-    console.log(`👻 Ghost Pattern Projected: ${ghostData.length} candles into future`);
+    // console.log(`👻 Ghost Pattern Projected: ${ghostData.length} candles into future`);
 
-  }, [visuals, timeframe]); // Re-draw when AI visuals update
+  }, [visuals, timeframe]); 
 
   // --- 📰 STEP 1: FETCH NEWS DATA ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
-              console.log("📡 Fetching News from Cloud...");
+              // console.log("📡 Fetching News from Cloud...");
               const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) {
                   const formattedData = res.data.map(n => ({...n, time: n.time}));
@@ -196,7 +199,7 @@ const ChartComponent = ({ levels, visuals }) => {
       const oldestTime = allDataRef.current[0].time; 
       
       try {
-          console.log("⚡ Fetching older history...");
+          // console.log("⚡ Fetching older history...");
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { 
                   limit: 500, 
@@ -264,7 +267,7 @@ const ChartComponent = ({ levels, visuals }) => {
 
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
-    fractalSeriesRef.current = ghostSeries; // Save ref for data updates
+    fractalSeriesRef.current = ghostSeries; 
 
     const onVisibleLogicalRangeChanged = (newVisibleLogicalRange) => {
         if (newVisibleLogicalRange === null) return;
@@ -298,7 +301,7 @@ const ChartComponent = ({ levels, visuals }) => {
       allDataRef.current = [];
       
       try {
-        console.log("⚡ Fetching initial data...");
+        // console.log("⚡ Fetching initial data...");
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 500, timestamp: Date.now() }
         });
@@ -352,7 +355,7 @@ const ChartComponent = ({ levels, visuals }) => {
 
     socket.on('connect', () => {
         setConnectionStatus('Connected');
-        console.log("✅ Socket Connected via Polling!");
+        // console.log("✅ Socket Connected via Polling!");
     });
     
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
