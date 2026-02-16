@@ -102,9 +102,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# 🔒 SECURITY UPDATE: Whitelist your Vercel App
+# This fixes the "Blocked by CORS" error
+origins = [
+    "http://localhost:3000",
+    "https://aura-trade-weld.vercel.app",  # <--- YOUR VERCEL APP
+    "https://aura-trade-v1.onrender.com"   # <--- YOUR BACKEND
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
