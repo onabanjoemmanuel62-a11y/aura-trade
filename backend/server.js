@@ -37,9 +37,25 @@ connectDB();
 const app = express();
 const server = http.createServer(app);
 
-// 🛡️ 1. GLOBAL CORS FIX (Crucial for Vercel/Production + Proxy Compatibility)
+// ==========================================
+// 🛡️ 1. GLOBAL CORS FIX (THE CRITICAL FIX)
+// ==========================================
+const allowedOrigins = [
+  "http://localhost:3000",
+  "https://aura-trade-weld.vercel.app",  // 👈 YOUR VERCEL APP
+  "https://aura-trade-v1.onrender.com"
+];
+
 app.use(cors({
-    origin: true, // Dynamically allow the origin of the requester
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) === -1) {
+            // Optional: You can allow all if you want, but this is safer
+            return callback(null, true); 
+        }
+        return callback(null, true);
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Origin', 'Accept', 'X-Requested-With']
@@ -99,7 +115,27 @@ app.post('/api/analyze', async (req, res) => {
     }
 });
 
-// Health Check Route
+// ==========================================
+// ✅ PYTHON BRIDGE: HEALTH (THE MISSING LINK)
+// This fixes the "Cannot GET /health" error
+// ==========================================
+app.get('/health', async (req, res) => {
+    try {
+        const response = await axios.get(`${BRAIN_URL}/health`);
+        res.json({
+            node_status: "Healthy",
+            python_brain: response.data
+        });
+    } catch (error) {
+        res.status(503).json({ 
+            node_status: "Healthy", 
+            python_brain: "OFFLINE", 
+            error: error.message 
+        });
+    }
+});
+
+// Node-only Health Check
 app.get('/healthcheck', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
