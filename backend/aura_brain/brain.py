@@ -82,6 +82,7 @@ def load_data_into_memory():
         df.dropna(subset=numeric_cols, inplace=True)
 
         if 'Date' in df.columns:
+            # Check if Date is numeric (Unix) or String
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df.dropna(subset=['Date'], inplace=True)
             df.set_index('Date', inplace=True)
@@ -103,11 +104,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # 🔒 SECURITY UPDATE: Whitelist your Vercel App
-# This is the line that fixes the Red Errors in your screenshots.
 origins = [
     "http://localhost:3000",
-    "https://aura-trade-weld.vercel.app",  # <--- YOUR VERCEL APP
-    "https://aura-trade-v1.onrender.com"   # <--- YOUR BACKEND
+    "https://aura-trade-weld.vercel.app",  
+    "https://aura-trade-v1.onrender.com"   
 ]
 
 app.add_middleware(
@@ -148,19 +148,14 @@ def detect_key_levels(df):
 
 # --- 3. FRACTAL PATTERN RECOGNITION (FIXED NORMALIZATION) ---
 def find_fractals(df):
-    """
-    Finds historical patterns and projects them onto current price.
-    """
     try:
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
         prices = recent_data['Close'].values
-        current_price = prices[-1] # Crucial for normalization
+        current_price = prices[-1] 
         
         if len(prices) < PATTERN_SIZE + 24: return []
 
         current_pattern = prices[-PATTERN_SIZE:]
-        
-        # Validate data
         if np.any(np.isnan(current_pattern)) or np.any(np.isinf(current_pattern)): return []
         
         scaler = MinMaxScaler()
@@ -178,14 +173,11 @@ def find_fractals(df):
                 corr, _ = pearsonr(current_norm, candidate_norm)
                 
                 if corr > 0.85: 
-                    # --- 🛡️ NORMALIZATION MAGIC HAPPENS HERE ---
-                    future_start_idx = i + PATTERN_SIZE
-                    future_end_idx = i + PATTERN_SIZE + 24
+                    # 🚀 THE FIX: Calculate % change from the historical entry point
+                    hist_entry_price = prices[i + PATTERN_SIZE - 1]
+                    future_slice = prices[i + PATTERN_SIZE : i + PATTERN_SIZE + 24]
                     
-                    hist_entry_price = prices[future_start_idx - 1]
-                    future_slice = prices[future_start_idx : future_end_idx]
-                    
-                    # Calculate percentage moves from history and apply to current price
+                    # Apply historical % movement to the CURRENT price
                     normalized_ghost = []
                     for hist_price in future_slice:
                         percent_change = (hist_price - hist_entry_price) / hist_entry_price
@@ -193,7 +185,6 @@ def find_fractals(df):
                         normalized_ghost.append(projected_price)
 
                     future_price = normalized_ghost[-1]
-                    
                     outcome = "BULLISH" if future_price > current_price else "BEARISH"
                     
                     matches.append({
@@ -201,102 +192,68 @@ def find_fractals(df):
                         "similarity": safe_float(corr),
                         "future_change": safe_float((future_price - current_price) / current_price * 100),
                         "start_date": str(recent_data.index[i]), 
-                        "plot_data": normalized_ghost # ✅ Send NORMALIZED data
+                        "plot_data": normalized_ghost 
                     })
             except:
                 continue
                 
-        logger.info(f"✅ Fractal scan complete: {len(matches)} matches found")
         return matches
-        
     except Exception as e:
         logger.error(f"⚠️ Fractal Scan Error: {e}")
         return []
 
 # --- 4. TRADE SETUP CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value=None):
-    """Calculates Entry, SL, TP based on market structure and volatility"""
     try:
         if atr_value is None or atr_value == 0:
-            atr_value = current_price * 0.01 # Default to 1% if ATR fails
+            atr_value = current_price * 0.01 
         
         entry = current_price
-        stop_loss = 0.0
-        take_profit = 0.0
-
         if signal == "BUY":
-            # SL below support, TP at resistance
-            stop_loss = support if support > 0 else current_price - (atr_value * 1.5)
-            take_profit = resistance if resistance > 0 else current_price + (atr_value * 2.0)
-            
-            # Safety checks (don't let SL be too close)
-            if (entry - stop_loss) < atr_value * 0.5:
-                stop_loss = entry - (atr_value * 1.5)
-            if (take_profit - entry) < atr_value:
-                take_profit = entry + (atr_value * 2.0)
-                
+            # SL below recent support or ATR based
+            stop_loss = support if (support > 0 and support < entry) else current_price - (atr_value * 1.5)
+            # TP at resistance or 2:1 RR
+            take_profit = resistance if (resistance > entry) else current_price + (abs(entry - stop_loss) * 2)
         elif signal == "SELL":
-            # SL above resistance, TP at support
-            stop_loss = resistance if resistance > 0 else current_price + (atr_value * 1.5)
-            take_profit = support if support > 0 else current_price - (atr_value * 2.0)
-            
-            if (stop_loss - entry) < atr_value * 0.5:
-                stop_loss = entry + (atr_value * 1.5)
-            if (entry - take_profit) < atr_value:
-                take_profit = entry - (atr_value * 2.0)
+            stop_loss = resistance if (resistance > 0 and resistance > entry) else current_price + (atr_value * 1.5)
+            take_profit = support if (support < entry and support > 0) else current_price - (abs(entry - stop_loss) * 2)
         else:
-            return None # No trade
+            return None
         
-        risk = abs(entry - stop_loss)
-        reward = abs(take_profit - entry)
-        rr_ratio = round(reward / risk, 2) if risk > 0 else 0
-
         return {
             "entry": round(entry, 2),
             "stop_loss": round(stop_loss, 2),
             "take_profit": round(take_profit, 2),
-            "risk_reward": f"1:{rr_ratio}"
+            "risk_reward": round(abs(take_profit - entry) / max(0.01, abs(entry - stop_loss)), 2)
         }
-    except Exception as e:
-        logger.error(f"Trade levels calc failed: {e}")
+    except:
         return None
 
 # --- 5. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     df = MARKET_MEMORY["df"]
-    
     if df is None or df.empty:
-        return {
-            "signal": "HOLD", "confidence": 0, "trend": "LOADING",
-            "reasoning": ["System initializing..."], 
-            "keyLevels": {"resistance": 0, "support": 0, "ema": 0}
-        }
+        return {"signal": "HOLD", "confidence": 0, "reasoning": ["System Warmup..."]}
 
     try:
         current_price = safe_float(df['Close'].iloc[-1])
         
-        # --- INDICATORS ---
+        # INDICATORS
         ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
         ema_200 = safe_float(ema_series.iloc[-1], current_price)
-        
         rsi_series = RSIIndicator(close=df['Close'], window=14).rsi()
         rsi = safe_float(rsi_series.iloc[-1], 50.0)
 
-        # Volatility (ATR Approximation: High - Low)
-        try:
-            atr_series = df['High'] - df['Low']
-            atr = safe_float(atr_series.tail(14).mean(), current_price * 0.01)
-        except:
-            atr = current_price * 0.01
-
+        # ATR Estimate
+        atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # --- AI SCANS ---
+        # AI SCANS
         trendlines = detect_key_levels(df)
         matches = find_fractals(df)
         
-        # --- SIGNAL LOGIC ---
+        # SIGNAL LOGIC
         total_matches = len(matches)
         signal = "NEUTRAL"
         confidence = 0
@@ -306,7 +263,6 @@ async def analyze(req: AnalysisRequest):
             matches.sort(key=lambda x: x['similarity'], reverse=True)
             best_match = matches[0]
 
-        if total_matches >= 3:
             bull_votes = len([m for m in matches if m['outcome'] == "BULLISH"])
             bear_votes = len([m for m in matches if m['outcome'] == "BEARISH"])
             
@@ -317,20 +273,19 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_votes / total_matches) * 100
             
-            # Confidence Adjustments
-            if (signal == "BUY" and trend == "DOWNTREND") or (signal == "SELL" and trend == "UPTREND"):
-                confidence -= 15
+            # Trend Alignment Bonus
+            if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"):
+                confidence += 10
+            # RSI Caution
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
-                confidence -= 10
+                confidence -= 20
 
-        # --- TRADE SETUP GENERATION ---
-        # Find nearest S/R levels
+        # LEVELS
         res_level = next((l['price'] for l in trendlines if l['type'] == 'RESISTANCE' and l['price'] > current_price), 0)
         sup_level = next((l['price'] for l in trendlines if l['type'] == 'SUPPORT' and l['price'] < current_price), 0)
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
-        # --- FINAL RESPONSE ---
         return {
             "signal": signal,
             "confidence": int(max(0, min(99, confidence))),
@@ -339,42 +294,22 @@ async def analyze(req: AnalysisRequest):
             "reasoning": [
                 f"Trend: {trend} (EMA: {round(ema_200, 2)})",
                 f"RSI: {round(rsi, 2)}",
-                f"Fractal Memory: Found {total_matches} similar historical setups."
+                f"History: Found {total_matches} similar patterns."
             ],
-            "keyLevels": {
-                "resistance": res_level if res_level > 0 else current_price * 1.02,
-                "support": sup_level if sup_level > 0 else current_price * 0.98,
-                "ema": ema_200
-            },
-            "visuals": {
-                "lines": trendlines,
-                "fractal": best_match
-            },
-            "tradeSetup": trade_setup
+            "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
+            "visuals": {"lines": trendlines, "fractal": best_match},
+            "tradeSetup": trade_setup # ✅ NOW INCLUDED
         }
-
     except Exception as e:
-        logger.error(f"❌ Analysis Crash: {e}", exc_info=True)
-        return {
-            "signal": "ERROR", 
-            "confidence": 0, 
-            "trend": "NEUTRAL",
-            "reasoning": ["Internal Analysis Error"],
-            "keyLevels": {"resistance": 0, "support": 0, "ema": 0}
-        }
+        logger.error(f"Analysis Crash: {e}", exc_info=True)
+        return {"signal": "ERROR", "confidence": 0}
 
-# ⚡ PROXY ROUTE (UNCHANGED)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     try:
         url = f"{NODE_URL}/{path}"
-        query_string = str(request.url.query)
-        if query_string: url = f"{url}?{query_string}"
-        
-        logger.info(f"🔄 Proxying {request.method} {path} -> {url}")
-        
+        if request.url.query: url += f"?{request.url.query}"
         body = await request.body() if request.method in ["POST", "PUT"] else None
-        
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
                 method=request.method, url=url,
@@ -382,12 +317,9 @@ async def proxy_to_node(path: str, request: Request):
                 content=body
             )
             return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-            
-    except Exception as e:
-        logger.error(f"❌ Proxy Error: {e}")
-        raise HTTPException(status_code=503, detail="Service Unavailable")
+    except:
+        raise HTTPException(status_code=503)
 
-# 💓 HEALTH CHECK (UNCHANGED)
 @app.get("/health")
 async def health():
     return {"status": "ok", "candles": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0}
