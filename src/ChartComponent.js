@@ -6,7 +6,6 @@ import io from 'socket.io-client';
 // ☁️ LIVE CLOUD SERVER ADDRESS
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// ⚠️ UPDATED: Now accepts 'tradeSetup' to draw Entry/TP/SL lines
 const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   // --- REFS ---
   const chartContainerRef = useRef(null);
@@ -14,9 +13,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   
   // 1. SERIES REFS
   const candleSeriesRef = useRef(null); 
-  const fractalSeriesRef = useRef(null); // 👻 For the Ghost Pattern
+  const fractalSeriesRef = useRef(null); // 👻 Ghost Pattern
   
-  // 2. TRENDLINE REFS (Stores array of active lines to clear them later)
+  // 2. LINE REFS (Stores array of active lines to clear them later)
   const linesRef = useRef([]); 
   
   const currentBarRef = useRef(null);
@@ -77,7 +76,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- ⚡ NEW: DRAW DYNAMIC TRENDLINES + TRADE SETUP ---
+  // --- ⚡ SMC VISUALIZATION LAYER ---
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
@@ -85,8 +84,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     linesRef.current.forEach(line => candleSeriesRef.current.removePriceLine(line));
     linesRef.current = [];
 
-    // 2. Helper to create Clean Lines
-    const addLine = (price, color, title, isDashed = false, width = 2) => {
+    // 2. Helper to create Lines
+    const addLine = (price, color, title, isDashed = false, width = 1) => {
         if (price && !isNaN(parseFloat(price))) {
             const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price),
@@ -100,35 +99,37 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
     };
 
-    // 3. Draw Smart Lines from 'visuals'
+    // 3. Draw SMC STRUCTURE (Order Blocks)
     if (visuals && visuals.lines && visuals.lines.length > 0) {
         visuals.lines.forEach(line => {
             if (line.type === 'RESISTANCE') {
-                addLine(line.price, '#ef5350', 'RES', true); // Red Dashed
+                // Bearish Order Block (Red, Solid)
+                addLine(line.price, '#ef5350', 'BEAR OB', false, 2); 
             } else if (line.type === 'SUPPORT') {
-                addLine(line.price, '#26a69a', 'SUP', true);   // Green Dashed
+                // Bullish Order Block (Teal, Solid)
+                addLine(line.price, '#26a69a', 'BULL OB', false, 2);   
             }
         });
     } 
-    // Fallback
+    // Fallback if AI is loading
     else if (levels) {
         if (levels.resistance) addLine(levels.resistance, '#ef5350', 'RES', true);
         if (levels.support) addLine(levels.support, '#26a69a', 'SUP', true);
     }
 
-    // 4. 💰 DRAW TRADE SETUP (NEW LOGIC)
+    // 4. 💰 DRAW SMC TRADE SETUP (Precision Levels)
     if (tradeSetup) {
-        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); // Bright Green
-        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     // Bright Red
-        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          // Blue Dotted
+        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP (Liquidity)', 0, 2); 
+        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL (Invalidation)', 0, 2);     
+        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY', 3, 2);          
     }
 
-    // 5. Always Draw EMA (Solid Gold)
+    // 5. Draw EMA (Trend Baseline)
     if (levels && levels.ema) {
-        addLine(levels.ema, '#FFD700', '200 EMA', false);
+        addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
     }
 
-  }, [levels, visuals, tradeSetup]); // ✅ Re-run when tradeSetup changes
+  }, [levels, visuals, tradeSetup]); // Re-run when AI updates
 
   // --- 👻 DRAW THE GHOST PATTERN (FRACTAL) ---
   useEffect(() => {
@@ -245,7 +246,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       width: chartContainerRef.current.clientWidth,
       height: 500,
       timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 20, barSpacing: 12, minBarSpacing: 5 },
-      // ⚠️ UPDATED: More padding on the right for TP/SL Labels
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
       crosshair: { mode: 1, vertLine: { labelVisible: true }, horzLine: { labelVisible: true, labelBackgroundColor: '#4CAF50' } }
     });
@@ -387,11 +387,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
         latestCandleRef.current = updatedCandle;
         
-        // 🧠 SMART AUTO-SCROLL
         if (chartRef.current) {
              const scrollPos = chartRef.current.timeScale().scrollPosition();
              const distanceToLive = Math.abs(scrollPos);
-
              if (distanceToLive < 5) {
                  chartRef.current.timeScale().scrollToPosition(0, false);
              }
