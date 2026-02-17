@@ -8,34 +8,27 @@ const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
 // 🎨 CUSTOM BOX PLUGIN (THE ENGINE)
-// This teaches the chart how to draw "Boxes"
 // ==========================================
-
 class BoxRenderer {
-    constructor(data) {
-        this._data = data;
-    }
-
+    constructor(data) { this._data = data; }
+    
     draw(target) {
         target.useBitmapCoordinateSpace((scope) => {
+            if (this._data.length === 0) return;
             const ctx = scope.context;
             const horizontalPixelRatio = scope.horizontalPixelRatio;
             const verticalPixelRatio = scope.verticalPixelRatio;
 
             this._data.forEach((zone) => {
-                // X-Axis (Time)
-                // If x is provided, start there. Otherwise, default to 0 (left edge)
                 const x1 = zone.x !== undefined ? zone.x * horizontalPixelRatio : 0;
-                const x2 = scope.mediaSize.width * horizontalPixelRatio; // Extend to right edge
+                const x2 = scope.mediaSize.width * horizontalPixelRatio;
                 
-                // Y-Axis (Price)
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 
                 const width = x2 - x1;
                 const height = yBottom - yTop; 
 
-                // Draw Box
                 ctx.fillStyle = zone.color;
                 ctx.fillRect(x1, yTop, width, height);
             });
@@ -44,13 +37,8 @@ class BoxRenderer {
 }
 
 class BoxPaneView {
-    constructor(source) {
-        this._source = source;
-    }
-
-    renderer() {
-        return new BoxRenderer(this._source._rendererData);
-    }
+    constructor(source) { this._source = source; }
+    renderer() { return new BoxRenderer(this._source._rendererData); }
 }
 
 class BoxPrimitive {
@@ -61,7 +49,6 @@ class BoxPrimitive {
 
     setData(zones, series, timeScale) {
         this._rendererData = zones.map(zone => {
-            // Convert Time to Coordinate (if explicit time is missing, it draws from left)
             const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : undefined;
             const priceTopCoord = series.priceToCoordinate(zone.top);
             const priceBottomCoord = series.priceToCoordinate(zone.bottom);
@@ -69,7 +56,7 @@ class BoxPrimitive {
             if (priceTopCoord === null || priceBottomCoord === null) return null;
 
             return {
-                x: timeCoord, // can be undefined to start from chart edge
+                x: timeCoord,
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
                 yBottom: Math.max(priceTopCoord, priceBottomCoord),
                 color: zone.color
@@ -77,25 +64,22 @@ class BoxPrimitive {
         }).filter(z => z !== null);
     }
 
-    updateAllViews() {
-        // No-op for this simple implementation, handled by chart redraw
-    }
-
-    paneViews() {
-        return this._paneViews;
-    }
+    updateAllViews() {}
+    paneViews() { return this._paneViews; }
 }
 
 // ==========================================
 // 🚀 MAIN REACT COMPONENT
 // ==========================================
-
 const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
   const fractalSeriesRef = useRef(null); 
-  const boxPrimitiveRef = useRef(new BoxPrimitive()); // 🆕 The Box Engine
+  const boxPrimitiveRef = useRef(new BoxPrimitive());
+  
+  // 🔒 SAFETY LOCKS
+  const isChartReady = useRef(false);
   
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
@@ -103,7 +87,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const allDataRef = useRef([]);
   const isLoadingRef = useRef(false); 
   const latestCandleRef = useRef(null); 
-  const isHistoryLoaded = useRef(false);
 
   const [timeframe, setTimeframe] = useState('1h');
   const [prediction, setPrediction] = useState(null);
@@ -121,116 +104,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
-  // --- ANIMATION LOOP ---
-  useEffect(() => {
-    let animationFrameId;
-    const renderLoop = () => {
-      // 1. Update Candles
-      if (candleSeriesRef.current && latestCandleRef.current) {
-        candleSeriesRef.current.update(latestCandleRef.current);
-        currentBarRef.current = latestCandleRef.current;
-        
-        const lastIdx = allDataRef.current.length - 1;
-        if (lastIdx >= 0) {
-             const lastItem = allDataRef.current[lastIdx];
-             if (lastItem.time === latestCandleRef.current.time) {
-                 allDataRef.current[lastIdx] = latestCandleRef.current;
-             } else {
-                 allDataRef.current.push(latestCandleRef.current);
-             }
-        }
-        latestCandleRef.current = null;
-      }
-
-      // 2. Update Boxes (Keep them glued to candles as chart scrolls)
-      if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
-          const rawZones = visuals.smc_zones.map(z => ({
-              time: z.start_time || (Date.now() / 1000), 
-              top: z.top,
-              bottom: z.bottom,
-              color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)' 
-          }));
-          
-          boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
-      }
-
-      animationFrameId = requestAnimationFrame(renderLoop);
-    };
-    renderLoop();
-    return () => cancelAnimationFrame(animationFrameId);
-  }, [visuals]);
-
-  // --- 📰 STEP 1: FETCH NEWS ---
-  useEffect(() => {
-      const fetchNews = async () => {
-          try {
-              const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
-              if (Array.isArray(res.data)) {
-                  const formattedData = res.data.map(n => ({...n, time: n.time}));
-                  setNewsData(formattedData);
-              }
-          } catch (err) { console.error("News Error", err); }
-      };
-      fetchNews();
-  }, []);
-
-  // --- 📰 STEP 2: NEWS MARKERS ---
-  useEffect(() => {
-    if (newsData.length > 0 && candleSeriesRef.current) {
-        const markers = newsData
-            .filter(n => n.time) 
-            .map(n => {
-                const time = getCandleStartTime(n.time, timeframeRef.current);
-                const isHigh = n.impact === 'High';
-                return {
-                    time: time,
-                    position: 'aboveBar',
-                    color: isHigh ? '#ef5350' : '#ffa726',
-                    shape: 'arrowDown',
-                    text: isHigh ? `🚩 ${n.event}` : '', 
-                    size: isHigh ? 2 : 1,
-                };
-            })
-            .sort((a, b) => a.time - b.time); 
-        candleSeriesRef.current.setMarkers(markers);
-    }
-  }, [newsData, timeframe, getCandleStartTime]);
-
-  // --- HISTORY FETCH ---
-  const fetchOlderHistory = async () => {
-      if (isLoadingRef.current || !allDataRef.current.length) return;
-      isLoadingRef.current = true;
-      const oldestTime = allDataRef.current[0].time; 
-      
-      try {
-          const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
-              params: { limit: 500, before: oldestTime, timestamp: Date.now() }
-          });
-          const rawData = Array.isArray(res.data) ? res.data : [];
-          if (rawData.length === 0) return;
-
-          const newOldData = rawData.map(item => ({
-            time: getCandleStartTime(item.time, timeframeRef.current), 
-            open: parseFloat(item.open), 
-            high: parseFloat(item.high), 
-            low: parseFloat(item.low), 
-            close: parseFloat(item.close)
-          })).sort((a, b) => a.time - b.time);
-
-          const combinedData = [...newOldData, ...allDataRef.current]
-              .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
-
-          allDataRef.current = combinedData;
-          if (candleSeriesRef.current) candleSeriesRef.current.setData(combinedData);
-
-      } catch (err) { console.error("History Error", err); } 
-      finally { isLoadingRef.current = false; }
-  };
-
-  // --- INITIALIZE CHART ---
+  // --- 1. INITIALIZE CHART (STRICT CLEANUP) ---
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
+    // Create Chart
     const chart = createChart(chartContainerRef.current, {
       layout: { background: { type: ColorType.Solid, color: '#161A25' }, textColor: '#D9D9D9' },
       grid: { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
@@ -241,37 +119,42 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     });
 
     const newSeries = chart.addSeries(CandlestickSeries, {
-      upColor: '#089981', downColor: '#F23645',
-      borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
+      upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
 
     const ghostSeries = chart.addSeries(LineSeries, {
         color: '#a855f7', lineWidth: 2, lineStyle: 2, title: 'AI PROJECTION'
     });
 
-    // 🌟 ATTACH THE BOX PLUGIN
+    // Attach Plugin
     newSeries.attachPrimitive(boxPrimitiveRef.current);
 
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
     fractalSeriesRef.current = ghostSeries; 
+    isChartReady.current = true; // 🔓 UNLOCK: Chart is ready to receive data
 
-    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => { 
-        if (range && range.from < 10) fetchOlderHistory(); 
-    });
-
-    const handleResize = () => chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+    // Handlers
+    const handleResize = () => {
+        if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+    };
     window.addEventListener('resize', handleResize);
 
+    // 🧹 CLEANUP: This prevents the "Object Disposed" error
     return () => { 
+        isChartReady.current = false; // 🔒 LOCK: Stop all updates
         window.removeEventListener('resize', handleResize); 
         chart.remove(); 
+        chartRef.current = null;
+        candleSeriesRef.current = null;
     };
   }, []);
 
-  // --- LOAD INITIAL DATA ---
+  // --- 2. LOAD HISTORY ---
   useEffect(() => {
-    if (!candleSeriesRef.current) return;
+    // Only load if chart exists
+    if (!isChartReady.current) return;
+
     const loadInitialHistory = async () => {
       setIsLoading(true);
       try {
@@ -283,26 +166,110 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
         })).sort((a, b) => a.time - b.time).filter((v,i,a)=>a.findIndex(t=>(t.time===v.time))===i);
 
-        if (candleSeriesRef.current) {
+        if (isChartReady.current && candleSeriesRef.current) {
             allDataRef.current = data;
             candleSeriesRef.current.setData(data);
             if (data.length > 0) currentBarRef.current = data[data.length - 1];
         }
-        isHistoryLoaded.current = true; 
       } catch (err) { console.error("Init Load Error", err); } 
       finally { setIsLoading(false); }
     };
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]); 
 
-  // --- SOCKETS ---
+  // --- 3. ANIMATION LOOP ---
+  useEffect(() => {
+    let animationFrameId;
+    const renderLoop = () => {
+      if (!isChartReady.current) return; // 🔒 Stop if chart dead
+
+      // Update Candles
+      if (candleSeriesRef.current && latestCandleRef.current) {
+        candleSeriesRef.current.update(latestCandleRef.current);
+        currentBarRef.current = latestCandleRef.current;
+        latestCandleRef.current = null;
+      }
+
+      // Update Boxes (SMC Zones)
+      if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
+          const rawZones = visuals.smc_zones.map(z => ({
+              time: z.start_time || (Date.now() / 1000), 
+              top: z.top,
+              bottom: z.bottom,
+              color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)' 
+          }));
+          boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
+      }
+
+      animationFrameId = requestAnimationFrame(renderLoop);
+    };
+    renderLoop();
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [visuals]);
+
+  // --- 4. NEWS & MARKERS ---
+  useEffect(() => {
+      const fetchNews = async () => {
+          try {
+              const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
+              if (Array.isArray(res.data)) setNewsData(res.data.map(n => ({...n, time: n.time})));
+          } catch (err) { console.error("News Error", err); }
+      };
+      fetchNews();
+  }, []);
+
+  useEffect(() => {
+    // 🔒 SAFETY CHECK: Only try to set markers if the series actually exists
+    if (newsData.length > 0 && isChartReady.current && candleSeriesRef.current) {
+        try {
+            const markers = newsData
+                .filter(n => n.time) 
+                .map(n => ({
+                    time: getCandleStartTime(n.time, timeframeRef.current),
+                    position: 'aboveBar',
+                    color: n.impact === 'High' ? '#ef5350' : '#ffa726',
+                    shape: 'arrowDown',
+                    text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
+                    size: n.impact === 'High' ? 2 : 1,
+                }))
+                .sort((a, b) => a.time - b.time); 
+            
+            candleSeriesRef.current.setMarkers(markers);
+        } catch (e) {
+            console.warn("Marker update skipped: Chart not ready");
+        }
+    }
+  }, [newsData, timeframe, getCandleStartTime]);
+
+  // --- 5. DRAW GHOST & TRADE LINES ---
+  useEffect(() => {
+      if(!isChartReady.current || !candleSeriesRef.current) return; // 🔒 Safety
+
+      // Ghost Pattern
+      if (fractalSeriesRef.current && visuals?.fractal && currentBarRef.current) {
+          const { plot_data } = visuals.fractal;
+          if (plot_data && plot_data.length > 0) {
+              const currentTime = currentBarRef.current.time;
+              const interval = timeframeRef.current === '1h' ? 3600 : 14400; 
+              const ghostData = plot_data.map((price, index) => ({
+                  time: currentTime + ((index + 1) * interval),
+                  value: price
+              }));
+              fractalSeriesRef.current.setData(ghostData);
+          }
+      }
+  }, [visuals, timeframe]);
+
+  // --- 6. SOCKETS ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socketRef.current = socket;
+    
     socket.on('connect', () => setConnectionStatus('Connected'));
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
+    
     socket.on('price-update', (data) => {
-        if (!isHistoryLoaded.current || !currentBarRef.current) return;
+        if (!isChartReady.current || !currentBarRef.current) return; // 🔒 Safety
         const price = parseFloat(data.close || data.c);
         if (isNaN(price)) return;
         
@@ -319,21 +286,17 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
         latestCandleRef.current = updatedCandle;
     });
+
     socket.on('prediction-update', (data) => setPrediction(data));
     return () => socket.disconnect();
   }, [timeframe, getCandleStartTime]);
 
-  // --- HANDLERS ---
-  const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; isHistoryLoaded.current = false; if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]); };
+  // --- RENDER CONTROLS & JSX ---
+  const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]); };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };
   const handleZoomIn = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 1.2 }); };
   const handleZoomOut = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 0.8 }); };
-  const handleScroll = (dir) => {
-      if(chartRef.current) {
-          const pos = chartRef.current.timeScale().scrollPosition();
-          chartRef.current.timeScale().scrollToPosition(pos + (dir === 'left' ? 10 : -10), true);
-      }
-  }
+  const handleScroll = (dir) => { if(chartRef.current) { const pos = chartRef.current.timeScale().scrollPosition(); chartRef.current.timeScale().scrollToPosition(pos + (dir === 'left' ? 10 : -10), true); } };
   const getStatusColor = () => connectionStatus === 'Connected' ? '#089981' : '#F23645';
 
   return (
