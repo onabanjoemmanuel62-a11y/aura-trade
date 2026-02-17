@@ -76,11 +76,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, []);
 
-  // --- ⚡ SMC VISUALIZATION LAYER ---
+  // --- ⚡ SMC VISUALIZATION LAYER (ZONES) ---
   useEffect(() => {
     if (!candleSeriesRef.current) return;
 
-    // 1. Clear OLD Lines to prevent duplicates
+    // 1. Clear OLD Lines
     linesRef.current.forEach(line => candleSeriesRef.current.removePriceLine(line));
     linesRef.current = [];
 
@@ -91,7 +91,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 price: parseFloat(price),
                 color: color,
                 lineWidth: width,
-                lineStyle: isDashed ? 2 : 0, // 0 = Solid, 2 = Dashed
+                lineStyle: isDashed ? 2 : 0, 
                 axisLabelVisible: true,
                 title: title,
             });
@@ -99,39 +99,48 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
     };
 
-    // 3. Draw SMC STRUCTURE (Order Blocks)
-    if (visuals && visuals.lines && visuals.lines.length > 0) {
-        visuals.lines.forEach(line => {
-            if (line.type === 'RESISTANCE') {
-                // Bearish Order Block (Red, Solid)
-                addLine(line.price, '#ef5350', 'BEAR OB', false, 2); 
-            } else if (line.type === 'SUPPORT') {
-                // Bullish Order Block (Teal, Solid)
-                addLine(line.price, '#26a69a', 'BULL OB', false, 2);   
+    // 3. Draw SMC ZONES (The "Boxes")
+    // We draw Top and Bottom lines to define the Order Block Zone
+    if (visuals && visuals.smc_zones) {
+        visuals.smc_zones.forEach(zone => {
+            if (zone.type === 'OB_BEAR') {
+                // Bearish Order Block (Supply Zone) - Red
+                // Top Line (Solid)
+                addLine(zone.top, '#ef5350', 'BEAR OB', false, 2);
+                // Bottom Line (Dashed) - Defines the entry edge
+                addLine(zone.bottom, 'rgba(239, 83, 80, 0.5)', '', true, 1);
+            } else if (zone.type === 'OB_BULL') {
+                // Bullish Order Block (Demand Zone) - Teal
+                // Top Line (Dashed) - Defines the entry edge
+                addLine(zone.top, 'rgba(38, 166, 154, 0.5)', '', true, 1);
+                // Bottom Line (Solid)
+                addLine(zone.bottom, '#26a69a', 'BULL OB', false, 2);
             }
         });
     } 
-    // Fallback if AI is loading
-    else if (levels) {
-        if (levels.resistance) addLine(levels.resistance, '#ef5350', 'RES', true);
-        if (levels.support) addLine(levels.support, '#26a69a', 'SUP', true);
+    // Fallback support for legacy lines if backend is updating
+    else if (visuals && visuals.lines) {
+        visuals.lines.forEach(line => {
+             if (line.type === 'RESISTANCE') addLine(line.price, '#ef5350', 'RES', true);
+             else if (line.type === 'SUPPORT') addLine(line.price, '#26a69a', 'SUP', true);
+        });
     }
 
-    // 4. 💰 DRAW SMC TRADE SETUP (Precision Levels)
+    // 4. 💰 DRAW TRADE SETUP
     if (tradeSetup) {
-        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP (Liquidity)', 0, 2); 
-        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL (Invalidation)', 0, 2);     
-        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY', 3, 2);          
+        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); 
+        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     
+        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          
     }
 
-    // 5. Draw EMA (Trend Baseline)
+    // 5. EMA
     if (levels && levels.ema) {
         addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
     }
 
   }, [levels, visuals, tradeSetup]); // Re-run when AI updates
 
-  // --- 👻 DRAW THE GHOST PATTERN (FRACTAL) ---
+  // --- 👻 DRAW THE GHOST PATTERN ---
   useEffect(() => {
     if (!fractalSeriesRef.current || !visuals?.fractal || !currentBarRef.current) return;
 
@@ -141,7 +150,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     const currentTime = currentBarRef.current.time;
     const interval = timeframeRef.current === '1h' ? 3600 : 14400; 
 
-    // Map the price data to future timestamps
     const ghostData = plot_data.map((price, index) => ({
         time: currentTime + ((index + 1) * interval),
         value: price
