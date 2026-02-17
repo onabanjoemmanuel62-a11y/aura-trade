@@ -100,25 +100,25 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     };
 
     // 3. Draw SMC ZONES (The "Boxes")
-    // We draw Top and Bottom lines to define the Order Block Zone
+    // We simulate boxes by drawing the Top and Bottom bounds
     if (visuals && visuals.smc_zones) {
         visuals.smc_zones.forEach(zone => {
             if (zone.type === 'OB_BEAR') {
-                // Bearish Order Block (Supply Zone) - Red
-                // Top Line (Solid)
+                // Bearish Order Block (Supply) - Red
+                // Draw Solid Top (Stop Loss Area)
                 addLine(zone.top, '#ef5350', 'BEAR OB', false, 2);
-                // Bottom Line (Dashed) - Defines the entry edge
-                addLine(zone.bottom, 'rgba(239, 83, 80, 0.5)', '', true, 1);
+                // Draw Dashed Bottom (Entry Area)
+                addLine(zone.bottom, 'rgba(239, 83, 80, 0.6)', '', true, 1);
             } else if (zone.type === 'OB_BULL') {
-                // Bullish Order Block (Demand Zone) - Teal
-                // Top Line (Dashed) - Defines the entry edge
-                addLine(zone.top, 'rgba(38, 166, 154, 0.5)', '', true, 1);
-                // Bottom Line (Solid)
+                // Bullish Order Block (Demand) - Teal
+                // Draw Dashed Top (Entry Area)
+                addLine(zone.top, 'rgba(38, 166, 154, 0.6)', '', true, 1);
+                // Draw Solid Bottom (Stop Loss Area)
                 addLine(zone.bottom, '#26a69a', 'BULL OB', false, 2);
             }
         });
     } 
-    // Fallback support for legacy lines if backend is updating
+    // Fallback for legacy lines
     else if (visuals && visuals.lines) {
         visuals.lines.forEach(line => {
              if (line.type === 'RESISTANCE') addLine(line.price, '#ef5350', 'RES', true);

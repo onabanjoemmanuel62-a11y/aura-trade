@@ -20,7 +20,7 @@ from ta.momentum import RSIIndicator
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
-MAX_SCAN_LIMIT = 5000   # Optimized for speed
+MAX_SCAN_LIMIT = 5000   # ⚡ Optimized for Speed
 NODE_URL = "http://127.0.0.1:10000" 
 
 logging.basicConfig(level=logging.INFO)
@@ -29,36 +29,57 @@ logger = logging.getLogger("AuraBrain")
 # 🧠 GLOBAL MEMORY
 MARKET_MEMORY = {"df": None}
 
+# --- HELPER: SAFE NUMBER ---
 def safe_float(value, default=0.0):
     try:
         if value is None: return default
         num = float(value)
         if math.isnan(num) or math.isinf(num): return default
         return num
-    except: return default
+    except:
+        return default
 
+# --- 1. DATA ENGINE ---
 def load_data_into_memory():
+    """Loads CSV once and stores it in RAM"""
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
-        if not os.path.exists(file_path): 
-            if os.path.exists(CSV_FILENAME): file_path = CSV_FILENAME
-            else: return None
 
-        try: df = pd.read_csv(file_path, sep=';')
-        except: df = pd.read_csv(file_path, sep=',')
+        logger.info(f"📂 Pre-loading database from: {file_path}")
+
+        if not os.path.exists(file_path):
+            if os.path.exists(CSV_FILENAME):
+                file_path = CSV_FILENAME
+            else:
+                logger.error(f"❌ File not found: {CSV_FILENAME}")
+                return None
+
+        # READ CSV
+        try:
+            df = pd.read_csv(file_path, sep=';')
+            if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',')
+        except:
+            df = pd.read_csv(file_path, sep=',')
         
+        # CLEANUP
         df.columns = [c.lower().strip() for c in df.columns]
-        rename_map = {'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'date': 'Date', 'time': 'Date'}
+        rename_map = {
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 
+            'date': 'Date', 'time': 'Date', 'timestamp': 'Date'
+        }
         df.rename(columns=rename_map, inplace=True)
         
+        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
-                if df[col].dtype == object: df[col] = df[col].astype(str).str.replace(',', '.')
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.replace(',', '.')
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.dropna(subset=numeric_cols, inplace=True)
+
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df.dropna(subset=['Date'], inplace=True)
@@ -67,7 +88,10 @@ def load_data_into_memory():
 
         logger.info(f"✅ SMC BRAIN LOADED: {len(df)} candles.")
         return df
-    except: return None
+
+    except Exception as e:
+        logger.error(f"❌ Cache Init Failed: {e}")
+        return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -77,10 +101,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 🔒 SECURITY: Allow All Origins
+# 🔒 SECURITY UPDATE: Whitelist your Vercel App
+origins = [
+    "http://localhost:3000",
+    "https://aura-trade-weld.vercel.app",  
+    "https://aura-trade-v1.onrender.com"   
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=origins, 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -112,7 +142,6 @@ def detect_smc_structures(df, current_price):
         # --- A. BEARISH ORDER BLOCKS (Supply) ---
         for idx in swing_highs[-15:]: # Scan last 15 swing highs
             # 1. Identify the OB Candle (The last UP candle before the drop)
-            # Simple heuristic: Look at the candle at the swing high
             ob_idx = idx
             
             # 2. Check for Break of Structure (BOS)
@@ -124,14 +153,12 @@ def detect_smc_structures(df, current_price):
             if lowest_after < lows[ob_idx]: # Valid Structure Break
                 
                 # 3. MITIGATION CHECK (Crucial: Is it still valid?)
-                # Has price come back UP and touched this zone since it was created?
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
                 
                 # Look at candles AFTER the break happened
                 # If any High > OB_Bottom, it's tested.
                 is_tested = False
-                # We start checking from 5 candles after creation to allow the move to happen
                 for future_idx in range(ob_idx + 5, len(highs)):
                     if highs[future_idx] >= ob_bottom:
                         is_tested = True
@@ -177,7 +204,7 @@ def detect_smc_structures(df, current_price):
         logger.warning(f"SMC Error: {e}")
         return []
 
-# --- 3. FRACTAL PROJECTION (NORMALIZED) ---
+# --- 3. FRACTAL PATTERN RECOGNITION (NORMALIZED) ---
 def find_fractals(df, live_price):
     try:
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
@@ -195,18 +222,20 @@ def find_fractals(df, live_price):
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
-        for i in range(0, history_limit, 5): # Step 5 for speed
+        # Speed Optimization: Step 5 instead of 2
+        for i in range(0, history_limit, 5):
             try:
                 candidate = prices[i : i + PATTERN_SIZE]
                 candidate_scaler = MinMaxScaler()
                 candidate_norm = candidate_scaler.fit_transform(candidate.reshape(-1, 1)).flatten()
+                
                 corr, _ = pearsonr(current_norm, candidate_norm)
                 
                 if corr > 0.85: 
+                    # 🚀 NORMALIZATION: Use % Change
                     hist_entry_price = prices[i + PATTERN_SIZE - 1]
                     future_slice = prices[i + PATTERN_SIZE : i + PATTERN_SIZE + 24]
                     
-                    # 🚀 NORMALIZATION: Use % Change
                     normalized_ghost = []
                     for hist_price in future_slice:
                         percent_change = (hist_price - hist_entry_price) / hist_entry_price
@@ -220,25 +249,35 @@ def find_fractals(df, live_price):
                         "outcome": outcome, 
                         "similarity": safe_float(corr),
                         "future_change": safe_float((future_price - current_price) / current_price * 100),
+                        "start_date": str(recent_data.index[i]), 
                         "plot_data": normalized_ghost 
                     })
-            except: continue
+            except:
+                continue
+                
         return matches
-    except: return []
+    except Exception as e:
+        logger.error(f"Fractal Scan Error: {e}")
+        return []
 
-# --- 4. TRADE SETUP ---
+# --- 4. TRADE SETUP CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value=None):
     try:
-        if atr_value is None or atr_value == 0: atr_value = current_price * 0.01 
+        if atr_value is None or atr_value == 0:
+            atr_value = current_price * 0.01 
+        
         entry = current_price
         
         if signal == "BUY":
+            # SL below Bullish OB
             stop_loss = support if (support > 0 and support < entry) else entry - (atr_value * 1.5)
+            # TP at Bearish OB
             take_profit = resistance if (resistance > entry) else entry + (abs(entry - stop_loss) * 2)
         elif signal == "SELL":
             stop_loss = resistance if (resistance > 0 and resistance > entry) else entry + (atr_value * 1.5)
             take_profit = support if (support < entry and support > 0) else entry - (abs(entry - stop_loss) * 2)
-        else: return None
+        else:
+            return None
         
         return {
             "entry": round(entry, 2),
@@ -246,13 +285,15 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
             "take_profit": round(take_profit, 2),
             "risk_reward": round(abs(take_profit - entry) / max(0.01, abs(entry - stop_loss)), 2)
         }
-    except: return None
+    except:
+        return None
 
 # --- 5. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     df = MARKET_MEMORY["df"]
-    if df is None or df.empty: return {"signal": "HOLD", "confidence": 0}
+    if df is None or df.empty:
+        return {"signal": "HOLD", "confidence": 0, "reasoning": ["System Warmup..."]}
 
     try:
         # Use live price from frontend if provided, otherwise CSV
@@ -268,7 +309,7 @@ async def analyze(req: AnalysisRequest):
         smc_zones = detect_smc_structures(df, current_price) # ✅ NOW FILTERED
         matches = find_fractals(df, current_price)           # ✅ NOW NORMALIZED
         
-        # FILTER SMC ZONES FOR NEAREST LEVELS
+        # FILTER SMC ZONES FOR NEAREST LEVELS (Reduce Clutter)
         bullish_zones = [z for z in smc_zones if z['type'] == 'OB_BULL' and z['top'] < current_price]
         bearish_zones = [z for z in smc_zones if z['type'] == 'OB_BEAR' and z['bottom'] > current_price]
         
@@ -280,7 +321,7 @@ async def analyze(req: AnalysisRequest):
         sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.98
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.02
 
-        # Send full zones to frontend for "Box" drawing
+        # Send strictly the nearest zones to frontend for "Box" drawing
         visual_zones = []
         if nearest_supp: visual_zones.append(nearest_supp)
         if nearest_res: visual_zones.append(nearest_res)
@@ -303,8 +344,10 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_votes / total_matches) * 100
             
-            if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"): confidence += 10
-            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30): confidence -= 15
+            if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"):
+                confidence += 10
+            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
+                confidence -= 20
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
@@ -313,7 +356,11 @@ async def analyze(req: AnalysisRequest):
             "confidence": int(max(0, min(99, confidence))),
             "trend": trend,
             "pattern": f"SMC Scan ({len(smc_zones)} Valid Zones)",
-            "reasoning": [f"Structure: {trend}", f"OB Supp: {round(sup_level, 2)}", f"OB Res: {round(res_level, 2)}"],
+            "reasoning": [
+                f"Structure: {trend}",
+                f"OB Support: {round(sup_level, 2)}",
+                f"OB Resistance: {round(res_level, 2)}"
+            ],
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
                 "smc_zones": visual_zones, # ✅ SENDING ZONES (Top/Bottom)
@@ -332,9 +379,14 @@ async def proxy_to_node(path: str, request: Request):
         if request.url.query: url += f"?{request.url.query}"
         body = await request.body() if request.method in ["POST", "PUT"] else None
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(method=request.method, url=url, headers=request.headers, content=body)
+            response = await client.request(
+                method=request.method, url=url,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
+                content=body
+            )
             return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-    except: raise HTTPException(status_code=503)
+    except:
+        raise HTTPException(status_code=503)
 
 @app.get("/health")
 async def health():
