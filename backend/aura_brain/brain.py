@@ -20,8 +20,8 @@ from ta.momentum import RSIIndicator
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
-MAX_SCAN_LIMIT = 50000
-NODE_URL = "http://127.0.0.1:10000"  # ⚡ Internal Node.js URL
+MAX_SCAN_LIMIT = 5000   # ⚡ SPEED FIX: Reduced from 50,000 to 5,000
+NODE_URL = "http://127.0.0.1:10000" 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
@@ -41,41 +41,56 @@ def safe_float(value, default=0.0):
 
 # --- 1. DATA ENGINE ---
 def load_data_into_memory():
+    """Loads CSV once and stores it in RAM"""
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
-        if not os.path.exists(file_path):
-            if os.path.exists(CSV_FILENAME): file_path = CSV_FILENAME
-            else: return None
+        logger.info(f"📂 Pre-loading database from: {file_path}")
 
+        if not os.path.exists(file_path):
+            if os.path.exists(CSV_FILENAME):
+                file_path = CSV_FILENAME
+            else:
+                logger.error(f"❌ File not found: {CSV_FILENAME}")
+                return None
+
+        # READ CSV
         try:
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',')
         except:
             df = pd.read_csv(file_path, sep=',')
         
+        # CLEANUP
         df.columns = [c.lower().strip() for c in df.columns]
-        rename_map = {'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'date': 'Date', 'time': 'Date', 'timestamp': 'Date'}
+        rename_map = {
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 
+            'date': 'Date', 'time': 'Date', 'timestamp': 'Date'
+        }
         df.rename(columns=rename_map, inplace=True)
         
+        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
-                if df[col].dtype == object: df[col] = df[col].astype(str).str.replace(',', '.')
+                if df[col].dtype == object:
+                    df[col] = df[col].astype(str).str.replace(',', '.')
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.dropna(subset=numeric_cols, inplace=True)
+
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
             df.dropna(subset=['Date'], inplace=True)
             df.set_index('Date', inplace=True)
             df.sort_index(inplace=True)
 
-        logger.info(f"✅ SMC BRAIN LOADED: {len(df)} candles.")
+        logger.info(f"✅ CACHED {len(df)} candles in RAM.")
         return df
+
     except Exception as e:
-        logger.error(f"❌ Init Failed: {e}")
+        logger.error(f"❌ Cache Init Failed: {e}")
         return None
 
 @asynccontextmanager
@@ -86,7 +101,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 🔒 SECURITY: Whitelist Vercel & Render
+# 🔒 SECURITY UPDATE: Whitelist your Vercel App
 origins = [
     "http://localhost:3000",
     "https://aura-trade-weld.vercel.app",  
@@ -119,7 +134,7 @@ def detect_smc_structures(df):
         
         # 1. FAIR VALUE GAPS (FVG) - The "Magnet"
         # Look for 3-candle patterns with gaps
-        for i in range(len(df)-300, len(df)): # Scan last 300 candles
+        for i in range(len(df)-200, len(df)): # Scan last 200 candles for speed
             # Bullish FVG: Candle 1 High < Candle 3 Low
             if highs[i-2] < lows[i]:
                 gap = lows[i] - highs[i-2]
@@ -133,7 +148,6 @@ def detect_smc_structures(df):
                     zones.append({"type": "FVG_BEAR", "price": highs[i], "top": lows[i-2], "bottom": highs[i]})
 
         # 2. ORDER BLOCKS (OB) - The "Wall"
-        # Simplified: Swing Highs/Lows that led to a break
         swing_period = 5
         swing_highs = argrelextrema(highs, np.greater, order=swing_period)[0]
         swing_lows = argrelextrema(lows, np.less, order=swing_period)[0]
@@ -150,7 +164,7 @@ def detect_smc_structures(df):
         logger.warning(f"⚠️ SMC Detection Failed: {e}")
         return []
 
-# --- 3. FRACTAL PATTERN RECOGNITION (NORMALIZED) ---
+# --- 3. FRACTAL PATTERN RECOGNITION (FIXED NORMALIZATION) ---
 def find_fractals(df):
     try:
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
@@ -160,13 +174,16 @@ def find_fractals(df):
         if len(prices) < PATTERN_SIZE + 24: return []
 
         current_pattern = prices[-PATTERN_SIZE:]
+        if np.any(np.isnan(current_pattern)) or np.any(np.isinf(current_pattern)): return []
+        
         scaler = MinMaxScaler()
         current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
         
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
-        for i in range(0, history_limit, 2):
+        # Speed Optimization: Step 5 instead of 2
+        for i in range(0, history_limit, 5):
             try:
                 candidate = prices[i : i + PATTERN_SIZE]
                 candidate_scaler = MinMaxScaler()
@@ -175,10 +192,11 @@ def find_fractals(df):
                 corr, _ = pearsonr(current_norm, candidate_norm)
                 
                 if corr > 0.85: 
-                    # 🚀 NORMALIZATION LOGIC
+                    # 🚀 THE FIX: Calculate % change from the historical entry point
                     hist_entry_price = prices[i + PATTERN_SIZE - 1]
                     future_slice = prices[i + PATTERN_SIZE : i + PATTERN_SIZE + 24]
                     
+                    # Apply historical % movement to the CURRENT price
                     normalized_ghost = []
                     for hist_price in future_slice:
                         percent_change = (hist_price - hist_entry_price) / hist_entry_price
@@ -195,20 +213,25 @@ def find_fractals(df):
                         "start_date": str(recent_data.index[i]), 
                         "plot_data": normalized_ghost 
                     })
-            except: continue
+            except:
+                continue
+                
         return matches
-    except: return []
+    except Exception as e:
+        logger.error(f"⚠️ Fractal Scan Error: {e}")
+        return []
 
-# --- 4. TRADE SETUP (SMC BASED) ---
+# --- 4. TRADE SETUP CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value=None):
     try:
-        if atr_value is None or atr_value == 0: atr_value = current_price * 0.01 
+        if atr_value is None or atr_value == 0:
+            atr_value = current_price * 0.01 
         
         entry = current_price
         if signal == "BUY":
-            # SL just below the Bullish Order Block
+            # SL below Bullish OB
             stop_loss = support if (support > 0 and support < entry) else current_price - (atr_value * 1.5)
-            # TP at the next Bearish Liquidity Pool
+            # TP at Bearish OB
             take_profit = resistance if (resistance > entry) else current_price + (abs(entry - stop_loss) * 2)
         elif signal == "SELL":
             stop_loss = resistance if (resistance > 0 and resistance > entry) else current_price + (atr_value * 1.5)
@@ -222,46 +245,55 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
             "take_profit": round(take_profit, 2),
             "risk_reward": round(abs(take_profit - entry) / max(0.01, abs(entry - stop_loss)), 2)
         }
-    except: return None
+    except:
+        return None
 
 # --- 5. API ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     df = MARKET_MEMORY["df"]
-    if df is None or df.empty: return {"signal": "HOLD", "confidence": 0}
+    if df is None or df.empty:
+        return {"signal": "HOLD", "confidence": 0, "reasoning": ["System Warmup..."]}
 
     try:
         current_price = safe_float(df['Close'].iloc[-1])
-        ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
-        rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
+        
+        # INDICATORS
+        ema_series = EMAIndicator(close=df['Close'], window=200).ema_indicator()
+        ema_200 = safe_float(ema_series.iloc[-1], current_price)
+        rsi_series = RSIIndicator(close=df['Close'], window=14).rsi()
+        rsi = safe_float(rsi_series.iloc[-1], 50.0)
+
+        # ATR Estimate
         atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # --- EXECUTE ENGINES ---
+        # AI SCANS (Now using SMC)
         smc_zones = detect_smc_structures(df) # 🆕 SMC Engine
         matches = find_fractals(df)           # 🆕 Normalized Fractals
         
-        # --- FILTER ZONES ---
-        # Find nearest Bullish Zone (Support) and Bearish Zone (Resistance)
+        # FILTER ZONES FOR FRONTEND
         bullish_zones = [z['price'] for z in smc_zones if z['type'] in ['OB_BULL', 'FVG_BULL'] and z['price'] < current_price]
         bearish_zones = [z['price'] for z in smc_zones if z['type'] in ['OB_BEAR', 'FVG_BEAR'] and z['price'] > current_price]
         
         sup_level = max(bullish_zones) if bullish_zones else current_price * 0.98
         res_level = min(bearish_zones) if bearish_zones else current_price * 1.02
 
-        # Convert to legacy "lines" format for frontend compatibility
+        # Convert to legacy "lines" format so Frontend understands
         trendlines = []
         if res_level: trendlines.append({"type": "RESISTANCE", "price": res_level})
         if sup_level: trendlines.append({"type": "SUPPORT", "price": sup_level})
 
-        # --- SIGNAL LOGIC ---
+        # SIGNAL LOGIC
         total_matches = len(matches)
         signal = "NEUTRAL"
         confidence = 0
         best_match = matches[0] if matches else None
 
-        if total_matches >= 2:
+        if total_matches >= 1:
             matches.sort(key=lambda x: x['similarity'], reverse=True)
+            best_match = matches[0]
+
             bull_votes = len([m for m in matches if m['outcome'] == "BULLISH"])
             bear_votes = len([m for m in matches if m['outcome'] == "BEARISH"])
             
@@ -272,8 +304,12 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_votes / total_matches) * 100
             
-            if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"): confidence += 10
-            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30): confidence -= 15
+            # Trend Alignment Bonus
+            if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"):
+                confidence += 10
+            # RSI Caution
+            if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
+                confidence -= 20
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
@@ -283,9 +319,9 @@ async def analyze(req: AnalysisRequest):
             "trend": trend,
             "pattern": f"SMC Scan ({len(smc_zones)} Zones)",
             "reasoning": [
-                f"Market Structure: {trend}",
-                f"Nearest OB Support: {round(sup_level, 2)}",
-                f"Nearest OB Resistance: {round(res_level, 2)}"
+                f"Structure: {trend}",
+                f"OB Support: {round(sup_level, 2)}",
+                f"OB Resistance: {round(res_level, 2)}"
             ],
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {"lines": trendlines, "fractal": best_match},
