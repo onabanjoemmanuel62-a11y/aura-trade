@@ -8,7 +8,7 @@ const NewsEvent = require('../models/NewsEvent');
 const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
 
 // ==========================================
-// 🕵️ NEWS ANALYZER (UNCHANGED - PRESERVED)
+// 🕵️ NEWS ANALYZER (UNCHANGED)
 // ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
@@ -72,7 +72,7 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 };
 
 // ==========================================
-// 🚀 MAIN CONTROLLER
+// 🚀 MAIN CONTROLLER (UPDATED LIMIT)
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
@@ -100,10 +100,10 @@ exports.analyzePattern = async (req, res) => {
         // ------------------------------------
         
         // 1. Fetch Fresh Data from MongoDB
-        // We need enough candles for the Python Fractal scan (min 100+)
+        // ✅ UPDATE: Increased limit from 300 -> 3000 to allow Fractal Matching
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
                                        .sort({ time: -1 }) // Get newest first
-                                       .limit(300)         // Get plenty of history
+                                       .limit(3000)        // 👈 THE CRITICAL FIX
                                        .lean();            // Convert to plain JSON
 
         if (rawCandles.length < 100) {
@@ -111,13 +111,12 @@ exports.analyzePattern = async (req, res) => {
         }
 
         // 2. Prepare Data for Python (Oldest -> Newest)
-        // Python expects a clean array of objects
         const cleanCandles = rawCandles.reverse().map(c => ({
             open: c.open,
             high: c.high,
             low: c.low,
             close: c.close,
-            time: c.time, // Ensure this matches what brain.py expects
+            time: c.time, 
             volume: c.volume || 0
         }));
 
