@@ -28,6 +28,11 @@ class BoxRenderer {
 
                 ctx.fillStyle = zone.color;
                 ctx.fillRect(x1, yTop, width, height);
+                
+                // Optional: Add a border to make it look exactly like the client's mockup
+                ctx.strokeStyle = zone.color.replace('0.25', '0.8'); // Make border darker
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x1, yTop, width, height);
             });
         });
     }
@@ -72,9 +77,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const boxPrimitiveRef = useRef(new BoxPrimitive());
   
   // Refs
-  const isChartReady = useRef(false); // 🔒 SAFETY LOCK
+  const isChartReady = useRef(false);
   const currentBarRef = useRef(null);
-  const socketRef = useRef(null);
   const timeframeRef = useRef('1h'); 
   const allDataRef = useRef([]);
   const isLoadingRef = useRef(false); 
@@ -87,7 +91,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const [newsData, setNewsData] = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
 
-  // --- HELPER: Grid Snapping ---
   const getCandleStartTime = useCallback((timestamp, tf) => {
     let seconds = Number(timestamp);
     if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
@@ -108,8 +111,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
     });
 
-    // ✅ V5 SYNTAX SAFEGUARD
-    // Using addSeries(CandlestickSeries) which is correct for v5
+    // ✅ THE FIX: V5 Syntax using addSeries()
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
@@ -123,14 +125,13 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
     fractalSeriesRef.current = ghostSeries; 
-    isChartReady.current = true; // 🔓 UNLOCK
+    isChartReady.current = true;
 
     const handleResize = () => {
         if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth });
     };
     window.addEventListener('resize', handleResize);
 
-    // 🕵️ HISTORY LISTENER
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
         if (range && range.from < 5 && !isLoadingRef.current) {
             fetchOlderHistory();
@@ -138,7 +139,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     });
 
     return () => { 
-        isChartReady.current = false; // 🔒 LOCK
+        isChartReady.current = false;
         window.removeEventListener('resize', handleResize); 
         chart.remove(); 
         chartRef.current = null;
@@ -146,7 +147,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     };
   }, []);
 
-  // --- 2. FETCH HISTORY ---
   const fetchOlderHistory = async () => {
       if (isLoadingRef.current || !allDataRef.current.length) return;
       isLoadingRef.current = true;
@@ -164,7 +164,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
           })).sort((a, b) => a.time - b.time);
 
-          // MERGE
           const combinedData = [...newOldData, ...allDataRef.current]
               .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
 
@@ -175,7 +174,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       finally { isLoadingRef.current = false; }
   };
 
-  // --- 3. LOAD INITIAL DATA ---
   useEffect(() => {
     if (!isChartReady.current) return;
 
@@ -201,7 +199,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime]);
 
-  // --- 4. ANIMATION LOOP ---
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
@@ -213,6 +210,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         latestCandleRef.current = null;
       }
 
+      // Render SMC Order Blocks from Python
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
           const rawZones = visuals.smc_zones.map(z => ({
               time: z.start_time || (Date.now() / 1000), 
@@ -227,7 +225,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, [visuals]);
 
-  // --- 5. MARKERS & LINES (CRASH FIX HERE) ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
@@ -250,8 +247,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 size: n.impact === 'High' ? 2 : 1,
             })).sort((a, b) => a.time - b.time); 
             
-            // ✅ SAFETY CHECK: Prevent white screen if setMarkers isn't ready
-            if (typeof candleSeriesRef.current.setMarkers === 'function') {
+            // ✅ SAFETY CHECK: Prevent the crash you experienced
+            if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
             }
         } catch (e) { console.warn("Marker skip", e); }
@@ -276,10 +273,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     if (levels && levels.ema) addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
   }, [levels, tradeSetup]); 
 
-  // --- 6. SOCKETS ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
-    socketRef.current = socket;
     socket.on('connect', () => setConnectionStatus('Connected'));
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
     socket.on('price-update', (data) => {
@@ -304,7 +299,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => socket.disconnect();
   }, [timeframe, getCandleStartTime]);
 
-  // --- RENDER ---
   const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]); };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };
   const handleZoomIn = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 1.2 }); };
