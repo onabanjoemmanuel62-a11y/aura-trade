@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType } from 'lightweight-charts';
+import React, { useEffect, useRef, useState } from 'react';
+import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts'; // 👈 Import Series Type
 import axios from 'axios';
 import io from 'socket.io-client';
 
@@ -39,8 +39,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             },
         });
 
-        // Add Candle Series
-        const candleSeries = chart.addCandlestickSeries({
+        // ✅ FIX: Use v5 Syntax (addSeries + CandlestickSeries)
+        const candleSeries = chart.addSeries(CandlestickSeries, {
             upColor: '#089981', downColor: '#F23645', 
             borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
         });
@@ -51,8 +51,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
         // Handle Resize
         const handleResize = () => {
-            if (chartContainerRef.current) {
-                chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+            if (chartRef.current) {
+                chartRef.current.applyOptions({ width: chartContainerRef.current.clientWidth });
             }
         };
         window.addEventListener('resize', handleResize);
@@ -68,7 +68,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     useEffect(() => {
         const loadHistory = async () => {
             try {
-                // Fetch 1000 candles
                 const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
                     params: { limit: 1000, timestamp: Date.now() }
                 });
@@ -84,7 +83,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                         }))
                         .sort((a, b) => a.time - b.time); 
                     
-                    // Remove duplicates
                     const uniqueData = [...new Map(sortedData.map(item => [item.time, item])).values()];
                     
                     candleSeriesRef.current.setData(uniqueData);
@@ -111,7 +109,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 const price = parseFloat(data.close);
                 const time = data.time; 
                 
-                // Update the current candle live
                 candleSeriesRef.current.update({
                     time: time,
                     open: parseFloat(data.open),
@@ -135,7 +132,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 price: parseFloat(price),
                 color: color,
                 lineWidth: 2,
-                lineStyle: 2, // Dashed
+                lineStyle: 2, 
                 axisLabelVisible: true,
                 title: title,
             });
@@ -146,7 +143,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         if (tradeSetup.stop_loss) createLine(tradeSetup.stop_loss, '#FF1744', 'SL');
 
     }, [tradeSetup]);
-
 
     return (
         <div style={{ position: 'relative', width: '100%', height: '500px', background: '#161A25', borderRadius: '8px', padding: '10px' }}>
