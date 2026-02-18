@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN (THE ENGINE)
+// 🎨 CUSTOM BOX PLUGIN (UPGRADED FOR TRADINGVIEW LOOK)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -19,20 +19,24 @@ class BoxRenderer {
             const verticalPixelRatio = scope.verticalPixelRatio;
 
             this._data.forEach((zone) => {
-                const x1 = zone.x !== undefined ? zone.x * horizontalPixelRatio : 0;
-                const x2 = scope.mediaSize.width * horizontalPixelRatio;
+                // If the start time is off-screen, anchor it to the far left (0)
+                const x1 = zone.x !== null ? zone.x * horizontalPixelRatio : 0;
+                const x2 = scope.mediaSize.width * horizontalPixelRatio; // Draw to far right
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 const width = x2 - x1;
-                const height = yBottom - yTop; 
+                const height = Math.abs(yBottom - yTop); 
 
+                // Fill the Box (Transparent)
                 ctx.fillStyle = zone.color;
-                ctx.fillRect(x1, yTop, width, height);
-                
-                // Optional: Add a border to make it look exactly like the client's mockup
-                ctx.strokeStyle = zone.color.replace('0.25', '0.8'); // Make border darker
-                ctx.lineWidth = 1;
-                ctx.strokeRect(x1, yTop, width, height);
+                ctx.fillRect(x1, Math.min(yTop, yBottom), width, height);
+
+                // Draw the Border (Solid) - Just like the client's mockup
+                if (zone.borderColor) {
+                    ctx.strokeStyle = zone.borderColor;
+                    ctx.lineWidth = 1.5 * horizontalPixelRatio;
+                    ctx.strokeRect(x1, Math.min(yTop, yBottom), width, height);
+                }
             });
         });
     }
@@ -50,15 +54,19 @@ class BoxPrimitive {
     }
     setData(zones, series, timeScale) {
         this._rendererData = zones.map(zone => {
-            const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : undefined;
+            // Get X coordinate, fallback to null if off-screen
+            const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : null;
+            
             const priceTopCoord = series.priceToCoordinate(zone.top);
             const priceBottomCoord = series.priceToCoordinate(zone.bottom);
             if (priceTopCoord === null || priceBottomCoord === null) return null;
+            
             return {
-                x: timeCoord,
+                x: timeCoord, // Renderer handles null by defaulting to left edge
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
                 yBottom: Math.max(priceTopCoord, priceBottomCoord),
-                color: zone.color
+                color: zone.color,
+                borderColor: zone.borderColor
             };
         }).filter(z => z !== null);
     }
@@ -76,6 +84,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const fractalSeriesRef = useRef(null); 
   const boxPrimitiveRef = useRef(new BoxPrimitive());
   
+  // ✅ FIX: Track active lines to prevent stacking
+  const activeLinesRef = useRef([]);
+
   // Refs
   const isChartReady = useRef(false);
   const currentBarRef = useRef(null);
@@ -111,7 +122,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
     });
 
-    // ✅ THE FIX: V5 Syntax using addSeries()
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
@@ -210,13 +220,22 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         latestCandleRef.current = null;
       }
 
-      // Render SMC Order Blocks from Python
+      // ✅ FIX: Draw Order Blocks near the current price
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
-          const rawZones = visuals.smc_zones.map(z => ({
-              time: z.start_time || (Date.now() / 1000), 
-              top: z.top, bottom: z.bottom,
-              color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)' 
-          }));
+          const rawZones = visuals.smc_zones.map(z => {
+              // Anchor the box 10 candles back so it spans across the current price
+              let safeTime = z.start_time || z.time;
+              if (!safeTime && allDataRef.current.length > 10) {
+                  safeTime = allDataRef.current[allDataRef.current.length - 10].time;
+              }
+
+              return {
+                  time: safeTime || (Date.now() / 1000), 
+                  top: z.top, bottom: z.bottom,
+                  color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)',
+                  borderColor: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.8)' : 'rgba(38, 166, 154, 0.8)'
+              };
+          });
           boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
       }
       animationFrameId = requestAnimationFrame(renderLoop);
@@ -247,7 +266,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 size: n.impact === 'High' ? 2 : 1,
             })).sort((a, b) => a.time - b.time); 
             
-            // ✅ SAFETY CHECK: Prevent the crash you experienced
             if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
             }
@@ -255,23 +273,35 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
+  // ✅ FIX: The "Stacked EMA" Fix
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
+    
+    // 1. Remove all old lines first to prevent stacking
+    activeLinesRef.current.forEach(line => {
+        try { candleSeriesRef.current.removePriceLine(line); } catch (e) {}
+    });
+    activeLinesRef.current = []; // Clear the array
+
+    // 2. Helper to create and track new lines
     const addLine = (price, color, title, isDashed = false, width = 2) => {
         if (price && !isNaN(parseFloat(price))) {
-            candleSeriesRef.current.createPriceLine({
+            const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price), color, lineWidth: width,
                 lineStyle: isDashed ? 2 : 0, axisLabelVisible: true, title
             });
+            activeLinesRef.current.push(line); // Track it
         }
     };
+
     if (tradeSetup) {
         if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); 
         if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     
         if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          
     }
     if (levels && levels.ema) addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
-  }, [levels, tradeSetup]); 
+
+  }, [levels, tradeSetup]); // Runs ONLY when AI data updates
 
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
