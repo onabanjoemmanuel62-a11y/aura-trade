@@ -108,9 +108,12 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
     });
 
+    // ✅ V5 SYNTAX SAFEGUARD
+    // Using addSeries(CandlestickSeries) which is correct for v5
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
+    
     const ghostSeries = chart.addSeries(LineSeries, {
         color: '#a855f7', lineWidth: 2, lineStyle: 2, title: 'AI PROJECTION'
     });
@@ -127,7 +130,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     };
     window.addEventListener('resize', handleResize);
 
-    // 🕵️ HISTORY LISTENER (Restored)
+    // 🕵️ HISTORY LISTENER
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
         if (range && range.from < 5 && !isLoadingRef.current) {
             fetchOlderHistory();
@@ -143,7 +146,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     };
   }, []);
 
-  // --- 2. FETCH HISTORY (Restored Full Logic) ---
+  // --- 2. FETCH HISTORY ---
   const fetchOlderHistory = async () => {
       if (isLoadingRef.current || !allDataRef.current.length) return;
       isLoadingRef.current = true;
@@ -161,7 +164,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
           })).sort((a, b) => a.time - b.time);
 
-          // MERGE: New Old Data + Existing Data
+          // MERGE
           const combinedData = [...newOldData, ...allDataRef.current]
               .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
 
@@ -179,7 +182,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     const loadInitialHistory = async () => {
       setIsLoading(true);
       try {
-        // Request 1000 candles initially to fill the screen
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 1000, timestamp: Date.now() }
         });
@@ -225,7 +227,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, [visuals]);
 
-  // --- 5. MARKERS & LINES ---
+  // --- 5. MARKERS & LINES (CRASH FIX HERE) ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
@@ -247,7 +249,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
                 text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
                 size: n.impact === 'High' ? 2 : 1,
             })).sort((a, b) => a.time - b.time); 
-            candleSeriesRef.current.setMarkers(markers);
+            
+            // ✅ SAFETY CHECK: Prevent white screen if setMarkers isn't ready
+            if (typeof candleSeriesRef.current.setMarkers === 'function') {
+                candleSeriesRef.current.setMarkers(markers);
+            }
         } catch (e) { console.warn("Marker skip", e); }
     }
   }, [newsData, timeframe, getCandleStartTime]);
