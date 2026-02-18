@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts'; // 👈 Import Series Type
+import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts'; // 👈 Import Series Class
 import axios from 'axios';
 import io from 'socket.io-client';
 
@@ -39,7 +39,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             },
         });
 
-        // ✅ FIX: Use v5 Syntax (addSeries + CandlestickSeries)
+        // ✅ FIX FOR VERSION 5: Use addSeries(CandlestickSeries, options)
         const candleSeries = chart.addSeries(CandlestickSeries, {
             upColor: '#089981', downColor: '#F23645', 
             borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
@@ -122,11 +122,10 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         return () => socket.disconnect();
     }, []);
 
-    // --- 4. DRAW TRADING LEVELS (TP/SL) ---
+    // --- 4. DRAW TRADING LEVELS ---
     useEffect(() => {
         if (!candleSeriesRef.current || !tradeSetup) return;
         
-        // Helper to draw lines
         const createLine = (price, color, title) => {
             candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price),
