@@ -1,11 +1,13 @@
-const axios = require('axios');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const path = require('path');
 
+// ✅ FIX: Import Class correctly
+const YahooFinance = require('yahoo-finance2').default; 
+const yahooFinance = new YahooFinance(); 
+
 // 1. Setup Environment
 if (require.main === module) {
-    // Point to backend/.env (Assuming running from backend/ folder)
     const envPath = path.join(__dirname, '../.env');
     console.log(`Loading .env from: ${envPath}`);
     dotenv.config({ path: envPath });
@@ -14,67 +16,83 @@ if (require.main === module) {
         console.error("❌ ERROR: .env loaded but MONGO_URI is missing!");
         process.exit(1);
     }
-
-    const connectDB = require('../config/db');
-    connectDB();
 }
 
 const Candle = require('../models/Candle');
 
-// Configuration
-const SYMBOL = 'PAXGUSDT'; // Gold-backed Crypto
-const TIMEFRAMES = ['1h', '4h']; // <--- NOW SUPPORTS MULTIPLE
-const LIMIT = 1000; // Get last 1000 candles
+// ⚙️ CONFIGURATION
+const SYMBOL = 'GC=F'; // Gold Futures
+const TIMEFRAMES = ['1h', '4h']; 
 
 const backfillData = async () => {
-    // Wait for DB connection
-    if (mongoose.connection.readyState === 0) {
-        await mongoose.connect(process.env.MONGO_URI);
+    console.log(`🔌 Connecting to MongoDB Atlas...`);
+
+    try {
+        // ✅ FIX: Explicit connection options with longer timeouts
+        await mongoose.connect(process.env.MONGO_URI, {
+            serverSelectionTimeoutMS: 30000, // Wait 30s instead of 10s
+            socketTimeoutMS: 45000,
+        });
+        console.log(`✅ DB Connected!`);
+    } catch (err) {
+        console.error("❌ DB Connection Failed. Check your IP Whitelist on Atlas!", err);
+        process.exit(1);
     }
 
-    console.log(`🚀 Starting Multi-Timeframe Backfill for ${SYMBOL}...`);
+    console.log(`🚀 Starting GOLD FUTURES (GC=F) Backfill...`);
+
+    // Calculate start date (60 days ago)
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() - 60); 
+    const period1 = startDate.toISOString().split('T')[0];
 
     for (const interval of TIMEFRAMES) {
-        console.log(`\n📡 Fetching ${interval} data from Binance...`);
+        console.log(`\n📡 Fetching ${interval} data from Yahoo Finance (Chart API)...`);
 
         try {
-            // 2. Fetch Data from Binance Public API
-            const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${interval}&limit=${LIMIT}`;
-            const response = await axios.get(url);
-            const rawData = response.data;
+            const queryOptions = {
+                period1: period1,
+                interval: '1h' 
+            };
 
-            console.log(`✅ Received ${rawData.length} candles for ${interval}. Processing...`);
+            const result = await yahooFinance.chart(SYMBOL, queryOptions);
+            const rawData = result.quotes; 
 
-            // 3. Prepare Bulk Operations
+            if (!rawData || rawData.length === 0) {
+                console.log(`⚠️ No data found for ${interval}`);
+                continue;
+            }
+
+            console.log(`✅ Received ${rawData.length} candles. Saving to DB...`);
+
             const bulkOps = rawData.map((candle) => {
-                // Binance Format: [Timestamp(ms), Open, High, Low, Close, Volume, ...]
-                const timeInSeconds = Math.floor(candle[0] / 1000); 
+                if (!candle.date) return null;
+                const timeInSeconds = Math.floor(new Date(candle.date).getTime() / 1000);
 
                 return {
                     updateOne: {
-                        filter: { time: timeInSeconds, timeframe: interval }, // <--- Specific to interval
+                        filter: { time: timeInSeconds, timeframe: interval }, 
                         update: {
                             $set: {
                                 time: timeInSeconds,
-                                open: parseFloat(candle[1]),
-                                high: parseFloat(candle[2]),
-                                low: parseFloat(candle[3]),
-                                close: parseFloat(candle[4]),
-                                timeframe: interval, // <--- Save as '1h' or '4h'
-                                isWeekend: new Date(timeInSeconds * 1000).getDay() === 0 || new Date(timeInSeconds * 1000).getDay() === 6
+                                open: candle.open,
+                                high: candle.high,
+                                low: candle.low,
+                                close: candle.close,
+                                volume: candle.volume || 0,
+                                timeframe: interval,
+                                isWeekend: false
                             }
                         },
                         upsert: true
                     }
                 };
-            });
+            }).filter(op => op !== null);
 
-            // 4. Execute Bulk Write
             if (bulkOps.length > 0) {
+                // ✅ FIX: Wait for the write to finish
                 await Candle.bulkWrite(bulkOps);
                 console.log(`💾 Saved ${bulkOps.length} candles (${interval}) to MongoDB.`);
-            } else {
-                console.log(`⚠️ No data to save for ${interval}.`);
             }
 
         } catch (error) {
@@ -82,11 +100,10 @@ const backfillData = async () => {
         }
     }
 
-    console.log('\n🎉 SUCCESS: All timeframes backfilled!');
+    console.log('\n🎉 SUCCESS: Gold History Loaded!');
     process.exit();
 };
 
-// Run immediately
 if (require.main === module) {
     backfillData();
 }
