@@ -11,7 +11,6 @@ const API_URL = 'https://aura-trade-v1.onrender.com';
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
-    
     draw(target) {
         target.useBitmapCoordinateSpace((scope) => {
             if (this._data.length === 0) return;
@@ -22,10 +21,8 @@ class BoxRenderer {
             this._data.forEach((zone) => {
                 const x1 = zone.x !== undefined ? zone.x * horizontalPixelRatio : 0;
                 const x2 = scope.mediaSize.width * horizontalPixelRatio;
-                
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
-                
                 const width = x2 - x1;
                 const height = yBottom - yTop; 
 
@@ -46,15 +43,12 @@ class BoxPrimitive {
         this._rendererData = [];
         this._paneViews = [new BoxPaneView(this)];
     }
-
     setData(zones, series, timeScale) {
         this._rendererData = zones.map(zone => {
             const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : undefined;
             const priceTopCoord = series.priceToCoordinate(zone.top);
             const priceBottomCoord = series.priceToCoordinate(zone.bottom);
-
             if (priceTopCoord === null || priceBottomCoord === null) return null;
-
             return {
                 x: timeCoord,
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
@@ -63,7 +57,6 @@ class BoxPrimitive {
             };
         }).filter(z => z !== null);
     }
-
     updateAllViews() {}
     paneViews() { return this._paneViews; }
 }
@@ -78,9 +71,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const fractalSeriesRef = useRef(null); 
   const boxPrimitiveRef = useRef(new BoxPrimitive());
   
-  // 🔒 SAFETY LOCKS
-  const isChartReady = useRef(false);
-  
+  // Refs
+  const isChartReady = useRef(false); // 🔒 SAFETY LOCK
   const currentBarRef = useRef(null);
   const socketRef = useRef(null);
   const timeframeRef = useRef('1h'); 
@@ -92,23 +84,21 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const [prediction, setPrediction] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
-  const [isHoveringControls, setIsHoveringControls] = useState(false);
   const [newsData, setNewsData] = useState([]);
+  const [isHoveringControls, setIsHoveringControls] = useState(false);
 
-  // --- HELPER: Strict Grid Snapping ---
+  // --- HELPER: Grid Snapping ---
   const getCandleStartTime = useCallback((timestamp, tf) => {
     let seconds = Number(timestamp);
     if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
-    let resolution = 3600; // 1h
-    if (tf === '4h') resolution = 14400; // 4h
+    let resolution = tf === '4h' ? 14400 : 3600;
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
-  // --- 1. INITIALIZE CHART (STRICT CLEANUP) ---
+  // --- 1. INITIALIZE CHART ---
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
-    // Create Chart
     const chart = createChart(chartContainerRef.current, {
       layout: { background: { type: ColorType.Solid, color: '#161A25' }, textColor: '#D9D9D9' },
       grid: { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
@@ -121,28 +111,31 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     const newSeries = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
-
     const ghostSeries = chart.addSeries(LineSeries, {
         color: '#a855f7', lineWidth: 2, lineStyle: 2, title: 'AI PROJECTION'
     });
 
-    // Attach Plugin
     newSeries.attachPrimitive(boxPrimitiveRef.current);
 
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
     fractalSeriesRef.current = ghostSeries; 
-    isChartReady.current = true; // 🔓 UNLOCK: Chart is ready to receive data
+    isChartReady.current = true; // 🔓 UNLOCK
 
-    // Handlers
     const handleResize = () => {
         if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth });
     };
     window.addEventListener('resize', handleResize);
 
-    // 🧹 CLEANUP: This prevents the "Object Disposed" error
+    // 🕵️ HISTORY LISTENER (Restored)
+    chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (range && range.from < 5 && !isLoadingRef.current) {
+            fetchOlderHistory();
+        }
+    });
+
     return () => { 
-        isChartReady.current = false; // 🔒 LOCK: Stop all updates
+        isChartReady.current = false; // 🔒 LOCK
         window.removeEventListener('resize', handleResize); 
         chart.remove(); 
         chartRef.current = null;
@@ -150,16 +143,45 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     };
   }, []);
 
-  // --- 2. LOAD HISTORY ---
+  // --- 2. FETCH HISTORY (Restored Full Logic) ---
+  const fetchOlderHistory = async () => {
+      if (isLoadingRef.current || !allDataRef.current.length) return;
+      isLoadingRef.current = true;
+      const oldestTime = allDataRef.current[0].time; 
+      
+      try {
+          const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
+              params: { limit: 500, before: oldestTime, timestamp: Date.now() }
+          });
+          const rawData = Array.isArray(res.data) ? res.data : [];
+          if (rawData.length === 0) return;
+
+          const newOldData = rawData.map(item => ({
+            time: getCandleStartTime(item.time, timeframeRef.current), 
+            open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
+          })).sort((a, b) => a.time - b.time);
+
+          // MERGE: New Old Data + Existing Data
+          const combinedData = [...newOldData, ...allDataRef.current]
+              .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
+
+          allDataRef.current = combinedData;
+          if (candleSeriesRef.current) candleSeriesRef.current.setData(combinedData);
+
+      } catch (err) { console.error("History Error", err); } 
+      finally { isLoadingRef.current = false; }
+  };
+
+  // --- 3. LOAD INITIAL DATA ---
   useEffect(() => {
-    // Only load if chart exists
     if (!isChartReady.current) return;
 
     const loadInitialHistory = async () => {
       setIsLoading(true);
       try {
+        // Request 1000 candles initially to fill the screen
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
-            params: { limit: 500, timestamp: Date.now() }
+            params: { limit: 1000, timestamp: Date.now() }
         });
         const data = (res.data || []).map(item => ({
             time: getCandleStartTime(item.time, timeframe), 
@@ -175,101 +197,87 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       finally { setIsLoading(false); }
     };
     loadInitialHistory();
-  }, [timeframe, getCandleStartTime]); 
+  }, [timeframe, getCandleStartTime]);
 
-  // --- 3. ANIMATION LOOP ---
+  // --- 4. ANIMATION LOOP ---
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
-      if (!isChartReady.current) return; // 🔒 Stop if chart dead
+      if (!isChartReady.current) return; 
 
-      // Update Candles
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 
-      // Update Boxes (SMC Zones)
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
           const rawZones = visuals.smc_zones.map(z => ({
               time: z.start_time || (Date.now() / 1000), 
-              top: z.top,
-              bottom: z.bottom,
+              top: z.top, bottom: z.bottom,
               color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)' 
           }));
           boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
       }
-
       animationFrameId = requestAnimationFrame(renderLoop);
     };
     renderLoop();
     return () => cancelAnimationFrame(animationFrameId);
   }, [visuals]);
 
-  // --- 4. NEWS & MARKERS ---
+  // --- 5. MARKERS & LINES ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
               const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) setNewsData(res.data.map(n => ({...n, time: n.time})));
-          } catch (err) { console.error("News Error", err); }
+          } catch (err) { console.error(err); }
       };
       fetchNews();
   }, []);
 
   useEffect(() => {
-    // 🔒 SAFETY CHECK: Only try to set markers if the series actually exists
     if (newsData.length > 0 && isChartReady.current && candleSeriesRef.current) {
         try {
-            const markers = newsData
-                .filter(n => n.time) 
-                .map(n => ({
-                    time: getCandleStartTime(n.time, timeframeRef.current),
-                    position: 'aboveBar',
-                    color: n.impact === 'High' ? '#ef5350' : '#ffa726',
-                    shape: 'arrowDown',
-                    text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
-                    size: n.impact === 'High' ? 2 : 1,
-                }))
-                .sort((a, b) => a.time - b.time); 
-            
+            const markers = newsData.filter(n => n.time).map(n => ({
+                time: getCandleStartTime(n.time, timeframeRef.current),
+                position: 'aboveBar',
+                color: n.impact === 'High' ? '#ef5350' : '#ffa726',
+                shape: 'arrowDown',
+                text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
+                size: n.impact === 'High' ? 2 : 1,
+            })).sort((a, b) => a.time - b.time); 
             candleSeriesRef.current.setMarkers(markers);
-        } catch (e) {
-            console.warn("Marker update skipped: Chart not ready");
-        }
+        } catch (e) { console.warn("Marker skip", e); }
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
-  // --- 5. DRAW GHOST & TRADE LINES ---
   useEffect(() => {
-      if(!isChartReady.current || !candleSeriesRef.current) return; // 🔒 Safety
-
-      // Ghost Pattern
-      if (fractalSeriesRef.current && visuals?.fractal && currentBarRef.current) {
-          const { plot_data } = visuals.fractal;
-          if (plot_data && plot_data.length > 0) {
-              const currentTime = currentBarRef.current.time;
-              const interval = timeframeRef.current === '1h' ? 3600 : 14400; 
-              const ghostData = plot_data.map((price, index) => ({
-                  time: currentTime + ((index + 1) * interval),
-                  value: price
-              }));
-              fractalSeriesRef.current.setData(ghostData);
-          }
-      }
-  }, [visuals, timeframe]);
+    if (!candleSeriesRef.current || !isChartReady.current) return;
+    const addLine = (price, color, title, isDashed = false, width = 2) => {
+        if (price && !isNaN(parseFloat(price))) {
+            candleSeriesRef.current.createPriceLine({
+                price: parseFloat(price), color, lineWidth: width,
+                lineStyle: isDashed ? 2 : 0, axisLabelVisible: true, title
+            });
+        }
+    };
+    if (tradeSetup) {
+        if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); 
+        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     
+        if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          
+    }
+    if (levels && levels.ema) addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
+  }, [levels, tradeSetup]); 
 
   // --- 6. SOCKETS ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socketRef.current = socket;
-    
     socket.on('connect', () => setConnectionStatus('Connected'));
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
-    
     socket.on('price-update', (data) => {
-        if (!isChartReady.current || !currentBarRef.current) return; // 🔒 Safety
+        if (!isChartReady.current || !currentBarRef.current) return; 
         const price = parseFloat(data.close || data.c);
         if (isNaN(price)) return;
         
@@ -286,12 +294,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
         latestCandleRef.current = updatedCandle;
     });
-
     socket.on('prediction-update', (data) => setPrediction(data));
     return () => socket.disconnect();
   }, [timeframe, getCandleStartTime]);
 
-  // --- RENDER CONTROLS & JSX ---
+  // --- RENDER ---
   const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]); };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };
   const handleZoomIn = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 1.2 }); };
