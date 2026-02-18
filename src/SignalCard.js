@@ -1,15 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, ShieldAlert, Lock } from 'lucide-react';
+import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, Lock, Target, Shield, Crosshair } from 'lucide-react';
 import axios from 'axios';
 
-// ☁️ LIVE SERVER ADDRESS
+// ☁️ LIVE SERVER ADDRESS (Ensure this matches your backend)
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // 🧠 AI PERSONALITY SETTINGS
-const ENTRY_THRESHOLD = 75;  // Must be this sure to ENTER
-const EXIT_THRESHOLD = 60;   // Must drop below this to EXIT
-const FLIP_THRESHOLD = 85;   // Must be this overwhelming to FLIP sides
-const LOCK_EXPIRY_HOURS = 4; // How long to remember a trade (prevents stale locks)
+const ENTRY_THRESHOLD = 70;  // Slightly lower threshold for SMC (it's stricter)
+const EXIT_THRESHOLD = 55;   
+const FLIP_THRESHOLD = 80;   
+const LOCK_EXPIRY_HOURS = 4; 
 
 const SignalCard = ({ externalData, loading, onRefresh }) => {
   // --- STATE ---
@@ -21,23 +21,18 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const [newsCountdown, setNewsCountdown] = useState('--:--:--');
 
   // 🔒 PERSISTENT SMART LOCK ENGINE
-  // We initialize state from LocalStorage so it survives page reloads
   const getSavedLock = () => {
     try {
       const saved = localStorage.getItem('aura_ai_lock');
       if (saved) {
         const parsed = JSON.parse(saved);
-        // Check if the lock is too old (expired)
         const ageHours = (Date.now() - parsed.timestamp) / (1000 * 60 * 60);
-        if (ageHours < LOCK_EXPIRY_HOURS) {
-          return parsed; // Return valid saved lock
-        }
+        if (ageHours < LOCK_EXPIRY_HOURS) return parsed;
       }
     } catch (e) { console.error("Storage Read Error", e); }
     return { type: 'NEUTRAL', confidence: 0, timestamp: Date.now() };
   };
 
-  // The "Truth" is stored in this ref, initialized from storage
   const activeSignalRef = useRef(getSavedLock()); 
   const [displayState, setDisplayState] = useState(activeSignalRef.current);
 
@@ -50,13 +45,14 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
 
   // --- ⚙️ THE PERSISTENT LOGIC ENGINE ---
   const processNewData = (newData) => {
+    // Handle the new Python response format
     const rawConf = Math.max(0, newData.confidence || 0);
     const rawSignal = (newData.signal || 'NEUTRAL').toUpperCase();
     
     let currentLock = activeSignalRef.current.type; 
     let nextState = 'NEUTRAL';
 
-    // 1. NEUTRAL STATE: Look for fresh entry
+    // 1. NEUTRAL STATE
     if (currentLock === 'NEUTRAL') {
       if (rawConf >= ENTRY_THRESHOLD) {
         nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
@@ -64,39 +60,36 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         nextState = 'NEUTRAL';
       }
     } 
-    // 2. LOCKED STATE: Defend the position
+    // 2. LOCKED STATE
     else {
-      // Check for Flip (Buy -> Sell)
       const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) || 
                          (currentLock === 'SELL' && rawSignal.includes('BUY'));
       
       if (isOpposite && rawConf >= FLIP_THRESHOLD) {
-        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; // Hard Flip
+        nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; 
       } 
       else if (rawConf < EXIT_THRESHOLD) {
-        nextState = 'NEUTRAL'; // Stop Loss
+        nextState = 'NEUTRAL'; 
       } 
       else {
-        nextState = currentLock; // HOLD THE LINE
+        nextState = currentLock; 
       }
     }
 
-    // SAVE DECISION TO STORAGE (Persistence)
     const newLockState = { 
       type: nextState, 
       confidence: rawConf, 
-      timestamp: Date.now() // Update timestamp so it stays fresh
+      timestamp: Date.now() 
     };
     
     activeSignalRef.current = newLockState;
     localStorage.setItem('aura_ai_lock', JSON.stringify(newLockState));
     
-    // Update UI
     setAnalysis(newData);
     setDisplayState(newLockState);
   };
 
-  // --- 2. INTERNAL BRAIN: Fetch Analysis (For News) ---
+  // --- 2. INTERNAL BRAIN (Fetch) ---
   const fetchLocalAnalysis = async (newsEvent = null) => {
     setNewsLoading(true);
     try {
@@ -117,7 +110,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     }
   };
 
-  // --- 3. THE FILTER: Find "Sniper" News Only ---
+  // --- 3. NEWS FILTER ---
   const fetchDailyNews = async () => {
       try {
           const res = await axios.get(`${API_URL}/api/news`);
@@ -243,7 +236,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                     <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: '#FFF' }}>
                          {displayState.type === 'BUY' ? <TrendingUp size={18} /> : 
                           displayState.type === 'SELL' ? <TrendingUp size={18} style={{transform:'scaleY(-1)'}} /> : 
-                          <ShieldAlert size={18} />}
+                          <Shield size={18} />}
                     </div>
                 </div>
             </div>
@@ -259,16 +252,47 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                         Signal weak. Waiting for &gt;{ENTRY_THRESHOLD}% confidence to enter.
                       </span>
                     ) : (
-                      analysis?.reasoning ? (
-                          Array.isArray(analysis.reasoning) 
-                              ? analysis.reasoning.map((r, i) => <div key={i}>• {r}</div>) 
-                              : analysis.reasoning
-                          ) : (analysis?.reason || "Scanning market structure...")
+                      <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
+                         {analysis?.reasoning && Array.isArray(analysis.reasoning) 
+                             ? analysis.reasoning.map((r, i) => (
+                                 <div key={i} style={{display: 'flex', gap: '6px'}}>
+                                    <span style={{color: signalColor}}>•</span>
+                                    <span>{r.replace(/OB/g, 'Order Block')}</span>
+                                 </div>
+                               )) 
+                             : (analysis?.reason || "Scanning market structure...")
+                         }
+                      </div>
                     )}
                 </div>
             </div>
 
-            {/* 3. IMPACT ALERT */}
+            {/* 3. NEW: TRADE SETUP CARD (SMC LEVELS) */}
+            {isLocked && analysis?.tradeSetup && (
+                <div style={{ background: 'rgba(0,0,0,0.3)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+                         <span style={{fontSize: '10px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '4px'}}>
+                            <Crosshair size={12}/> ENTRY
+                         </span>
+                         <span style={{fontSize: '12px', fontWeight: 'bold', color: '#fff'}}>{analysis.tradeSetup.entry}</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: '8px' }}>
+                        <div style={{ flex: 1, background: 'rgba(239, 83, 80, 0.15)', padding: '6px', borderRadius: '4px', textAlign: 'center' }}>
+                            <div style={{ fontSize: '9px', color: '#ef5350', fontWeight: 'bold' }}>STOP LOSS</div>
+                            <div style={{ fontSize: '11px', color: '#ffcdd2' }}>{analysis.tradeSetup.stop_loss}</div>
+                        </div>
+                        <div style={{ flex: 1, background: 'rgba(0, 230, 118, 0.15)', padding: '6px', borderRadius: '4px', textAlign: 'center' }}>
+                            <div style={{ fontSize: '9px', color: '#00e676', fontWeight: 'bold' }}>TAKE PROFIT</div>
+                            <div style={{ fontSize: '11px', color: '#b9f6ca' }}>{analysis.tradeSetup.take_profit}</div>
+                        </div>
+                    </div>
+                    <div style={{textAlign: 'center', marginTop: '6px', fontSize: '9px', color: '#9ca3af'}}>
+                        RR: 1:{analysis.tradeSetup.risk_reward}
+                    </div>
+                </div>
+            )}
+
+            {/* 4. IMPACT ALERT */}
             {nextNews && (
                 <div style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '12px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)', animation: 'pulse 2s infinite' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -277,22 +301,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                     </div>
                     <div style={{ fontSize: '11px', color: '#ff8a80', marginTop: '4px' }}>Upcoming: <b>{nextNews.title || nextNews.event || "High Impact News"}</b></div>
                     <style>{`@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0.4); } 70% { box-shadow: 0 0 0 10px rgba(239, 83, 80, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 83, 80, 0); } }`}</style>
-                </div>
-            )}
-
-            {/* 4. CONTEXT / TREND */}
-            {isLocked && analysis?.trend && (
-                <div style={{ display: 'flex', gap: '8px', marginTop: 'auto' }}>
-                      <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
-                          <div style={{ fontSize: '9px', color: '#9ca3af' }}>MARKET BIAS</div>
-                          <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff' }}>{analysis.trend}</div>
-                      </div>
-                      {analysis.pattern && (
-                        <div style={{ flex: 1, background: 'rgba(255,255,255,0.05)', padding: '8px', borderRadius: '6px', textAlign: 'center' }}>
-                            <div style={{ fontSize: '9px', color: '#9ca3af' }}>PATTERN</div>
-                            <div style={{ fontSize: '12px', fontWeight: 'bold', color: '#fff' }}>{analysis.pattern}</div>
-                        </div>
-                      )}
                 </div>
             )}
 

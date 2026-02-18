@@ -1,9 +1,14 @@
+const axios = require('axios'); // 🔌 Bridge to Python
 const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
-const TI = require('technicalindicators'); // 🧠 The New Brain Cell
+
+// ⚙️ CONFIGURATION
+// If you are on Render, this URL might need to be your internal Render URL.
+// For local dev, it is usually port 8000.
+const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
 
 // ==========================================
-// 🕵️ NEWS ANALYZER (Keep this - it works!)
+// 🕵️ NEWS ANALYZER (UNCHANGED - PRESERVED)
 // ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
@@ -67,42 +72,6 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 };
 
 // ==========================================
-// 🧠 PATTERN RECOGNITION ENGINE
-// ==========================================
-const detectAdvancedPatterns = (opens, highs, lows, closes) => {
-    let signals = [];
-
-    // 1. FOREX STRUCTURES (M & W Patterns)
-    const doubleTop = TI.doubletop({ input: { highs, lows, close: closes, period: 20 } });
-    const doubleBottom = TI.doublebottom({ input: { highs, lows, close: closes, period: 20 } });
-    
-    if (doubleTop) signals.push({ name: 'Double Top (M-Pattern)', type: 'BEARISH', strength: 85 });
-    if (doubleBottom) signals.push({ name: 'Double Bottom (W-Pattern)', type: 'BULLISH', strength: 85 });
-
-    // 2. HEAD AND SHOULDERS
-    const hs = TI.headandshoulders({ input: { highs, lows, close: closes, period: 30 } });
-    const invHs = TI.inverseheadandshoulders({ input: { highs, lows, close: closes, period: 30 } });
-    
-    if (hs) signals.push({ name: 'Head & Shoulders', type: 'BEARISH', strength: 90 });
-    if (invHs) signals.push({ name: 'Inv. Head & Shoulders', type: 'BULLISH', strength: 90 });
-
-    // 3. CANDLESTICK PATTERNS (The "Micro" View)
-    // We analyze the last 5 candles for immediate signals
-    const last5Open = opens.slice(-5);
-    const last5High = highs.slice(-5);
-    const last5Low = lows.slice(-5);
-    const last5Close = closes.slice(-5);
-    const input = { open: last5Open, high: last5High, low: last5Low, close: last5Close };
-
-    if (TI.bullishengulfingpattern(input)) signals.push({ name: 'Bullish Engulfing', type: 'BULLISH', strength: 70 });
-    if (TI.bearishengulfingpattern(input)) signals.push({ name: 'Bearish Engulfing', type: 'BEARISH', strength: 70 });
-    if (TI.hammerpattern(input)) signals.push({ name: 'Hammer (Rejection)', type: 'BULLISH', strength: 65 });
-    if (TI.shootingstarpattern(input)) signals.push({ name: 'Shooting Star', type: 'BEARISH', strength: 65 });
-
-    return signals;
-};
-
-// ==========================================
 // 🚀 MAIN CONTROLLER
 // ==========================================
 exports.analyzePattern = async (req, res) => {
@@ -110,7 +79,7 @@ exports.analyzePattern = async (req, res) => {
         const { timeframe, eventName, currency } = req.body;
 
         // ------------------------------------
-        // PATH A: NEWS EVENT ANALYSIS
+        // PATH A: NEWS EVENT ANALYSIS (Legacy Logic)
         // ------------------------------------
         if (eventName) {
             const newsStrategy = await analyzeNewsImpact(eventName, currency || 'USD');
@@ -127,95 +96,57 @@ exports.analyzePattern = async (req, res) => {
         }
 
         // ------------------------------------
-        // PATH B: TECHNICAL ANALYSIS (Fallback)
+        // PATH B: SMC BRAIN (The New Python Bridge)
         // ------------------------------------
         
-        // 1. GET DATA (Need 100+ candles for indicators to work)
+        // 1. Fetch Fresh Data from MongoDB
+        // We need enough candles for the Python Fractal scan (min 100+)
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
-                                        .sort({ time: -1 })
-                                        .limit(150);
+                                       .sort({ time: -1 }) // Get newest first
+                                       .limit(300)         // Get plenty of history
+                                       .lean();            // Convert to plain JSON
 
-        if (rawCandles.length < 50) {
-            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: 'Not enough data.' });
+        if (rawCandles.length < 100) {
+            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: 'Not enough data for SMC analysis.' });
         }
 
-        // 2. PREPARE DATA (Reverse to Oldest -> Newest)
-        const candles = rawCandles.reverse();
-        const opens = candles.map(c => c.open);
-        const highs = candles.map(c => c.high);
-        const lows = candles.map(c => c.low);
-        const closes = candles.map(c => c.close);
+        // 2. Prepare Data for Python (Oldest -> Newest)
+        // Python expects a clean array of objects
+        const cleanCandles = rawCandles.reverse().map(c => ({
+            open: c.open,
+            high: c.high,
+            low: c.low,
+            close: c.close,
+            time: c.time, // Ensure this matches what brain.py expects
+            volume: c.volume || 0
+        }));
 
-        // 3. INDICATORS
-        // Trend (EMA)
-        const ema50 = TI.EMA.calculate({ period: 50, values: closes });
-        const ema200 = TI.EMA.calculate({ period: 200, values: closes });
+        const currentPrice = cleanCandles[cleanCandles.length - 1].close;
+
+        // 3. Call the Python Brain
+        console.log(`📡 Contacting SMC Brain for ${cleanCandles.length} candles...`);
         
-        const lastEma50 = ema50[ema50.length - 1];
-        const lastEma200 = ema200[ema200.length - 1];
-        let trend = lastEma50 > lastEma200 ? 'UPTREND' : 'DOWNTREND';
+        try {
+            const pythonResponse = await axios.post(PYTHON_API_URL, {
+                timeframe: timeframe || '1h',
+                currency: currency || 'XAUUSD',
+                current_price: currentPrice,
+                candles: cleanCandles // 👈 SENDING LIVE DATA
+            });
 
-        // Momentum (RSI)
-        const rsiArray = TI.RSI.calculate({ period: 14, values: closes });
-        const lastRsi = rsiArray[rsiArray.length - 1];
+            // 4. Return the Smart Response
+            return res.json(pythonResponse.data);
 
-        // 4. PATTERN RECOGNITION
-        const patterns = detectAdvancedPatterns(opens, highs, lows, closes);
-
-        // 5. CALCULATE SCORE
-        let confidence = 0;
-        let reasoning = [];
-        let finalSignal = 'NEUTRAL';
-
-        // A. Trend Score
-        if (trend === 'UPTREND') {
-            confidence += 30;
-            reasoning.push("📈 Market Structure: Uptrend (EMA 50 > 200)");
-        } else {
-            confidence += 30;
-            reasoning.push("📉 Market Structure: Downtrend (EMA 50 < 200)");
+        } catch (pyError) {
+            console.error("⚠️ Python Brain Unreachable:", pyError.message);
+            // Fallback if Python is offline
+            return res.json({
+                signal: 'NEUTRAL',
+                confidence: 0,
+                reason: 'SMC Engine is offline. Please check Python service.',
+                error: pyError.message
+            });
         }
-
-        // B. RSI Score
-        if (lastRsi > 70) {
-            confidence -= 10; 
-            reasoning.push("⚠️ RSI Overbought (>70). Risk of reversal.");
-        } else if (lastRsi < 30) {
-            confidence -= 10;
-            reasoning.push("⚠️ RSI Oversold (<30). Risk of reversal.");
-        } else {
-            reasoning.push(`ℹ️ RSI is Neutral (${lastRsi.toFixed(1)})`);
-        }
-
-        // C. Pattern Score
-        if (patterns.length > 0) {
-            const bestPattern = patterns[patterns.length - 1]; // Most recent pattern
-            reasoning.push(`✨ Pattern Detected: ${bestPattern.name}`);
-            
-            if (bestPattern.type === 'BULLISH') {
-                if (trend === 'UPTREND') confidence += bestPattern.strength; // Pattern matches Trend
-                else confidence += (bestPattern.strength / 2); // Counter-trend trade
-                finalSignal = 'BUY';
-            } else {
-                if (trend === 'DOWNTREND') confidence += bestPattern.strength;
-                else confidence += (bestPattern.strength / 2);
-                finalSignal = 'SELL';
-            }
-        } else {
-            reasoning.push("No clear chart patterns detected.");
-        }
-
-        // Cap Confidence
-        confidence = Math.min(98, Math.max(0, confidence));
-        if (confidence < 45) finalSignal = 'NEUTRAL';
-
-        res.json({
-            signal: finalSignal,
-            confidence: Math.round(confidence),
-            trend: trend,
-            reason: reasoning.join('\n'), // Send as multi-line text
-            pattern: patterns.length > 0 ? patterns[patterns.length - 1].name : 'None'
-        });
 
     } catch (error) {
         console.error('❌ Analysis Error:', error);

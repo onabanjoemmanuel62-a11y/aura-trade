@@ -5,6 +5,7 @@ import math
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List, Optional, Dict
 from sklearn.preprocessing import MinMaxScaler
 from scipy.stats import pearsonr
 from scipy.signal import argrelextrema
@@ -20,13 +21,13 @@ from ta.momentum import RSIIndicator
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 PATTERN_SIZE = 60       
-MAX_SCAN_LIMIT = 5000   # ⚡ Optimized for Speed
+MAX_SCAN_LIMIT = 5000   
 NODE_URL = "http://127.0.0.1:10000" 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
-# 🧠 GLOBAL MEMORY
+# 🧠 GLOBAL MEMORY (Fallback only)
 MARKET_MEMORY = {"df": None}
 
 # --- HELPER: SAFE NUMBER ---
@@ -39,21 +40,15 @@ def safe_float(value, default=0.0):
     except:
         return default
 
-# --- 1. DATA ENGINE ---
-def load_data_into_memory():
-    """Loads CSV once and stores it in RAM"""
+# --- 1. DATA ENGINE (MODIFIED FOR HYBRID LOADING) ---
+def load_csv_fallback():
+    """Loads CSV as a fallback if no live data is provided."""
     try:
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         file_path = os.path.join(base_dir, CSV_FILENAME)
 
-        logger.info(f"📂 Pre-loading database from: {file_path}")
-
         if not os.path.exists(file_path):
-            if os.path.exists(CSV_FILENAME):
-                file_path = CSV_FILENAME
-            else:
-                logger.error(f"❌ File not found: {CSV_FILENAME}")
-                return None
+            return None
 
         # READ CSV
         try:
@@ -62,7 +57,7 @@ def load_data_into_memory():
         except:
             df = pd.read_csv(file_path, sep=',')
         
-        # CLEANUP
+        # CLEANUP & STANDARDIZE
         df.columns = [c.lower().strip() for c in df.columns]
         rename_map = {
             'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 
@@ -70,44 +65,53 @@ def load_data_into_memory():
         }
         df.rename(columns=rename_map, inplace=True)
         
-        # CONVERT NUMBERS
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
-                if df[col].dtype == object:
-                    df[col] = df[col].astype(str).str.replace(',', '.')
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.dropna(subset=numeric_cols, inplace=True)
-
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
-            df.dropna(subset=['Date'], inplace=True)
-            df.set_index('Date', inplace=True)
-            df.sort_index(inplace=True)
-
-        logger.info(f"✅ SMC BRAIN LOADED: {len(df)} candles.")
-        return df
+        # Ensure we have enough data
+        return df if len(df) > 50 else None
 
     except Exception as e:
-        logger.error(f"❌ Cache Init Failed: {e}")
+        logger.error(f"❌ CSV Load Failed: {e}")
+        return None
+
+def process_live_candles(candles_data: List[Dict]):
+    """Converts Node.js JSON candles into a Pandas DataFrame."""
+    try:
+        df = pd.DataFrame(candles_data)
+        
+        # Standardize Columns
+        rename_map = {
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 
+            'time': 'Date', 'timestamp': 'Date'
+        }
+        df.rename(columns=rename_map, inplace=True)
+        
+        # Ensure numeric types
+        cols = ['Open', 'High', 'Low', 'Close']
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+            
+        return df
+    except Exception as e:
+        logger.error(f"❌ Live Data Conversion Failed: {e}")
         return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    MARKET_MEMORY["df"] = load_data_into_memory()
+    # Load CSV once on startup just in case
+    MARKET_MEMORY["df"] = load_csv_fallback()
+    logger.info(f"✅ BRAIN STARTED. CSV Memory: {len(MARKET_MEMORY['df']) if MARKET_MEMORY['df'] is not None else 0} candles.")
     yield
     MARKET_MEMORY["df"] = None
 
 app = FastAPI(lifespan=lifespan)
 
-# 🔒 SECURITY UPDATE: Whitelist your Vercel App
-origins = [
-    "http://localhost:3000",
-    "https://aura-trade-weld.vercel.app",  
-    "https://aura-trade-v1.onrender.com"   
-]
-
+# 🔒 SECURITY
+origins = ["*"] # Open internally, locked by firewall in prod
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins, 
@@ -116,72 +120,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 📨 UPDATED REQUEST MODEL
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
-    currency: str = "USD"
-    current_price: float = 0.0 # Allow frontend to inject live price
+    currency: str = "XAUUSD"
+    current_price: float = 0.0
+    candles: Optional[List[Dict]] = None  # 👈 NEW: Accepts live candle array
 
-# --- 2. SMC ENGINE (ORDER BLOCKS + MITIGATION) ---
-def detect_smc_structures(df, current_price):
-    """
-    Identifies Order Blocks and filters out those that have been 'tested' (mitigated).
-    """
+# --- 2. SMC ENGINE (UNCHANGED LOGIC) ---
+def detect_smc_structures(df):
     zones = []
     try:
-        # Need arrays for fast lookups
         opens = df['Open'].values
         closes = df['Close'].values
         highs = df['High'].values
         lows = df['Low'].values
         
-        # Detect Swing Points (Fractals)
         swing_period = 5
         swing_highs = argrelextrema(highs, np.greater, order=swing_period)[0]
         swing_lows = argrelextrema(lows, np.less, order=swing_period)[0]
 
-        # --- A. BEARISH ORDER BLOCKS (Supply) ---
-        for idx in swing_highs[-15:]: # Scan last 15 swing highs
-            # 1. Identify the OB Candle (The last UP candle before the drop)
+        # A. BEARISH OB (Supply)
+        for idx in swing_highs[-20:]: 
             ob_idx = idx
-            
-            # 2. Check for Break of Structure (BOS)
-            # Did price drop significantly below this OB's low subsequently?
             subsequent_price = lows[ob_idx+1:]
             if len(subsequent_price) == 0: continue
             
-            lowest_after = np.min(subsequent_price)
-            if lowest_after < lows[ob_idx]: # Valid Structure Break
-                
-                # 3. MITIGATION CHECK (Crucial: Is it still valid?)
+            if np.min(subsequent_price) < lows[ob_idx]: # BOS
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
                 
-                # Look at candles AFTER the break happened
-                # If any High > OB_Bottom, it's tested.
+                # Mitigation Check
                 is_tested = False
                 for future_idx in range(ob_idx + 5, len(highs)):
                     if highs[future_idx] >= ob_bottom:
                         is_tested = True
                         break
                 
-                # Only add if UNTESTED (Fresh)
                 if not is_tested:
-                    zones.append({
-                        "type": "OB_BEAR", 
-                        "top": float(ob_top), 
-                        "bottom": float(ob_bottom),
-                        "price": float(ob_bottom) # For sorting
-                    })
+                    zones.append({"type": "OB_BEAR", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_bottom)})
 
-        # --- B. BULLISH ORDER BLOCKS (Demand) ---
-        for idx in swing_lows[-15:]:
+        # B. BULLISH OB (Demand)
+        for idx in swing_lows[-20:]:
             ob_idx = idx
             subsequent_price = highs[ob_idx+1:]
             if len(subsequent_price) == 0: continue
             
-            highest_after = np.max(subsequent_price)
-            if highest_after > highs[ob_idx]: # Valid BOS
-                
+            if np.max(subsequent_price) > highs[ob_idx]: # BOS
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
                 
@@ -192,37 +177,29 @@ def detect_smc_structures(df, current_price):
                         break
                 
                 if not is_tested:
-                    zones.append({
-                        "type": "OB_BULL", 
-                        "top": float(ob_top), 
-                        "bottom": float(ob_bottom),
-                        "price": float(ob_top)
-                    })
+                    zones.append({"type": "OB_BULL", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_top)})
 
         return zones
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
         return []
 
-# --- 3. FRACTAL PATTERN RECOGNITION (NORMALIZED) ---
+# --- 3. FRACTAL PATTERN RECOGNITION ---
 def find_fractals(df, live_price):
     try:
         recent_data = df.iloc[-(MAX_SCAN_LIMIT + PATTERN_SIZE):]
         prices = recent_data['Close'].values
-        # Use live price from frontend if available, else last CSV price
         current_price = live_price if live_price > 0 else prices[-1]
         
         if len(prices) < PATTERN_SIZE + 24: return []
         current_pattern = prices[-PATTERN_SIZE:]
         
-        # Normalize
         scaler = MinMaxScaler()
         current_norm = scaler.fit_transform(current_pattern.reshape(-1, 1)).flatten()
         
         matches = []
         history_limit = len(prices) - PATTERN_SIZE - 24 
         
-        # Speed Optimization: Step 5 instead of 2
         for i in range(0, history_limit, 5):
             try:
                 candidate = prices[i : i + PATTERN_SIZE]
@@ -232,7 +209,6 @@ def find_fractals(df, live_price):
                 corr, _ = pearsonr(current_norm, candidate_norm)
                 
                 if corr > 0.85: 
-                    # 🚀 NORMALIZATION: Use % Change
                     hist_entry_price = prices[i + PATTERN_SIZE - 1]
                     future_slice = prices[i + PATTERN_SIZE : i + PATTERN_SIZE + 24]
                     
@@ -252,29 +228,24 @@ def find_fractals(df, live_price):
                         "start_date": str(recent_data.index[i]), 
                         "plot_data": normalized_ghost 
                     })
-            except:
-                continue
+            except: continue
                 
         return matches
     except Exception as e:
         logger.error(f"Fractal Scan Error: {e}")
         return []
 
-# --- 4. TRADE SETUP CALCULATOR ---
-def calculate_trade_levels(current_price, signal, support, resistance, atr_value=None):
+# --- 4. TRADE CALCULATOR ---
+def calculate_trade_levels(current_price, signal, support, resistance, atr_value):
     try:
-        if atr_value is None or atr_value == 0:
-            atr_value = current_price * 0.01 
-        
         entry = current_price
+        atr_buffer = atr_value * 1.5 if atr_value else entry * 0.002
         
         if signal == "BUY":
-            # SL below Bullish OB
-            stop_loss = support if (support > 0 and support < entry) else entry - (atr_value * 1.5)
-            # TP at Bearish OB
+            stop_loss = support if (support > 0 and support < entry) else entry - atr_buffer
             take_profit = resistance if (resistance > entry) else entry + (abs(entry - stop_loss) * 2)
         elif signal == "SELL":
-            stop_loss = resistance if (resistance > 0 and resistance > entry) else entry + (atr_value * 1.5)
+            stop_loss = resistance if (resistance > 0 and resistance > entry) else entry + atr_buffer
             take_profit = support if (support < entry and support > 0) else entry - (abs(entry - stop_loss) * 2)
         else:
             return None
@@ -288,15 +259,22 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
     except:
         return None
 
-# --- 5. API ENDPOINT ---
+# --- 5. MAIN ENDPOINT (THE BRAIN) ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    df = MARKET_MEMORY["df"]
+    # 1. DECIDE DATA SOURCE: Live vs CSV
+    if req.candles and len(req.candles) > 50:
+        df = process_live_candles(req.candles)
+        data_source = "LIVE_NODE_DATA"
+    else:
+        df = MARKET_MEMORY["df"]
+        data_source = "CSV_FALLBACK"
+
     if df is None or df.empty:
-        return {"signal": "HOLD", "confidence": 0, "reasoning": ["System Warmup..."]}
+        return {"signal": "HOLD", "confidence": 0, "reasoning": ["Waiting for data..."]}
 
     try:
-        # Use live price from frontend if provided, otherwise CSV
+        # 2. PREPARE METRICS
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
@@ -305,28 +283,25 @@ async def analyze(req: AnalysisRequest):
         atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
         trend = "UPTREND" if current_price > ema_200 else "DOWNTREND"
         
-        # EXECUTE SMC & FRACTALS
-        smc_zones = detect_smc_structures(df, current_price) # ✅ NOW FILTERED
-        matches = find_fractals(df, current_price)           # ✅ NOW NORMALIZED
+        # 3. RUN ALGORITHMS
+        smc_zones = detect_smc_structures(df) 
+        matches = find_fractals(df, current_price)
         
-        # FILTER SMC ZONES FOR NEAREST LEVELS (Reduce Clutter)
+        # 4. FILTER ZONES
         bullish_zones = [z for z in smc_zones if z['type'] == 'OB_BULL' and z['top'] < current_price]
         bearish_zones = [z for z in smc_zones if z['type'] == 'OB_BEAR' and z['bottom'] > current_price]
         
-        # Find closest support (Highest Bullish OB below price)
         nearest_supp = max(bullish_zones, key=lambda z: z['top']) if bullish_zones else None
-        # Find closest resistance (Lowest Bearish OB above price)
         nearest_res = min(bearish_zones, key=lambda z: z['bottom']) if bearish_zones else None
         
-        sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.98
-        res_level = nearest_res['bottom'] if nearest_res else current_price * 1.02
+        sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.985
+        res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
 
-        # Send strictly the nearest zones to frontend for "Box" drawing
         visual_zones = []
         if nearest_supp: visual_zones.append(nearest_supp)
         if nearest_res: visual_zones.append(nearest_res)
 
-        # SIGNAL LOGIC
+        # 5. GENERATE SIGNAL
         total_matches = len(matches)
         signal = "NEUTRAL"
         confidence = 0
@@ -344,10 +319,19 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 confidence = (bear_votes / total_matches) * 100
             
+            # Confluence Factors
             if (signal == "BUY" and trend == "UPTREND") or (signal == "SELL" and trend == "DOWNTREND"):
-                confidence += 10
+                confidence += 15
+            
+            # RSI Filter
             if (signal == "BUY" and rsi > 70) or (signal == "SELL" and rsi < 30):
-                confidence -= 20
+                confidence -= 25 # High risk
+                
+            # OB Confirmation (The "SMC" Stamp)
+            if signal == "BUY" and nearest_supp and abs(current_price - nearest_supp['top']) < atr:
+                confidence += 20 # Bouncing off Order Block
+            if signal == "SELL" and nearest_res and abs(current_price - nearest_res['bottom']) < atr:
+                confidence += 20 # Rejecting Order Block
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
@@ -355,23 +339,26 @@ async def analyze(req: AnalysisRequest):
             "signal": signal,
             "confidence": int(max(0, min(99, confidence))),
             "trend": trend,
-            "pattern": f"SMC Scan ({len(smc_zones)} Valid Zones)",
+            "pattern": f"SMC + Fractal ({data_source})",
             "reasoning": [
-                f"Structure: {trend}",
-                f"OB Support: {round(sup_level, 2)}",
-                f"OB Resistance: {round(res_level, 2)}"
+                f"Market Structure: {trend}",
+                f"Order Block Sup: {round(sup_level, 2)}",
+                f"Order Block Res: {round(res_level, 2)}",
+                f"RSI: {round(rsi, 1)}"
             ],
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
-                "smc_zones": visual_zones, # ✅ SENDING ZONES (Top/Bottom)
+                "smc_zones": visual_zones, 
                 "fractal": best_match
             },
             "tradeSetup": trade_setup
         }
+
     except Exception as e:
         logger.error(f"Analysis Crash: {e}", exc_info=True)
-        return {"signal": "ERROR", "confidence": 0}
+        return {"signal": "ERROR", "confidence": 0, "reasoning": [str(e)]}
 
+# Proxy remains the same
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     try:
@@ -387,7 +374,3 @@ async def proxy_to_node(path: str, request: Request):
             return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
     except:
         raise HTTPException(status_code=503)
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "candles": len(MARKET_MEMORY["df"]) if MARKET_MEMORY["df"] is not None else 0}
