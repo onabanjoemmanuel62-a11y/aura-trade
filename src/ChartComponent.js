@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN (UPGRADED FOR TRADINGVIEW LOOK)
+// 🎨 CUSTOM BOX PLUGIN
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -19,19 +19,16 @@ class BoxRenderer {
             const verticalPixelRatio = scope.verticalPixelRatio;
 
             this._data.forEach((zone) => {
-                // If the start time is off-screen, anchor it to the far left (0)
                 const x1 = zone.x !== null ? zone.x * horizontalPixelRatio : 0;
-                const x2 = scope.mediaSize.width * horizontalPixelRatio; // Draw to far right
+                const x2 = scope.mediaSize.width * horizontalPixelRatio; 
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 const width = x2 - x1;
                 const height = Math.abs(yBottom - yTop); 
 
-                // Fill the Box (Transparent)
                 ctx.fillStyle = zone.color;
                 ctx.fillRect(x1, Math.min(yTop, yBottom), width, height);
 
-                // Draw the Border (Solid) - Just like the client's mockup
                 if (zone.borderColor) {
                     ctx.strokeStyle = zone.borderColor;
                     ctx.lineWidth = 1.5 * horizontalPixelRatio;
@@ -54,15 +51,13 @@ class BoxPrimitive {
     }
     setData(zones, series, timeScale) {
         this._rendererData = zones.map(zone => {
-            // Get X coordinate, fallback to null if off-screen
             const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : null;
-            
             const priceTopCoord = series.priceToCoordinate(zone.top);
             const priceBottomCoord = series.priceToCoordinate(zone.bottom);
             if (priceTopCoord === null || priceBottomCoord === null) return null;
             
             return {
-                x: timeCoord, // Renderer handles null by defaulting to left edge
+                x: timeCoord, 
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
                 yBottom: Math.max(priceTopCoord, priceBottomCoord),
                 color: zone.color,
@@ -83,11 +78,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const candleSeriesRef = useRef(null); 
   const fractalSeriesRef = useRef(null); 
   const boxPrimitiveRef = useRef(new BoxPrimitive());
-  
-  // ✅ FIX: Track active lines to prevent stacking
   const activeLinesRef = useRef([]);
 
-  // Refs
   const isChartReady = useRef(false);
   const currentBarRef = useRef(null);
   const timeframeRef = useRef('1h'); 
@@ -108,6 +100,24 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     let resolution = tf === '4h' ? 14400 : 3600;
     return Math.floor(seconds / resolution) * resolution;
   }, []);
+
+  // ✅ THE GAP KILLER: Strict Data Processor
+  const processCandles = useCallback((rawData, tf) => {
+      if (!Array.isArray(rawData)) return [];
+      return rawData
+          .filter(d => d.open != null && d.close != null) // Drop missing DB fields
+          .map(d => ({
+              time: getCandleStartTime(d.time, tf),
+              open: parseFloat(d.open),
+              high: parseFloat(d.high),
+              low: parseFloat(d.low),
+              close: parseFloat(d.close)
+          }))
+          // ⚠️ THIS IS THE MAGIC LINE: Drops NaNs and 0s which cause the blank gaps
+          .filter(d => !isNaN(d.open) && !isNaN(d.close) && d.open > 0) 
+          .sort((a, b) => a.time - b.time)
+          .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i); // Distinct
+  }, [getCandleStartTime]);
 
   // --- 1. INITIALIZE CHART ---
   useEffect(() => {
@@ -166,15 +176,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
               params: { limit: 500, before: oldestTime, timestamp: Date.now() }
           });
-          const rawData = Array.isArray(res.data) ? res.data : [];
-          if (rawData.length === 0) return;
+          
+          const newValidData = processCandles(res.data, timeframeRef.current);
+          if (newValidData.length === 0) return;
 
-          const newOldData = rawData.map(item => ({
-            time: getCandleStartTime(item.time, timeframeRef.current), 
-            open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
-          })).sort((a, b) => a.time - b.time);
-
-          const combinedData = [...newOldData, ...allDataRef.current]
+          const combinedData = [...newValidData, ...allDataRef.current]
               .filter((v, i, a) => a.findIndex(t => (t.time === v.time)) === i);
 
           allDataRef.current = combinedData;
@@ -193,21 +199,20 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 1000, timestamp: Date.now() }
         });
-        const data = (res.data || []).map(item => ({
-            time: getCandleStartTime(item.time, timeframe), 
-            open: parseFloat(item.open), high: parseFloat(item.high), low: parseFloat(item.low), close: parseFloat(item.close)
-        })).sort((a, b) => a.time - b.time).filter((v,i,a)=>a.findIndex(t=>(t.time===v.time))===i);
+        
+        // 🧼 Send data through the Gap Killer
+        const validData = processCandles(res.data, timeframe);
 
         if (isChartReady.current && candleSeriesRef.current) {
-            allDataRef.current = data;
-            candleSeriesRef.current.setData(data);
-            if (data.length > 0) currentBarRef.current = data[data.length - 1];
+            allDataRef.current = validData;
+            candleSeriesRef.current.setData(validData);
+            if (validData.length > 0) currentBarRef.current = validData[validData.length - 1];
         }
       } catch (err) { console.error("Init Load Error", err); } 
       finally { setIsLoading(false); }
     };
     loadInitialHistory();
-  }, [timeframe, getCandleStartTime]);
+  }, [timeframe, getCandleStartTime, processCandles]);
 
   useEffect(() => {
     let animationFrameId;
@@ -220,10 +225,8 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         latestCandleRef.current = null;
       }
 
-      // ✅ FIX: Draw Order Blocks near the current price
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
           const rawZones = visuals.smc_zones.map(z => {
-              // Anchor the box 10 candles back so it spans across the current price
               let safeTime = z.start_time || z.time;
               if (!safeTime && allDataRef.current.length > 10) {
                   safeTime = allDataRef.current[allDataRef.current.length - 10].time;
@@ -273,24 +276,21 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
-  // ✅ FIX: The "Stacked EMA" Fix
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     
-    // 1. Remove all old lines first to prevent stacking
     activeLinesRef.current.forEach(line => {
         try { candleSeriesRef.current.removePriceLine(line); } catch (e) {}
     });
-    activeLinesRef.current = []; // Clear the array
+    activeLinesRef.current = []; 
 
-    // 2. Helper to create and track new lines
     const addLine = (price, color, title, isDashed = false, width = 2) => {
         if (price && !isNaN(parseFloat(price))) {
             const line = candleSeriesRef.current.createPriceLine({
                 price: parseFloat(price), color, lineWidth: width,
                 lineStyle: isDashed ? 2 : 0, axisLabelVisible: true, title
             });
-            activeLinesRef.current.push(line); // Track it
+            activeLinesRef.current.push(line); 
         }
     };
 
@@ -301,7 +301,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     }
     if (levels && levels.ema) addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
 
-  }, [levels, tradeSetup]); // Runs ONLY when AI data updates
+  }, [levels, tradeSetup]); 
 
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
@@ -310,7 +310,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     socket.on('price-update', (data) => {
         if (!isChartReady.current || !currentBarRef.current) return; 
         const price = parseFloat(data.close || data.c);
-        if (isNaN(price)) return;
+        
+        // Prevent live blank gaps
+        if (isNaN(price) || price <= 0) return; 
         
         const time = getCandleStartTime(data.time || Date.now(), timeframeRef.current);
         const lastCandle = allDataRef.current[allDataRef.current.length - 1];
