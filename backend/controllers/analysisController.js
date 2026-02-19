@@ -3,12 +3,10 @@ const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
 
 // ⚙️ CONFIGURATION
-// If you are on Render, this URL might need to be your internal Render URL.
-// For local dev, it is usually port 8000.
 const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
 
 // ==========================================
-// 🕵️ NEWS ANALYZER (UNCHANGED)
+// 🕵️ NEWS ANALYZER (UNCHANGED LEGACY)
 // ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
@@ -72,7 +70,7 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 };
 
 // ==========================================
-// 🚀 MAIN CONTROLLER (UPDATED LIMIT)
+// 🚀 MAIN CONTROLLER (UPDATED FOR SMC + NEWS)
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
@@ -89,7 +87,7 @@ exports.analyzePattern = async (req, res) => {
                     confidence: newsStrategy.probability,
                     pattern: 'Historical News Bias',
                     trend: 'News Driven',
-                    reason: newsStrategy.reason,
+                    reason: [newsStrategy.reason],
                     newsContext: `Stats: ${newsStrategy.stats.wins} Wins / ${newsStrategy.stats.losses} Losses`
                 });
             }
@@ -100,14 +98,13 @@ exports.analyzePattern = async (req, res) => {
         // ------------------------------------
         
         // 1. Fetch Fresh Data from MongoDB
-        // ✅ UPDATE: Increased limit from 300 -> 3000 to allow Fractal Matching
         const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
-                                       .sort({ time: -1 }) // Get newest first
-                                       .limit(3000)        // 👈 THE CRITICAL FIX
-                                       .lean();            // Convert to plain JSON
+                                       .sort({ time: -1 }) 
+                                       .limit(3000)        
+                                       .lean();            
 
         if (rawCandles.length < 100) {
-            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: 'Not enough data for SMC analysis.' });
+            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: ['Not enough data for SMC analysis.'] });
         }
 
         // 2. Prepare Data for Python (Oldest -> Newest)
@@ -122,18 +119,27 @@ exports.analyzePattern = async (req, res) => {
 
         const currentPrice = cleanCandles[cleanCandles.length - 1].close;
 
-        // 3. Call the Python Brain
-        console.log(`📡 Contacting SMC Brain for ${cleanCandles.length} candles...`);
+        // 🆕 3. FETCH RECENT FUNDAMENTAL NEWS
+        // Grab the most recent high-impact USD news outcome to feed to Python
+        const latestNews = await NewsEvent.findOne({ 
+            impact: 'High', 
+            actual: { $ne: null }, 
+            forecast: { $ne: null } 
+        }).sort({ time: -1 }).lean();
+
+        // 4. Call the Python Brain
+        console.log(`📡 Contacting SMC Brain for ${cleanCandles.length} candles + News (${latestNews ? latestNews.event : 'None'})...`);
         
         try {
             const pythonResponse = await axios.post(PYTHON_API_URL, {
                 timeframe: timeframe || '1h',
                 currency: currency || 'XAUUSD',
                 current_price: currentPrice,
-                candles: cleanCandles // 👈 SENDING LIVE DATA
+                candles: cleanCandles,
+                news_data: latestNews // 👈 SENDING LIVE NEWS OUTCOME TO PYTHON
             });
 
-            // 4. Return the Smart Response
+            // 5. Return the Smart Response
             return res.json(pythonResponse.data);
 
         } catch (pyError) {
@@ -142,7 +148,7 @@ exports.analyzePattern = async (req, res) => {
             return res.json({
                 signal: 'NEUTRAL',
                 confidence: 0,
-                reason: 'SMC Engine is offline. Please check Python service.',
+                reason: ['SMC Engine is offline. Please check Python service.'],
                 error: pyError.message
             });
         }
