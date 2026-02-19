@@ -125,12 +125,18 @@ class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
     current_price: float = 0.0
-    candles: Optional[List[Dict]] = None  # 👈 NEW: Accepts live candle array
+    candles: Optional[List[Dict]] = None  # 👈 Accepts live candle array
 
-# --- 2. SMC ENGINE (UNCHANGED LOGIC) ---
+# --- 2. SMC ENGINE (UPDATED WITH TIMESTAMPS) ---
 def detect_smc_structures(df):
     zones = []
     try:
+        # ✅ THE FIX: Safely grab timestamps to send to React
+        if 'Date' in df.columns:
+            dates = df['Date'].values
+        else:
+            dates = df.index.values
+
         opens = df['Open'].values
         closes = df['Close'].values
         highs = df['High'].values
@@ -149,6 +155,7 @@ def detect_smc_structures(df):
             if np.min(subsequent_price) < lows[ob_idx]: # BOS
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
+                ob_time = dates[ob_idx] # 👈 Capture Exact Time
                 
                 # Mitigation Check
                 is_tested = False
@@ -158,7 +165,13 @@ def detect_smc_structures(df):
                         break
                 
                 if not is_tested:
-                    zones.append({"type": "OB_BEAR", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_bottom)})
+                    zones.append({
+                        "type": "OB_BEAR", 
+                        "top": float(ob_top), 
+                        "bottom": float(ob_bottom), 
+                        "price": float(ob_bottom),
+                        "time": int(ob_time) # 👈 Send to React
+                    })
 
         # B. BULLISH OB (Demand)
         for idx in swing_lows[-20:]:
@@ -169,6 +182,7 @@ def detect_smc_structures(df):
             if np.max(subsequent_price) > highs[ob_idx]: # BOS
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
+                ob_time = dates[ob_idx] # 👈 Capture Exact Time
                 
                 is_tested = False
                 for future_idx in range(ob_idx + 5, len(lows)):
@@ -177,7 +191,13 @@ def detect_smc_structures(df):
                         break
                 
                 if not is_tested:
-                    zones.append({"type": "OB_BULL", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_top)})
+                    zones.append({
+                        "type": "OB_BULL", 
+                        "top": float(ob_top), 
+                        "bottom": float(ob_bottom), 
+                        "price": float(ob_top),
+                        "time": int(ob_time) # 👈 Send to React
+                    })
 
         return zones
     except Exception as e:
