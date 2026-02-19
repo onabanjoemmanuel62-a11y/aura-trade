@@ -7,19 +7,22 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN
+// 🎨 CUSTOM BOX PLUGIN (UPGRADED FOR MULTIPLE ZONES)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
     draw(target) {
         target.useBitmapCoordinateSpace((scope) => {
-            if (this._data.length === 0) return;
+            if (!this._data || this._data.length === 0) return;
             const ctx = scope.context;
             const horizontalPixelRatio = scope.horizontalPixelRatio;
             const verticalPixelRatio = scope.verticalPixelRatio;
 
             this._data.forEach((zone) => {
-                const x1 = zone.x !== null ? zone.x * horizontalPixelRatio : 0;
+                // Ensure valid coordinates
+                if (zone.x === null || isNaN(zone.x)) return;
+
+                const x1 = zone.x * horizontalPixelRatio;
                 const x2 = scope.mediaSize.width * horizontalPixelRatio; 
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
@@ -50,11 +53,26 @@ class BoxPrimitive {
         this._paneViews = [new BoxPaneView(this)];
     }
     setData(zones, series, timeScale) {
+        if (!zones || !Array.isArray(zones)) {
+            this._rendererData = [];
+            return;
+        }
+
         this._rendererData = zones.map(zone => {
-            const timeCoord = zone.time ? timeScale.timeToCoordinate(zone.time) : null;
+            if (!zone.time || !zone.top || !zone.bottom) return null;
+            
+            // Allow for historical times to map correctly
+            let timeCoord = null;
+            try {
+                 timeCoord = timeScale.timeToCoordinate(zone.time);
+            } catch(e) {
+                 return null;
+            }
+
             const priceTopCoord = series.priceToCoordinate(zone.top);
             const priceBottomCoord = series.priceToCoordinate(zone.bottom);
-            if (priceTopCoord === null || priceBottomCoord === null) return null;
+            
+            if (priceTopCoord === null || priceBottomCoord === null || timeCoord === null) return null;
             
             return {
                 x: timeCoord, 
@@ -65,7 +83,12 @@ class BoxPrimitive {
             };
         }).filter(z => z !== null);
     }
-    updateAllViews() {}
+    updateAllViews() {
+         // Lightweight charts required update trigger
+         if(this._paneViews[0] && this._paneViews[0].update) {
+             this._paneViews[0].update();
+         }
+    }
     paneViews() { return this._paneViews; }
 }
 
@@ -76,8 +99,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
-  const fractalSeriesRef = useRef(null); 
-  const boxPrimitiveRef = useRef(new BoxPrimitive());
+  const boxPrimitiveRef = useRef(null); // Ref for plugin
   const activeLinesRef = useRef([]);
 
   const isChartReady = useRef(false);
@@ -88,8 +110,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const latestCandleRef = useRef(null); 
 
   const [timeframe, setTimeframe] = useState('1h');
-  const [prediction, setPrediction] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
   const [newsData, setNewsData] = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
@@ -105,7 +125,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const processCandles = useCallback((rawData, tf) => {
       if (!Array.isArray(rawData)) return [];
       return rawData
-          .filter(d => d.open != null && d.close != null) // Drop missing DB fields
+          .filter(d => d.open != null && d.close != null) 
           .map(d => ({
               time: getCandleStartTime(d.time, tf),
               open: parseFloat(d.open),
@@ -113,10 +133,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
               low: parseFloat(d.low),
               close: parseFloat(d.close)
           }))
-          // ⚠️ THIS IS THE MAGIC LINE: Drops NaNs and 0s which cause the blank gaps
           .filter(d => !isNaN(d.open) && !isNaN(d.close) && d.open > 0) 
           .sort((a, b) => a.time - b.time)
-          .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i); // Distinct
+          .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i); 
   }, [getCandleStartTime]);
 
   // --- 1. INITIALIZE CHART ---
@@ -136,15 +155,13 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
     
-    const ghostSeries = chart.addSeries(LineSeries, {
-        color: '#a855f7', lineWidth: 2, lineStyle: 2, title: 'AI PROJECTION'
-    });
-
-    newSeries.attachPrimitive(boxPrimitiveRef.current);
+    // Attach the Box Plugin
+    const primitive = new BoxPrimitive();
+    newSeries.attachPrimitive(primitive);
+    boxPrimitiveRef.current = primitive;
 
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
-    fractalSeriesRef.current = ghostSeries; 
     isChartReady.current = true;
 
     const handleResize = () => {
@@ -194,13 +211,11 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     if (!isChartReady.current) return;
 
     const loadInitialHistory = async () => {
-      setIsLoading(true);
       try {
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
             params: { limit: 1000, timestamp: Date.now() }
         });
         
-        // 🧼 Send data through the Gap Killer
         const validData = processCandles(res.data, timeframe);
 
         if (isChartReady.current && candleSeriesRef.current) {
@@ -209,44 +224,50 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             if (validData.length > 0) currentBarRef.current = validData[validData.length - 1];
         }
       } catch (err) { console.error("Init Load Error", err); } 
-      finally { setIsLoading(false); }
     };
     loadInitialHistory();
   }, [timeframe, getCandleStartTime, processCandles]);
 
+  // --- 🎨 RENDER VISUALS (ORDER BLOCKS) ---
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
       if (!isChartReady.current) return; 
 
+      // 1. Update Live Candle
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 
-      if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current) {
+      // 2. Render ALL Order Blocks
+      if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current && boxPrimitiveRef.current) {
           const rawZones = visuals.smc_zones.map(z => {
-              let safeTime = z.start_time || z.time;
+              // Ensure we have a valid time, fallback to recent if missing
+              let safeTime = z.time;
               if (!safeTime && allDataRef.current.length > 10) {
                   safeTime = allDataRef.current[allDataRef.current.length - 10].time;
               }
 
               return {
-                  time: safeTime || (Date.now() / 1000), 
+                  time: safeTime, 
                   top: z.top, bottom: z.bottom,
                   color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)',
                   borderColor: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.8)' : 'rgba(38, 166, 154, 0.8)'
               };
           });
+          
           boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
       }
+
       animationFrameId = requestAnimationFrame(renderLoop);
     };
     renderLoop();
     return () => cancelAnimationFrame(animationFrameId);
   }, [visuals]);
 
+  // --- 📰 RENDER NEWS MARKERS ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
@@ -276,6 +297,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
+  // --- 🎯 RENDER LEVELS (EMA, TP, SL) ---
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     
@@ -303,6 +325,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
   }, [levels, tradeSetup]); 
 
+  // --- ⚡ WEBSOCKET CONNECTION ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socket.on('connect', () => setConnectionStatus('Connected'));
@@ -311,7 +334,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         if (!isChartReady.current || !currentBarRef.current) return; 
         const price = parseFloat(data.close || data.c);
         
-        // Prevent live blank gaps
         if (isNaN(price) || price <= 0) return; 
         
         const time = getCandleStartTime(data.time || Date.now(), timeframeRef.current);
@@ -327,11 +349,10 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
         latestCandleRef.current = updatedCandle;
     });
-    socket.on('prediction-update', (data) => setPrediction(data));
     return () => socket.disconnect();
   }, [timeframe, getCandleStartTime]);
 
-  const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; if(fractalSeriesRef.current) fractalSeriesRef.current.setData([]); };
+  const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };
   const handleZoomIn = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 1.2 }); };
   const handleZoomOut = () => { if(chartRef.current) chartRef.current.timeScale().applyOptions({ barSpacing: chartRef.current.timeScale().options().barSpacing * 0.8 }); };
@@ -340,17 +361,12 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
   return (
     <div style={{ position: 'relative', width: '100%', backgroundColor: '#161A25', borderRadius: '8px', overflow: 'hidden' }} onMouseEnter={() => setIsHoveringControls(true)} onMouseLeave={() => setIsHoveringControls(false)}>
-      {isLoading && <div style={{ position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.5)', zIndex: 50, display: 'flex', justifyContent: 'center', alignItems: 'center' }}><div style={{ width: '40px', height: '40px', border: '4px solid #333', borderTop: '4px solid #089981', borderRadius: '50%', animation: 'spin 1s linear infinite' }} /></div>}
       
       <div style={{ position: 'absolute', top: '15px', left: '15px', right: '15px', zIndex: 20, display: 'flex', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(42, 46, 57, 0.8)', padding: '4px 10px', borderRadius: '4px', borderLeft: `3px solid ${getStatusColor()}` }}>
                 <span style={{ fontSize: '11px', fontWeight: '600', color: '#FFF' }}>{connectionStatus}</span>
             </div>
-            {prediction && <div style={{ background: 'rgba(30, 41, 59, 0.95)', padding: '10px 14px', borderRadius: '6px', border: '1px solid #334155' }}>
-                <div style={{ fontSize: '10px', color: '#94A3B8' }}>AI Signal</div>
-                <div style={{ fontSize: '18px', fontWeight: 'bold', color: parseFloat(prediction.probUp) > 55 ? '#089981' : '#F23645' }}>{parseFloat(prediction.probUp) > 55 ? 'BUY' : 'SELL'} <span style={{fontSize: '14px', color: '#FFF'}}>{Math.max(parseFloat(prediction.probUp||0), parseFloat(prediction.probDown||0)).toFixed(0)}%</span></div>
-            </div>}
         </div>
         <div style={{ display: 'flex', gap: '2px', background: '#2A2E39', padding: '2px', borderRadius: '4px' }}>
             {['1h', '4h'].map(tf => <button key={tf} onClick={() => handleTimeframeChange(tf)} style={{ padding: '6px 14px', background: timeframe === tf ? '#4B4B69' : 'transparent', color: timeframe === tf ? '#FFF' : '#787B86', border: 'none', cursor: 'pointer' }}>{tf.toUpperCase()}</button>)}

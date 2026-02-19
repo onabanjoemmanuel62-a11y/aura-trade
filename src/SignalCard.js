@@ -241,29 +241,23 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
             </div>
 
-            {/* 2. LOGIC / REASONING */}
+            {/* 2. LOGIC / REASONING (🔥 ALWAYS VISIBLE NOW 🔥) */}
             <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: `3px solid ${signalColor}` }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: signalColor, fontSize: '11px', fontWeight: 'bold' }}>
                     <History size={14} /> STRATEGY LOGIC
                 </div>
                 <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.5', maxHeight: '100px', overflowY: 'auto', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
-                    {!isLocked ? (
-                      <span style={{color: '#fbbf24'}}>
-                        Signal weak. Waiting for &gt;{ENTRY_THRESHOLD}% confidence to enter.
-                      </span>
-                    ) : (
-                      <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
-                         {analysis?.reasoning && Array.isArray(analysis.reasoning) 
-                             ? analysis.reasoning.map((r, i) => (
-                                 <div key={i} style={{display: 'flex', gap: '6px'}}>
-                                    <span style={{color: signalColor}}>•</span>
-                                    <span>{r.replace(/OB/g, 'Order Block')}</span>
-                                 </div>
-                               )) 
-                             : (analysis?.reason || "Scanning market structure...")
-                         }
-                      </div>
-                    )}
+                    <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
+                       {analysis?.reasoning && Array.isArray(analysis.reasoning) 
+                           ? analysis.reasoning.map((r, i) => (
+                               <div key={i} style={{display: 'flex', gap: '6px'}}>
+                                  <span style={{color: signalColor}}>•</span>
+                                  <span>{r.replace(/OB/g, 'Order Block')}</span>
+                               </div>
+                             )) 
+                           : (analysis?.reason || "Scanning market structure...")
+                       }
+                    </div>
                 </div>
             </div>
 
@@ -304,10 +298,10 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
             )}
 
-            {/* 5. QUIET STATE */}
+            {/* 5. QUIET STATE FOOTER */}
             {!isLocked && (
                 <div style={{ marginTop: 'auto', padding: '15px', textAlign: 'center', border: '1px dashed #374357', borderRadius: '8px', color: '#fbbf24', fontSize: '12px', fontStyle: 'italic', backgroundColor: 'rgba(251, 191, 36, 0.05)' }}>
-                    "Analyzing... Confidence is below {ENTRY_THRESHOLD}% threshold."
+                    Awaiting high-probability setup (&gt;{ENTRY_THRESHOLD}%)
                 </div>
             )}
         </>
