@@ -18,6 +18,9 @@ const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
 const newsRoutes = require('./routes/newsRoutes');
 
+// 👈 NEW: Import your Analysis Controller
+const analysisController = require('./controllers/analysisController'); 
+
 try {
   dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
   console.log('🌍 DNS configured to bypass ISP');
@@ -82,21 +85,8 @@ app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
 
-// ✅ PYTHON BRIDGE 
-app.post('/api/analyze', async (req, res) => {
-    try {
-        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
-        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
-        res.json(response.data);
-    } catch (error) {
-        console.error("🧠 Brain Connection Error:", error.message);
-        res.status(200).json({ 
-            signal: "HOLD", confidence: 0, trend: "NEUTRAL",
-            reason: ["AI Brain is initializing or unreachable..."],
-            keyLevels: { resistance: 0, support: 0, ema: 0 }
-        });
-    }
-});
+// ✅ THE FIX: Route the request through your controller so it fetches the 3000 candles!
+app.post('/api/analyze', analysisController.analyzePattern);
 
 app.get('/health', async (req, res) => {
     try {
@@ -169,7 +159,6 @@ const handleNewTick = async (data) => {
 const syncHistoricalData = async () => {
     console.log("🔄 AUTO-CATCH-UP: Patching missing candles from server downtime...");
     try {
-        // ✅ FIX: Calculate an exact start date (7 days ago) instead of 'range: 7d'
         const startDate = new Date();
         startDate.setDate(startDate.getDate() - 7);
         const period1 = startDate.toISOString().split('T')[0];
@@ -217,7 +206,6 @@ const startLivePriceFeed = () => {
     
     setInterval(async () => {
         try {
-            // ✅ FIX: Calculate a recent start date instead of 'range: 1d'
             const startDate = new Date();
             startDate.setDate(startDate.getDate() - 1);
             const period1 = startDate.toISOString().split('T')[0];
@@ -258,7 +246,7 @@ const initializeDataEngines = async () => {
 initializeDataEngines();
 
 cron.schedule('0 */4 * * *', () => syncHistoricalData());
-cron.schedule('0 */6 * * *', () => fetchLiveNews());     
+cron.schedule('0 */6 * * *', () => fetchLiveNews());      
 
 // ==========================================
 // 💓 KEEP ALIVE PING
