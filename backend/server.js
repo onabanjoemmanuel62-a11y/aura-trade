@@ -9,7 +9,7 @@ const cron = require('node-cron');
 const fetchLiveNews = require('./scripts/fetchLiveNews');
 const axios = require('axios'); 
 
-// ✅ THE FIX: Correctly instantiate Yahoo Finance
+// ✅ Correctly instantiate Yahoo Finance
 const YahooFinance = require('yahoo-finance2').default;
 const yahooFinance = new YahooFinance(); 
 
@@ -169,8 +169,12 @@ const handleNewTick = async (data) => {
 const syncHistoricalData = async () => {
     console.log("🔄 AUTO-CATCH-UP: Patching missing candles from server downtime...");
     try {
-        // Fetch the last 7 days of 1-Hour candles
-        const result = await yahooFinance.chart('GC=F', { interval: '1h', range: '7d' });
+        // ✅ FIX: Calculate an exact start date (7 days ago) instead of 'range: 7d'
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 7);
+        const period1 = startDate.toISOString().split('T')[0];
+
+        const result = await yahooFinance.chart('GC=F', { period1, interval: '1h' });
         const rawData = result?.quotes || [];
 
         if (rawData.length === 0) return;
@@ -211,10 +215,14 @@ const syncHistoricalData = async () => {
 const startLivePriceFeed = () => {
     console.log('🔌 Starting Live Yahoo Finance Feed (GC=F)...');
     
-    // Poll every 30 seconds for faster chart movement
     setInterval(async () => {
         try {
-            const result = await yahooFinance.chart('GC=F', { interval: '1m', range: '1d' });
+            // ✅ FIX: Calculate a recent start date instead of 'range: 1d'
+            const startDate = new Date();
+            startDate.setDate(startDate.getDate() - 1);
+            const period1 = startDate.toISOString().split('T')[0];
+
+            const result = await yahooFinance.chart('GC=F', { period1, interval: '1m' });
             
             if (result && result.quotes && result.quotes.length > 0) {
                 const latest = result.quotes[result.quotes.length - 1];
@@ -233,26 +241,24 @@ const startLivePriceFeed = () => {
                 await handleNewTick(candlePayload);
             }
         } catch (error) {
-            // Keep logs clean, don't crash if Yahoo drops a single request
-            console.error('⚠️ Yahoo Feed slight delay...');
+            console.error('⚠️ Yahoo Feed slight delay...', error.message);
         }
-    }, 30000); 
+    }, 30000); // 30 second updates
 };
 
 // ==========================================
 // 🕒 STARTUP & AUTOMATION RUNNERS
 // ==========================================
 const initializeDataEngines = async () => {
-    await syncHistoricalData(); // 1. Patch any holes first
+    await syncHistoricalData(); // 1. Patch holes (No more schema errors)
     startLivePriceFeed();       // 2. Start real-time feed
     fetchLiveNews();            // 3. Fetch initial news
 };
 
 initializeDataEngines();
 
-// Scheduled Maintenance
-cron.schedule('0 */4 * * *', () => syncHistoricalData()); // Auto-patch every 4 hours
-cron.schedule('0 */6 * * *', () => fetchLiveNews());      // Fetch news every 6 hours
+cron.schedule('0 */4 * * *', () => syncHistoricalData());
+cron.schedule('0 */6 * * *', () => fetchLiveNews());     
 
 // ==========================================
 // 💓 KEEP ALIVE PING
