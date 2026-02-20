@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN (TRUNCATES MITIGATED OBS)
+// 🎨 CUSTOM BOX PLUGIN (HIGH VISIBILITY & TRUNCATION)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -22,35 +22,34 @@ class BoxRenderer {
                 if (zone.x === null || isNaN(zone.x)) return;
 
                 const x1 = zone.x * horizontalPixelRatio;
-                // 🛑 THE MAGIC: If it has an end time (x2), stop drawing there. 
-                // Otherwise, stretch to the far right edge of the screen.
                 const x2 = (zone.x2 !== null && !isNaN(zone.x2)) 
                     ? zone.x2 * horizontalPixelRatio 
                     : scope.mediaSize.width * horizontalPixelRatio; 
                 
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
-                const width = x2 - x1;
+                
+                // 🛑 MATHEMATICAL WRAP: If mitigated, add a few pixels so the box engulfs the mitigating candle, rather than stopping inside its center.
+                const width = zone.isMitigated ? (x2 - x1) + (6 * horizontalPixelRatio) : (x2 - x1);
                 const height = Math.abs(yBottom - yTop); 
 
-                // Safety check: skip drawing if the box dimensions are negative/zero
-                if (width <= 0) return; 
+                // Safety check: skip drawing if the box is crushed backwards
+                if (width <= 0 && zone.x2 !== null) return; 
 
                 ctx.fillStyle = zone.color;
                 ctx.fillRect(x1, Math.min(yTop, yBottom), width, height);
 
                 if (zone.borderColor) {
                     ctx.strokeStyle = zone.borderColor;
-                    // 🎨 Make mitigated blocks faint with a dashed border
                     if (zone.isMitigated) {
-                        ctx.setLineDash([4 * horizontalPixelRatio, 4 * horizontalPixelRatio]);
-                        ctx.lineWidth = 1 * horizontalPixelRatio;
+                        ctx.setLineDash([5 * horizontalPixelRatio, 5 * horizontalPixelRatio]);
+                        ctx.lineWidth = 1.5 * horizontalPixelRatio; // Thicker dashed line for visibility
                     } else {
                         ctx.setLineDash([]);
-                        ctx.lineWidth = 1.5 * horizontalPixelRatio;
+                        ctx.lineWidth = 2 * horizontalPixelRatio; // Thicker solid line for active blocks
                     }
                     ctx.strokeRect(x1, Math.min(yTop, yBottom), width, height);
-                    ctx.setLineDash([]); // Reset dash for the next item
+                    ctx.setLineDash([]); 
                 }
             });
         });
@@ -81,12 +80,12 @@ class BoxPrimitive {
             
             try {
                  timeCoord = timeScale.timeToCoordinate(zone.time);
-                 // If Python says it's mitigated, map the end coordinate
+                 // Map the end coordinate if mitigated
                  if (zone.mitigated_time) {
                      timeCoord2 = timeScale.timeToCoordinate(zone.mitigated_time);
                  }
             } catch(e) {
-                 return null; // Time is off-screen, safe to skip rendering
+                 return null; 
             }
 
             const priceTopCoord = series.priceToCoordinate(zone.top);
@@ -94,16 +93,16 @@ class BoxPrimitive {
             
             if (priceTopCoord === null || priceBottomCoord === null || timeCoord === null) return null;
             
-            // Define styling based on mitigation status
             const isMitigated = zone.is_mitigated || false;
             let fillColor, borderColor;
 
+            // 🔆 VISIBILITY BOOST: Increased opacities so you can clearly see the footprints
             if (isMitigated) {
-                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.04)' : 'rgba(38, 166, 154, 0.04)';
-                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.3)' : 'rgba(38, 166, 154, 0.3)';
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.1)' : 'rgba(38, 166, 154, 0.1)';
+                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.5)' : 'rgba(38, 166, 154, 0.5)';
             } else {
-                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)';
-                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.8)' : 'rgba(38, 166, 154, 0.8)';
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)';
+                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.9)' : 'rgba(38, 166, 154, 0.9)';
             }
 
             return {
@@ -258,7 +257,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime, processCandles]);
 
-  // --- 🎨 RENDER VISUALS (ORDER BLOCKS) ---
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
@@ -270,7 +268,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         latestCandleRef.current = null;
       }
 
-      // 2. Feed zones to the BoxPrimitive
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current && boxPrimitiveRef.current) {
           boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, chartRef.current.timeScale());
       }
@@ -281,7 +278,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(animationFrameId);
   }, [visuals]);
 
-  // --- 📰 RENDER NEWS MARKERS ---
   useEffect(() => {
       const fetchNews = async () => {
           try {
@@ -311,7 +307,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
-  // --- 🎯 RENDER LEVELS (EMA, TP, SL) ---
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     
@@ -339,7 +334,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
   }, [levels, tradeSetup]); 
 
-  // --- ⚡ WEBSOCKET CONNECTION ---
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socket.on('connect', () => setConnectionStatus('Connected'));

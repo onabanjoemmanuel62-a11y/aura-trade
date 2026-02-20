@@ -111,7 +111,7 @@ def detect_smc_structures(df):
         highs = df['High'].values
         lows = df['Low'].values
         
-        # Calculate True Range for momentum threshold
+        # Calculate True Range for strict momentum threshold
         tr = np.maximum(highs - lows, np.abs(highs - np.roll(closes, 1)))
         atr = pd.Series(tr).rolling(14).mean().bfill().values
 
@@ -122,19 +122,24 @@ def detect_smc_structures(df):
         # A. BEARISH OB (Supply)
         for idx in swing_highs[-40:]: 
             ob_idx = idx
-            if ob_idx + 3 >= len(highs): continue # Need future candles for validation
+            
+            # SMC RULE: Find the true institutional buy-to-sell candle.
+            if closes[ob_idx] < opens[ob_idx] and ob_idx > 0 and closes[ob_idx-1] > opens[ob_idx-1]:
+                ob_idx = ob_idx - 1 
+                
+            if ob_idx + 3 >= len(highs): continue 
             
             subsequent_lows = lows[ob_idx+1:]
             if len(subsequent_lows) == 0: continue
 
             if np.min(subsequent_lows) < lows[ob_idx]: # Break of Structure
                 
-                # 🛡️ STRICT FILTER: Must have a Bearish Fair Value Gap (FVG) OR massive momentum drop
+                # 🛡️ STRICT FILTER: Must have a Bearish Fair Value Gap (FVG) AND massive momentum
                 has_fvg = highs[ob_idx+2] < lows[ob_idx]
-                has_momentum = (highs[ob_idx] - closes[ob_idx+2]) > (atr[ob_idx] * 1.5)
+                has_momentum = (highs[ob_idx] - closes[ob_idx+2]) > atr[ob_idx]
                 
-                if not (has_fvg or has_momentum):
-                    continue # Discard low-probability block
+                if not (has_fvg and has_momentum):
+                    continue # Discard weak/fake Order Blocks
                 
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
@@ -163,6 +168,11 @@ def detect_smc_structures(df):
         # B. BULLISH OB (Demand)
         for idx in swing_lows[-40:]:
             ob_idx = idx
+            
+            # SMC RULE: Find the true institutional sell-to-buy candle.
+            if closes[ob_idx] > opens[ob_idx] and ob_idx > 0 and closes[ob_idx-1] < opens[ob_idx-1]:
+                ob_idx = ob_idx - 1 
+                
             if ob_idx + 3 >= len(lows): continue 
             
             subsequent_highs = highs[ob_idx+1:]
@@ -170,12 +180,12 @@ def detect_smc_structures(df):
 
             if np.max(subsequent_highs) > highs[ob_idx]: # Break of Structure
                 
-                # 🛡️ STRICT FILTER: Must have a Bullish Fair Value Gap (FVG) OR massive momentum rally
+                # 🛡️ STRICT FILTER: Must have a Bullish Fair Value Gap (FVG) AND massive momentum
                 has_fvg = lows[ob_idx+2] > highs[ob_idx]
-                has_momentum = (closes[ob_idx+2] - lows[ob_idx]) > (atr[ob_idx] * 1.5)
+                has_momentum = (closes[ob_idx+2] - lows[ob_idx]) > atr[ob_idx]
                 
-                if not (has_fvg or has_momentum):
-                    continue # Discard low-probability block
+                if not (has_fvg and has_momentum):
+                    continue # Discard weak/fake Order Blocks
                 
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
@@ -205,7 +215,6 @@ def detect_smc_structures(df):
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
         return []
-# =================================================================
 
 # --- 3. TRADE CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value):
@@ -394,7 +403,7 @@ async def analyze(req: AnalysisRequest):
             "reasoning": strategy_logic,
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
-                "smc_zones": smc_zones, # 👈 Sends ALL zones with mitigated_time metadata
+                "smc_zones": smc_zones, 
             },
             "tradeSetup": trade_setup if confidence >= 60 else None
         }
