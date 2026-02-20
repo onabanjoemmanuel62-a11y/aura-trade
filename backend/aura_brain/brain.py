@@ -96,10 +96,11 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 UPGRADED SMC ENGINE: FVG FILTER & MITIGATION TIMESTAMPS
+# 🧠 UPGRADED SMC ENGINE: EXTRACTS ZONES + BOS LINES
 # =================================================================
 def detect_smc_structures(df):
     zones = []
+    lines = [] # 👈 NEW: Array to hold Break of Structure lines
     try:
         if 'Date' in df.columns:
             dates = df['Date'].values
@@ -154,6 +155,22 @@ def detect_smc_structures(df):
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
+
+                # 🛑 RECORD BOS LINE COORDINATES
+                break_idx = None
+                for i in range(ob_idx + 1, len(lows)):
+                    if lows[i] < lows[ob_idx]:
+                        break_idx = i
+                        break
+                
+                if break_idx:
+                    lines.append({
+                        "level": float(lows[ob_idx]),
+                        "start_time": int(dates[ob_idx]),
+                        "end_time": int(dates[break_idx]),
+                        "type": "BOS",
+                        "color": "rgba(239, 83, 80, 0.8)" # Red BOS
+                    })
                 
                 zones.append({
                     "type": "OB_BEAR", 
@@ -200,6 +217,22 @@ def detect_smc_structures(df):
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
+
+                # 🛑 RECORD BOS LINE COORDINATES
+                break_idx = None
+                for i in range(ob_idx + 1, len(highs)):
+                    if highs[i] > highs[ob_idx]:
+                        break_idx = i
+                        break
+                
+                if break_idx:
+                    lines.append({
+                        "level": float(highs[ob_idx]),
+                        "start_time": int(dates[ob_idx]),
+                        "end_time": int(dates[break_idx]),
+                        "type": "BOS",
+                        "color": "rgba(38, 166, 154, 0.8)" # Green BOS
+                    })
                 
                 zones.append({
                     "type": "OB_BULL", 
@@ -211,10 +244,10 @@ def detect_smc_structures(df):
                     "is_mitigated": is_tested
                 })
 
-        return zones
+        return {"zones": zones, "lines": lines} # 👈 NEW: Return Both
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
-        return []
+        return {"zones": [], "lines": []}
 
 # --- 3. TRADE CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value):
@@ -270,8 +303,10 @@ async def analyze(req: AnalysisRequest):
         else:
             trend = "RANGING"
         
-        # GET ALL ZONES (Filtered for high probability)
-        smc_zones = detect_smc_structures(df) 
+        # UNPACK NEW SMC DICTIONARY
+        smc_data = detect_smc_structures(df) 
+        smc_zones = smc_data.get("zones", [])
+        bos_lines = smc_data.get("lines", [])
         
         # Sort ONLY unmitigated zones for trading logic
         bullish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BULL' and not z['is_mitigated'] and z['top'] < current_price], key=lambda x: current_price - x['top'])
@@ -284,7 +319,6 @@ async def analyze(req: AnalysisRequest):
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
 
         # 🎯 TRUE LIQUIDITY POOL DETECTOR (BSL / SSL)
-        # We use scipy's argrelextrema to find CONFIRMED historical peaks, ignoring the live pumping price
         highs_arr = df['High'].values
         lows_arr = df['Low'].values
         
@@ -292,13 +326,11 @@ async def analyze(req: AnalysisRequest):
         conf_swing_lows = argrelextrema(lows_arr, np.less, order=5)[0]
         
         if len(conf_swing_highs) > 0:
-            # Get the highest of the last 3 confirmed swing highs
             buy_side_liquidity = float(np.max(highs_arr[conf_swing_highs[-3:]]))
         else:
-            buy_side_liquidity = float(np.max(highs_arr[-50:-5])) # Fallback avoiding last 5 candles
+            buy_side_liquidity = float(np.max(highs_arr[-50:-5])) 
             
         if len(conf_swing_lows) > 0:
-            # Get the lowest of the last 3 confirmed swing lows
             sell_side_liquidity = float(np.min(lows_arr[conf_swing_lows[-3:]]))
         else:
             sell_side_liquidity = float(np.min(lows_arr[-50:-5]))
@@ -342,7 +374,6 @@ async def analyze(req: AnalysisRequest):
         strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
 
         if trend == "UPTREND" and nearest_supp:
-            # Print the Static Target
             strategy_logic.append(f"🎯 Target Liquidity (BSL): {round(buy_side_liquidity, 2)}")
             distance_to_ob = current_price - nearest_supp['top']
             
@@ -379,7 +410,6 @@ async def analyze(req: AnalysisRequest):
                 strategy_logic.append(f"Price is too far from support ({round(nearest_supp['top'], 2)}). Ignoring Sells against trend.")
 
         elif trend == "DOWNTREND" and nearest_res:
-            # Print the Static Target
             strategy_logic.append(f"🎯 Target Liquidity (SSL): {round(sell_side_liquidity, 2)}")
             distance_to_ob = nearest_res['bottom'] - current_price
             
@@ -428,6 +458,7 @@ async def analyze(req: AnalysisRequest):
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
                 "smc_zones": smc_zones, 
+                "bos_lines": bos_lines # 👈 NEW: Sends BOS lines to React
             },
             "tradeSetup": trade_setup if confidence >= 60 else None
         }

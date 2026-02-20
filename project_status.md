@@ -1,11 +1,11 @@
 PROJECT: AuraTrade AI (XAUUSD SMC System)
-STATUS: [Phase 4: Institutional AI & UI Synchronization - LIVE]
+STATUS: [Phase 5: Live Testing & Institutional Refinement - LIVE]
 1. TECH STACK (Confirmed)
-Frontend: React (Vercel) - Running Lightweight Charts v5 with Custom SMC BoxRenderer.
+Frontend: React (Vercel) - Running Lightweight Charts v5 with Custom SMC BoxRenderer (Truncation & Opacity enabled).
 
-Backend Manager: Node.js/Express (Render) - Auto-Patching Yahoo Finance GC=F Live Feed + News Fetcher.
+Backend Manager: Node.js/Express (Render) - Auto-Patching Yahoo Finance GC=F Live Feed + Multi-News Fetcher.
 
-Logic Engine: Python (aura_brain/brain.py) - Pure SMC + Fundamental Logic Engine.
+Logic Engine: Python (aura_brain/brain.py) - Strict SMC (FVG/BSL/SSL) + Fundamental Logic Engine.
 
 Database: MongoDB (Stores Continuous, Clean Candle Data & News)
 
@@ -20,31 +20,37 @@ Database: MongoDB (Stores Continuous, Clean Candle Data & News)
 
 [x] Implement Auto-Catch-Up: Node.js seamlessly patches offline gaps on boot.
 
-[x] UPGRADE: Pure SMC Math Engine: Replaced historical fractal guessing with strict Order Block proximity math.
-
-[x] UPGRADE: Institutional Trend Lock: AI uses 50/200 EMA to lock trading direction (No buying in downtrends).
+[x] UPGRADE: Institutional Trend Lock: AI uses 50/200 EMA to lock trading direction.
 
 [x] UPGRADE: Liquidity Sweep Detector: AI scans for "Stop Hunts" (wicks piercing OBs) to boost confidence.
 
-[x] UPGRADE: Fundamental News Injection: Node.js sends the latest High-Impact USD News (Actual vs Forecast) to Python to confirm or block technical setups.
+[x] UPGRADE: UI Synchronization: SignalCard.js now maps the Python reasoning array to display the AI's exact thoughts.
+
+[x] UPGRADE: Multi-News Engine: SignalCard.js fetches and displays all upcoming High-Impact USD news for the day with live countdowns.
+
+[x] UPGRADE: Strict FVG Filter: brain.py now requires a Fair Value Gap and massive ATR displacement to validate an Order Block.
+
+[x] UPGRADE: Mitigation Footprints: ChartComponent.js and brain.py work together to accurately truncate mitigated OBs, fading them into dashed historical footprints.
+
+[x] UPGRADE: Static Liquidity Targets (BSL/SSL): AI now uses scipy wave detection to find confirmed historical swing highs/lows for exact Take Profit targeting, ignoring the live pumping candle.
 
 3. CRITICAL SOLUTIONS
-How does the AI know the trend? [SOLVED]
+How does the AI set accurate Liquidity Targets? [SOLVED]
 
-Solution: Python calculates the 50 EMA and 200 EMA on the fly. If the 50 crosses below the 200, the AI strictly ignores all Bullish Demand zones.
+Solution: Instead of tracking the absolute highest candle (which moves with live price), Python uses argrelextrema to find the last 3 confirmed historical peaks where retail traders actually placed their stop losses.
 
-How does the AI factor in Forex Factory News? [SOLVED]
+How does the chart handle cluttered Order Blocks? [SOLVED]
 
-Solution: Node.js fetches the latest outcome (e.g., GDP Actual > Forecast) from MongoDB and packages it with the candles. Python reads the USD strength and applies it inversely to Gold (XAUUSD).
+Solution: Python records the exact timestamp a block is pierced (mitigated_time). React reads this and mathematically truncates the box at that exact candle, rendering it as a faint, dashed footprint.
 
-4. CURRENT TASK: DEPLOYMENT & VERIFICATION
-[x] Deploy Python Engine: brain.py upgraded and live on Render.
+4. CURRENT TASK: LIVE OBSERVATION
+[x] Deploy React Frontend: Multi-news and AI logs are live.
 
-[x] Deploy Node.js Controller: analysisController.js upgraded and live on Render.
+[x] Deploy Python Engine: FVG and BSL/SSL logic are live.
 
-[ ] Update React UI (Pending): Modify the SignalCard component to .map() and render the Python reasoning array so the user can read the AI's logic.
+[ ] Forward Testing: Monitor the AI's accuracy in live market conditions. Watch how it handles upcoming NY session volatility.
 
 5. KNOWN RISKS / NEXT STEPS
-Order Block Clutter: Now that Python sends all unmitigated zones, the chart might look busy. If needed, we can limit Python to only send the top 3 closest zones.
+Latency Management: Python is doing heavy calculus on 3000 candles (FVGs, EMAs, Extrema peaks). Monitor Render server response times.
 
-Strictness Limit: The AI will confidently stay at 0% until the price enters the "strike zone" (within 3x ATR of an Order Block). This requires patience from the trader.
+Strictness Patience: The AI will confidently sit at 0% until price enters the 3x ATR "strike zone" of an FVG-backed Order Block.

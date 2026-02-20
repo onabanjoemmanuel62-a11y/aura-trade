@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN (HIGH VISIBILITY & TRUNCATION)
+// 🎨 1. CUSTOM BOX PLUGIN (ORDER BLOCKS)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -29,11 +29,9 @@ class BoxRenderer {
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 
-                // 🛑 MATHEMATICAL WRAP: If mitigated, add a few pixels so the box engulfs the mitigating candle, rather than stopping inside its center.
                 const width = zone.isMitigated ? (x2 - x1) + (6 * horizontalPixelRatio) : (x2 - x1);
                 const height = Math.abs(yBottom - yTop); 
 
-                // Safety check: skip drawing if the box is crushed backwards
                 if (width <= 0 && zone.x2 !== null) return; 
 
                 ctx.fillStyle = zone.color;
@@ -43,10 +41,10 @@ class BoxRenderer {
                     ctx.strokeStyle = zone.borderColor;
                     if (zone.isMitigated) {
                         ctx.setLineDash([5 * horizontalPixelRatio, 5 * horizontalPixelRatio]);
-                        ctx.lineWidth = 1.5 * horizontalPixelRatio; // Thicker dashed line for visibility
+                        ctx.lineWidth = 1.5 * horizontalPixelRatio; 
                     } else {
                         ctx.setLineDash([]);
-                        ctx.lineWidth = 2 * horizontalPixelRatio; // Thicker solid line for active blocks
+                        ctx.lineWidth = 2 * horizontalPixelRatio; 
                     }
                     ctx.strokeRect(x1, Math.min(yTop, yBottom), width, height);
                     ctx.setLineDash([]); 
@@ -80,7 +78,6 @@ class BoxPrimitive {
             
             try {
                  timeCoord = timeScale.timeToCoordinate(zone.time);
-                 // Map the end coordinate if mitigated
                  if (zone.mitigated_time) {
                      timeCoord2 = timeScale.timeToCoordinate(zone.mitigated_time);
                  }
@@ -96,7 +93,6 @@ class BoxPrimitive {
             const isMitigated = zone.is_mitigated || false;
             let fillColor, borderColor;
 
-            // 🔆 VISIBILITY BOOST: Increased opacities so you can clearly see the footprints
             if (isMitigated) {
                 fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.1)' : 'rgba(38, 166, 154, 0.1)';
                 borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.5)' : 'rgba(38, 166, 154, 0.5)';
@@ -107,7 +103,7 @@ class BoxPrimitive {
 
             return {
                 x: timeCoord, 
-                x2: timeCoord2, // Will be null for active blocks, stretching them to infinity
+                x2: timeCoord2, 
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
                 yBottom: Math.max(priceTopCoord, priceBottomCoord),
                 color: fillColor,
@@ -125,6 +121,68 @@ class BoxPrimitive {
 }
 
 // ==========================================
+// 🎨 2. NEW PLUGIN: BOS / CHoCH LINES
+// ==========================================
+class BOSRenderer {
+    constructor(data) { this._data = data; }
+    draw(target) {
+        target.useBitmapCoordinateSpace((scope) => {
+            if (!this._data || this._data.length === 0) return;
+            const ctx = scope.context;
+            const horizontalPixelRatio = scope.horizontalPixelRatio;
+            const verticalPixelRatio = scope.verticalPixelRatio;
+
+            this._data.forEach((line) => {
+                if (line.x1 === null || line.x2 === null || line.y === null) return;
+                
+                const x1 = line.x1 * horizontalPixelRatio;
+                const x2 = line.x2 * horizontalPixelRatio;
+                const y = line.y * verticalPixelRatio;
+
+                // Draw the dashed line
+                ctx.beginPath();
+                ctx.moveTo(x1, y);
+                ctx.lineTo(x2, y);
+                ctx.strokeStyle = line.color;
+                ctx.lineWidth = 1.5 * horizontalPixelRatio;
+                ctx.setLineDash([4 * horizontalPixelRatio, 4 * horizontalPixelRatio]);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Draw the "BOS" text label
+                ctx.font = `bold ${11 * horizontalPixelRatio}px sans-serif`;
+                ctx.fillStyle = line.color;
+                ctx.fillText("BOS", x2 + (4 * horizontalPixelRatio), y + (3 * horizontalPixelRatio));
+            });
+        });
+    }
+}
+
+class BOSPaneView {
+    constructor(source) { this._source = source; }
+    renderer() { return new BOSRenderer(this._source._rendererData); }
+}
+
+class BOSPrimitive {
+    constructor() { this._rendererData = []; this._paneViews = [new BOSPaneView(this)]; }
+    setData(lines, series, timeScale) {
+        if (!lines || !Array.isArray(lines)) { this._rendererData = []; return; }
+        this._rendererData = lines.map(line => {
+            if (!line.start_time || !line.end_time || !line.level) return null;
+            try {
+                const x1 = timeScale.timeToCoordinate(line.start_time);
+                const x2 = timeScale.timeToCoordinate(line.end_time);
+                const y = series.priceToCoordinate(line.level);
+                if (x1 === null || x2 === null || y === null) return null;
+                return { x1, x2, y, color: line.color };
+            } catch(e) { return null; }
+        }).filter(l => l !== null);
+    }
+    updateAllViews() { if(this._paneViews[0] && this._paneViews[0].update) this._paneViews[0].update(); }
+    paneViews() { return this._paneViews; }
+}
+
+// ==========================================
 // 🚀 MAIN REACT COMPONENT
 // ==========================================
 const ChartComponent = ({ levels, visuals, tradeSetup }) => {
@@ -132,6 +190,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
   const boxPrimitiveRef = useRef(null); 
+  const bosPrimitiveRef = useRef(null); // 👈 NEW REF FOR BOS LINES
   const activeLinesRef = useRef([]);
 
   const isChartReady = useRef(false);
@@ -185,9 +244,15 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
     
-    const primitive = new BoxPrimitive();
-    newSeries.attachPrimitive(primitive);
-    boxPrimitiveRef.current = primitive;
+    // Attach Order Block Plugin
+    const boxPrimitive = new BoxPrimitive();
+    newSeries.attachPrimitive(boxPrimitive);
+    boxPrimitiveRef.current = boxPrimitive;
+
+    // 👈 Attach BOS Lines Plugin
+    const bosPrimitive = new BOSPrimitive();
+    newSeries.attachPrimitive(bosPrimitive);
+    bosPrimitiveRef.current = bosPrimitive;
 
     chartRef.current = chart;
     candleSeriesRef.current = newSeries; 
@@ -257,6 +322,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     loadInitialHistory();
   }, [timeframe, getCandleStartTime, processCandles]);
 
+  // --- 🎨 RENDER VISUALS (OBS & BOS) ---
   useEffect(() => {
     let animationFrameId;
     const renderLoop = () => {
@@ -268,8 +334,15 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         latestCandleRef.current = null;
       }
 
-      if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current && boxPrimitiveRef.current) {
-          boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, chartRef.current.timeScale());
+      if (chartRef.current && candleSeriesRef.current) {
+          // Render OBs
+          if (visuals?.smc_zones && boxPrimitiveRef.current) {
+              boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, chartRef.current.timeScale());
+          }
+          // Render BOS Lines
+          if (visuals?.bos_lines && bosPrimitiveRef.current) {
+              bosPrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, chartRef.current.timeScale());
+          }
       }
 
       animationFrameId = requestAnimationFrame(renderLoop);
