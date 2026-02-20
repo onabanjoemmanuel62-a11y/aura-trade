@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 1. CUSTOM BOX PLUGIN (ORDER BLOCKS)
+// 🎨 1. CUSTOM BOX PLUGIN (HIGH VISIBILITY)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -29,22 +29,26 @@ class BoxRenderer {
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 
-                const width = zone.isMitigated ? (x2 - x1) + (6 * horizontalPixelRatio) : (x2 - x1);
-                const height = Math.abs(yBottom - yTop); 
+                // 🛑 GUARANTEED VISIBILITY: Ensure the box has a minimum width and engulfs the mitigating candle
+                let width = x2 - x1;
+                if (zone.isMitigated) {
+                    width = Math.max(width + (12 * horizontalPixelRatio), 20 * horizontalPixelRatio);
+                }
 
                 if (width <= 0 && zone.x2 !== null) return; 
 
                 ctx.fillStyle = zone.color;
+                const height = Math.abs(yBottom - yTop);
                 ctx.fillRect(x1, Math.min(yTop, yBottom), width, height);
 
                 if (zone.borderColor) {
                     ctx.strokeStyle = zone.borderColor;
                     if (zone.isMitigated) {
-                        ctx.setLineDash([5 * horizontalPixelRatio, 5 * horizontalPixelRatio]);
+                        ctx.setLineDash([6 * horizontalPixelRatio, 6 * horizontalPixelRatio]);
                         ctx.lineWidth = 1.5 * horizontalPixelRatio; 
                     } else {
                         ctx.setLineDash([]);
-                        ctx.lineWidth = 2 * horizontalPixelRatio; 
+                        ctx.lineWidth = 2.5 * horizontalPixelRatio; 
                     }
                     ctx.strokeRect(x1, Math.min(yTop, yBottom), width, height);
                     ctx.setLineDash([]); 
@@ -93,12 +97,13 @@ class BoxPrimitive {
             const isMitigated = zone.is_mitigated || false;
             let fillColor, borderColor;
 
+            // 🔥 MASSIVE BRIGHTNESS BOOST FOR ALL OBs
             if (isMitigated) {
-                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.1)' : 'rgba(38, 166, 154, 0.1)';
-                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.5)' : 'rgba(38, 166, 154, 0.5)';
-            } else {
-                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.25)' : 'rgba(38, 166, 154, 0.25)';
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)';
                 borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.9)' : 'rgba(38, 166, 154, 0.9)';
+            } else {
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.3)' : 'rgba(38, 166, 154, 0.3)';
+                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 1)' : 'rgba(38, 166, 154, 1)';
             }
 
             return {
@@ -121,7 +126,7 @@ class BoxPrimitive {
 }
 
 // ==========================================
-// 🎨 2. NEW PLUGIN: BOS / CHoCH LINES
+// 🎨 2. NEW PLUGIN: THICK BOS / CHoCH LINES
 // ==========================================
 class BOSRenderer {
     constructor(data) { this._data = data; }
@@ -139,20 +144,23 @@ class BOSRenderer {
                 const x2 = line.x2 * horizontalPixelRatio;
                 const y = line.y * verticalPixelRatio;
 
+                // Force solid 100% opacity color for the line
+                const brightColor = line.color.replace(/0\.\d+\)/, '1)');
+
                 // Draw the dashed line
                 ctx.beginPath();
                 ctx.moveTo(x1, y);
-                ctx.lineTo(x2, y);
-                ctx.strokeStyle = line.color;
-                ctx.lineWidth = 1.5 * horizontalPixelRatio;
-                ctx.setLineDash([4 * horizontalPixelRatio, 4 * horizontalPixelRatio]);
+                ctx.lineTo(x2 + (15 * horizontalPixelRatio), y); // Extend slightly past the break candle
+                ctx.strokeStyle = brightColor;
+                ctx.lineWidth = 2.5 * horizontalPixelRatio; // 🔥 Thicker line
+                ctx.setLineDash([8 * horizontalPixelRatio, 6 * horizontalPixelRatio]); // 🔥 Clearer dashes
                 ctx.stroke();
                 ctx.setLineDash([]);
 
                 // Draw the "BOS" text label
-                ctx.font = `bold ${11 * horizontalPixelRatio}px sans-serif`;
-                ctx.fillStyle = line.color;
-                ctx.fillText("BOS", x2 + (4 * horizontalPixelRatio), y + (3 * horizontalPixelRatio));
+                ctx.font = `bold ${13 * horizontalPixelRatio}px sans-serif`; // 🔥 Larger text
+                ctx.fillStyle = brightColor;
+                ctx.fillText("BOS", x2 + (20 * horizontalPixelRatio), y + (4 * horizontalPixelRatio));
             });
         });
     }
@@ -190,7 +198,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
   const boxPrimitiveRef = useRef(null); 
-  const bosPrimitiveRef = useRef(null); // 👈 NEW REF FOR BOS LINES
+  const bosPrimitiveRef = useRef(null); 
   const activeLinesRef = useRef([]);
 
   const isChartReady = useRef(false);
@@ -249,7 +257,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     newSeries.attachPrimitive(boxPrimitive);
     boxPrimitiveRef.current = boxPrimitive;
 
-    // 👈 Attach BOS Lines Plugin
+    // Attach BOS Lines Plugin
     const bosPrimitive = new BOSPrimitive();
     newSeries.attachPrimitive(bosPrimitive);
     bosPrimitiveRef.current = bosPrimitive;
@@ -297,7 +305,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
           allDataRef.current = combinedData;
           if (candleSeriesRef.current) candleSeriesRef.current.setData(combinedData);
 
-      } catch (err) { console.error("History Error", err); } 
+      } catch (err) { } 
       finally { isLoadingRef.current = false; }
   };
 
@@ -317,7 +325,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             candleSeriesRef.current.setData(validData);
             if (validData.length > 0) currentBarRef.current = validData[validData.length - 1];
         }
-      } catch (err) { console.error("Init Load Error", err); } 
+      } catch (err) {} 
     };
     loadInitialHistory();
   }, [timeframe, getCandleStartTime, processCandles]);
@@ -356,7 +364,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
           try {
               const res = await axios.get(`${API_URL}/api/news`, { params: { limit: 100 } });
               if (Array.isArray(res.data)) setNewsData(res.data.map(n => ({...n, time: n.time})));
-          } catch (err) { console.error(err); }
+          } catch (err) {}
       };
       fetchNews();
   }, []);
@@ -376,7 +384,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
             }
-        } catch (e) { console.warn("Marker skip", e); }
+        } catch (e) { }
     }
   }, [newsData, timeframe, getCandleStartTime]);
 
