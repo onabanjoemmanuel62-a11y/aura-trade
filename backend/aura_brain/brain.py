@@ -280,6 +280,12 @@ async def analyze(req: AnalysisRequest):
         nearest_supp = bullish_zones[0] if bullish_zones else None
         nearest_res = bearish_zones[0] if bearish_zones else None
         
+        # 🎯 LIQUIDITY POOL DETECTOR (BSL / SSL)
+        recent_highs = df['High'].tail(50).values
+        recent_lows = df['Low'].tail(50).values
+        buy_side_liquidity = float(np.max(recent_highs))
+        sell_side_liquidity = float(np.min(recent_lows))
+
         sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.985
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
 
@@ -309,10 +315,10 @@ async def analyze(req: AnalysisRequest):
             
             if actual > forecast:
                 news_bias = "BEARISH_GOLD"
-                news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast}). Strong USD = Bearish Gold."
+                news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast}). Strong USD limits Gold."
             elif actual < forecast:
                 news_bias = "BULLISH_GOLD"
-                news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast}). Weak USD = Bullish Gold."
+                news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast}). Weak USD fuels Gold."
 
         # =========================================================
         # 🧠 PURE SMC CALCULATOR
@@ -322,6 +328,7 @@ async def analyze(req: AnalysisRequest):
         strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
 
         if trend == "UPTREND" and nearest_supp:
+            strategy_logic.append(f"🎯 Target Liquidity (BSL): {round(buy_side_liquidity, 2)}")
             distance_to_ob = current_price - nearest_supp['top']
             
             if distance_to_ob <= (atr * 3): 
@@ -357,6 +364,7 @@ async def analyze(req: AnalysisRequest):
                 strategy_logic.append(f"Price is too far from support ({round(nearest_supp['top'], 2)}). Ignoring Sells against trend.")
 
         elif trend == "DOWNTREND" and nearest_res:
+            strategy_logic.append(f"🎯 Target Liquidity (SSL): {round(sell_side_liquidity, 2)}")
             distance_to_ob = nearest_res['bottom'] - current_price
             
             if distance_to_ob <= (atr * 3):
