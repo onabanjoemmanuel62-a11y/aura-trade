@@ -87,7 +87,7 @@ app = FastAPI(lifespan=lifespan)
 origins = ["*"] 
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# 📨 UPDATED REQUEST MODEL: Now accepts live news data from Node.js
+# 📨 UPDATED REQUEST MODEL
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
@@ -95,7 +95,9 @@ class AnalysisRequest(BaseModel):
     candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
-# --- 2. SMC ENGINE (EXTRACTS ALL UNMITIGATED ZONES) ---
+# =================================================================
+# 🧠 UPGRADED SMC ENGINE: FVG FILTER & MITIGATION TIMESTAMPS
+# =================================================================
 def detect_smc_structures(df):
     zones = []
     try:
@@ -104,9 +106,15 @@ def detect_smc_structures(df):
         else:
             dates = df.index.values
 
+        opens = df['Open'].values
+        closes = df['Close'].values
         highs = df['High'].values
         lows = df['Low'].values
         
+        # Calculate True Range for momentum threshold
+        tr = np.maximum(highs - lows, np.abs(highs - np.roll(closes, 1)))
+        atr = pd.Series(tr).rolling(14).mean().bfill().values
+
         swing_period = 5
         swing_highs = argrelextrema(highs, np.greater, order=swing_period)[0]
         swing_lows = argrelextrema(lows, np.less, order=swing_period)[0]
@@ -114,47 +122,90 @@ def detect_smc_structures(df):
         # A. BEARISH OB (Supply)
         for idx in swing_highs[-40:]: 
             ob_idx = idx
-            subsequent_price = lows[ob_idx+1:]
-            if len(subsequent_price) == 0: continue
+            if ob_idx + 3 >= len(highs): continue # Need future candles for validation
             
-            if np.min(subsequent_price) < lows[ob_idx]: 
+            subsequent_lows = lows[ob_idx+1:]
+            if len(subsequent_lows) == 0: continue
+
+            if np.min(subsequent_lows) < lows[ob_idx]: # Break of Structure
+                
+                # 🛡️ STRICT FILTER: Must have a Bearish Fair Value Gap (FVG) OR massive momentum drop
+                has_fvg = highs[ob_idx+2] < lows[ob_idx]
+                has_momentum = (highs[ob_idx] - closes[ob_idx+2]) > (atr[ob_idx] * 1.5)
+                
+                if not (has_fvg or has_momentum):
+                    continue # Discard low-probability block
+                
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
                 ob_time = dates[ob_idx] 
                 
                 is_tested = False
-                for future_idx in range(ob_idx + 5, len(highs)):
+                mitigated_time = None
+                
+                # 🛑 MITIGATION TRACKER: Find exactly when it was hit
+                for future_idx in range(ob_idx + 2, len(highs)):
                     if highs[future_idx] >= ob_bottom:
                         is_tested = True
+                        mitigated_time = dates[future_idx]
                         break
                 
-                if not is_tested:
-                    zones.append({"type": "OB_BEAR", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_bottom), "time": int(ob_time)})
+                zones.append({
+                    "type": "OB_BEAR", 
+                    "top": float(ob_top), 
+                    "bottom": float(ob_bottom), 
+                    "price": float(ob_bottom), 
+                    "time": int(ob_time),
+                    "mitigated_time": int(mitigated_time) if is_tested else None,
+                    "is_mitigated": is_tested
+                })
 
         # B. BULLISH OB (Demand)
         for idx in swing_lows[-40:]:
             ob_idx = idx
-            subsequent_price = highs[ob_idx+1:]
-            if len(subsequent_price) == 0: continue
+            if ob_idx + 3 >= len(lows): continue 
             
-            if np.max(subsequent_price) > highs[ob_idx]: 
+            subsequent_highs = highs[ob_idx+1:]
+            if len(subsequent_highs) == 0: continue
+
+            if np.max(subsequent_highs) > highs[ob_idx]: # Break of Structure
+                
+                # 🛡️ STRICT FILTER: Must have a Bullish Fair Value Gap (FVG) OR massive momentum rally
+                has_fvg = lows[ob_idx+2] > highs[ob_idx]
+                has_momentum = (closes[ob_idx+2] - lows[ob_idx]) > (atr[ob_idx] * 1.5)
+                
+                if not (has_fvg or has_momentum):
+                    continue # Discard low-probability block
+                
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
                 ob_time = dates[ob_idx] 
                 
                 is_tested = False
-                for future_idx in range(ob_idx + 5, len(lows)):
+                mitigated_time = None
+                
+                # 🛑 MITIGATION TRACKER: Find exactly when it was hit
+                for future_idx in range(ob_idx + 2, len(lows)):
                     if lows[future_idx] <= ob_top:
                         is_tested = True
+                        mitigated_time = dates[future_idx]
                         break
                 
-                if not is_tested:
-                    zones.append({"type": "OB_BULL", "top": float(ob_top), "bottom": float(ob_bottom), "price": float(ob_top), "time": int(ob_time)})
+                zones.append({
+                    "type": "OB_BULL", 
+                    "top": float(ob_top), 
+                    "bottom": float(ob_bottom), 
+                    "price": float(ob_top), 
+                    "time": int(ob_time),
+                    "mitigated_time": int(mitigated_time) if is_tested else None,
+                    "is_mitigated": is_tested
+                })
 
         return zones
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
         return []
+# =================================================================
 
 # --- 3. TRADE CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value):
@@ -180,7 +231,7 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
     except:
         return None
 
-# --- 4. MAIN ENDPOINT (THE NEW AI BRAIN) ---
+# --- 4. MAIN ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
     if req.candles and len(req.candles) > 50:
@@ -197,13 +248,12 @@ async def analyze(req: AnalysisRequest):
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
-        # 🛡️ THE 100% ACCURATE TREND FILTER (50 EMA & 200 EMA)
+        # 🛡️ THE 100% ACCURATE TREND FILTER
         ema_50 = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
         ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
         rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
         atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
         
-        # Strict Institutional Trend Rules
         if ema_50 > ema_200 and current_price > ema_200:
             trend = "UPTREND"
         elif ema_50 < ema_200 and current_price < ema_200:
@@ -211,12 +261,12 @@ async def analyze(req: AnalysisRequest):
         else:
             trend = "RANGING"
         
-        # GET ALL ZONES
+        # GET ALL ZONES (Filtered for high probability)
         smc_zones = detect_smc_structures(df) 
         
-        # Sort zones by proximity to current price
-        bullish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BULL' and z['top'] < current_price], key=lambda x: current_price - x['top'])
-        bearish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BEAR' and z['bottom'] > current_price], key=lambda x: x['bottom'] - current_price)
+        # Sort ONLY unmitigated zones for trading logic
+        bullish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BULL' and not z['is_mitigated'] and z['top'] < current_price], key=lambda x: current_price - x['top'])
+        bearish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BEAR' and not z['is_mitigated'] and z['bottom'] > current_price], key=lambda x: x['bottom'] - current_price)
         
         nearest_supp = bullish_zones[0] if bullish_zones else None
         nearest_res = bearish_zones[0] if bearish_zones else None
@@ -224,24 +274,22 @@ async def analyze(req: AnalysisRequest):
         sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.985
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
 
-        # 🚨 LIQUIDITY SWEEP / STOP HUNT DETECTOR
+        # 🚨 LIQUIDITY SWEEP
         recent_candles = df.tail(3)
         liquidity_sweep_bullish = False
         liquidity_sweep_bearish = False
         
         if nearest_supp:
             for _, c in recent_candles.iterrows():
-                # Price dipped below OB but closed inside/above it
                 if c['Low'] < nearest_supp['bottom'] and c['Close'] > nearest_supp['bottom']:
                     liquidity_sweep_bullish = True
                     
         if nearest_res:
             for _, c in recent_candles.iterrows():
-                # Price spiked above OB but closed inside/below it
                 if c['High'] > nearest_res['top'] and c['Close'] < nearest_res['top']:
                     liquidity_sweep_bearish = True
 
-        # 📰 FUNDAMENTAL NEWS EVALUATOR
+        # 📰 FUNDAMENTALS
         news_bias = "NEUTRAL"
         news_string = "No recent impactful news data."
         
@@ -258,7 +306,7 @@ async def analyze(req: AnalysisRequest):
                 news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast}). Weak USD = Bullish Gold."
 
         # =========================================================
-        # 🧠 PURE SMC + NEWS PROBABILITY CALCULATOR
+        # 🧠 PURE SMC CALCULATOR
         # =========================================================
         signal = "NEUTRAL"
         confidence = 0
@@ -271,22 +319,19 @@ async def analyze(req: AnalysisRequest):
                 signal = "BUY"
                 base_conf = 55
                 
-                # SMC Rules
                 if current_price <= nearest_supp['top'] and current_price >= nearest_supp['bottom']:
                     base_conf += 20 
-                    strategy_logic.append("Premium Entry: Price inside Bullish Order Block.")
+                    strategy_logic.append("Premium Entry: Price inside High-Prob Bullish OB.")
                 elif distance_to_ob <= atr:
                     base_conf += 10
-                    strategy_logic.append("Approaching Entry: Price near Bullish Order Block.")
+                    strategy_logic.append("Approaching Entry: Price near Bullish OB.")
                 else:
                     strategy_logic.append("Waiting for retracement into Order Block.")
                     
-                # Liquidity Trap
                 if liquidity_sweep_bullish:
                     base_conf += 15
                     strategy_logic.append("🚨 Bullish Stop Hunt Detected! Early sellers trapped.")
                 
-                # News Confluence
                 if news_bias == "BULLISH_GOLD":
                     base_conf += 15
                     strategy_logic.append("🔥 News Aligns with Trend! Massive Bullish Confluence.")
@@ -309,22 +354,19 @@ async def analyze(req: AnalysisRequest):
                 signal = "SELL"
                 base_conf = 55
                 
-                # SMC Rules
                 if current_price >= nearest_res['bottom'] and current_price <= nearest_res['top']:
                     base_conf += 20
-                    strategy_logic.append("Premium Entry: Price inside Bearish Order Block.")
+                    strategy_logic.append("Premium Entry: Price inside High-Prob Bearish OB.")
                 elif distance_to_ob <= atr:
                     base_conf += 10
-                    strategy_logic.append("Approaching Entry: Price near Bearish Order Block.")
+                    strategy_logic.append("Approaching Entry: Price near Bearish OB.")
                 else:
                     strategy_logic.append("Waiting for rally into Order Block.")
                     
-                # Liquidity Trap
                 if liquidity_sweep_bearish:
                     base_conf += 15
                     strategy_logic.append("🚨 Bearish Stop Hunt Detected! Early buyers trapped.")
                     
-                # News Confluence
                 if news_bias == "BEARISH_GOLD":
                     base_conf += 15
                     strategy_logic.append("🔥 News Aligns with Trend! Massive Bearish Confluence.")
@@ -342,8 +384,6 @@ async def analyze(req: AnalysisRequest):
         else:
             strategy_logic.append("No clear institutional setups in current range.")
 
-        # =========================================================
-
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
         return {
@@ -354,7 +394,7 @@ async def analyze(req: AnalysisRequest):
             "reasoning": strategy_logic,
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
-                "smc_zones": smc_zones, 
+                "smc_zones": smc_zones, # 👈 Sends ALL zones with mitigated_time metadata
             },
             "tradeSetup": trade_setup if confidence >= 60 else None
         }

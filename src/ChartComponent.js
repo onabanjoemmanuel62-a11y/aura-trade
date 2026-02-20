@@ -7,7 +7,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ==========================================
-// 🎨 CUSTOM BOX PLUGIN (UPGRADED FOR MULTIPLE ZONES)
+// 🎨 CUSTOM BOX PLUGIN (TRUNCATES MITIGATED OBS)
 // ==========================================
 class BoxRenderer {
     constructor(data) { this._data = data; }
@@ -19,23 +19,38 @@ class BoxRenderer {
             const verticalPixelRatio = scope.verticalPixelRatio;
 
             this._data.forEach((zone) => {
-                // Ensure valid coordinates
                 if (zone.x === null || isNaN(zone.x)) return;
 
                 const x1 = zone.x * horizontalPixelRatio;
-                const x2 = scope.mediaSize.width * horizontalPixelRatio; 
+                // 🛑 THE MAGIC: If it has an end time (x2), stop drawing there. 
+                // Otherwise, stretch to the far right edge of the screen.
+                const x2 = (zone.x2 !== null && !isNaN(zone.x2)) 
+                    ? zone.x2 * horizontalPixelRatio 
+                    : scope.mediaSize.width * horizontalPixelRatio; 
+                
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 const width = x2 - x1;
                 const height = Math.abs(yBottom - yTop); 
+
+                // Safety check: skip drawing if the box dimensions are negative/zero
+                if (width <= 0) return; 
 
                 ctx.fillStyle = zone.color;
                 ctx.fillRect(x1, Math.min(yTop, yBottom), width, height);
 
                 if (zone.borderColor) {
                     ctx.strokeStyle = zone.borderColor;
-                    ctx.lineWidth = 1.5 * horizontalPixelRatio;
+                    // 🎨 Make mitigated blocks faint with a dashed border
+                    if (zone.isMitigated) {
+                        ctx.setLineDash([4 * horizontalPixelRatio, 4 * horizontalPixelRatio]);
+                        ctx.lineWidth = 1 * horizontalPixelRatio;
+                    } else {
+                        ctx.setLineDash([]);
+                        ctx.lineWidth = 1.5 * horizontalPixelRatio;
+                    }
                     ctx.strokeRect(x1, Math.min(yTop, yBottom), width, height);
+                    ctx.setLineDash([]); // Reset dash for the next item
                 }
             });
         });
@@ -61,12 +76,17 @@ class BoxPrimitive {
         this._rendererData = zones.map(zone => {
             if (!zone.time || !zone.top || !zone.bottom) return null;
             
-            // Allow for historical times to map correctly
             let timeCoord = null;
+            let timeCoord2 = null; 
+            
             try {
                  timeCoord = timeScale.timeToCoordinate(zone.time);
+                 // If Python says it's mitigated, map the end coordinate
+                 if (zone.mitigated_time) {
+                     timeCoord2 = timeScale.timeToCoordinate(zone.mitigated_time);
+                 }
             } catch(e) {
-                 return null;
+                 return null; // Time is off-screen, safe to skip rendering
             }
 
             const priceTopCoord = series.priceToCoordinate(zone.top);
@@ -74,17 +94,30 @@ class BoxPrimitive {
             
             if (priceTopCoord === null || priceBottomCoord === null || timeCoord === null) return null;
             
+            // Define styling based on mitigation status
+            const isMitigated = zone.is_mitigated || false;
+            let fillColor, borderColor;
+
+            if (isMitigated) {
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.04)' : 'rgba(38, 166, 154, 0.04)';
+                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.3)' : 'rgba(38, 166, 154, 0.3)';
+            } else {
+                fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)';
+                borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.8)' : 'rgba(38, 166, 154, 0.8)';
+            }
+
             return {
                 x: timeCoord, 
+                x2: timeCoord2, // Will be null for active blocks, stretching them to infinity
                 yTop: Math.min(priceTopCoord, priceBottomCoord), 
                 yBottom: Math.max(priceTopCoord, priceBottomCoord),
-                color: zone.color,
-                borderColor: zone.borderColor
+                color: fillColor,
+                borderColor: borderColor,
+                isMitigated: isMitigated
             };
         }).filter(z => z !== null);
     }
     updateAllViews() {
-         // Lightweight charts required update trigger
          if(this._paneViews[0] && this._paneViews[0].update) {
              this._paneViews[0].update();
          }
@@ -99,7 +132,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
-  const boxPrimitiveRef = useRef(null); // Ref for plugin
+  const boxPrimitiveRef = useRef(null); 
   const activeLinesRef = useRef([]);
 
   const isChartReady = useRef(false);
@@ -121,7 +154,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     return Math.floor(seconds / resolution) * resolution;
   }, []);
 
-  // ✅ THE GAP KILLER: Strict Data Processor
   const processCandles = useCallback((rawData, tf) => {
       if (!Array.isArray(rawData)) return [];
       return rawData
@@ -138,7 +170,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
           .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i); 
   }, [getCandleStartTime]);
 
-  // --- 1. INITIALIZE CHART ---
   useEffect(() => {
     if (!chartContainerRef.current) return;
 
@@ -155,7 +186,6 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
     
-    // Attach the Box Plugin
     const primitive = new BoxPrimitive();
     newSeries.attachPrimitive(primitive);
     boxPrimitiveRef.current = primitive;
@@ -234,31 +264,15 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     const renderLoop = () => {
       if (!isChartReady.current) return; 
 
-      // 1. Update Live Candle
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 
-      // 2. Render ALL Order Blocks
+      // 2. Feed zones to the BoxPrimitive
       if (visuals?.smc_zones && chartRef.current && candleSeriesRef.current && boxPrimitiveRef.current) {
-          const rawZones = visuals.smc_zones.map(z => {
-              // Ensure we have a valid time, fallback to recent if missing
-              let safeTime = z.time;
-              if (!safeTime && allDataRef.current.length > 10) {
-                  safeTime = allDataRef.current[allDataRef.current.length - 10].time;
-              }
-
-              return {
-                  time: safeTime, 
-                  top: z.top, bottom: z.bottom,
-                  color: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)',
-                  borderColor: z.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.8)' : 'rgba(38, 166, 154, 0.8)'
-              };
-          });
-          
-          boxPrimitiveRef.current.setData(rawZones, candleSeriesRef.current, chartRef.current.timeScale());
+          boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, chartRef.current.timeScale());
       }
 
       animationFrameId = requestAnimationFrame(renderLoop);
