@@ -96,11 +96,11 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 UPGRADED SMC ENGINE: EXTRACTS ZONES + BOS LINES
+# 🧠 UPGRADED SMC ENGINE: TRUE STRUCTURAL BOS & FVG FILTER
 # =================================================================
 def detect_smc_structures(df):
     zones = []
-    lines = [] # 👈 NEW: Array to hold Break of Structure lines
+    lines = [] 
     try:
         if 'Date' in df.columns:
             dates = df['Date'].values
@@ -129,18 +129,32 @@ def detect_smc_structures(df):
                 ob_idx = ob_idx - 1 
                 
             if ob_idx + 3 >= len(highs): continue 
+
+            # 🎯 FIND PREVIOUS STRUCTURAL SWING LOW (The level to break)
+            prior_lows = [l for l in swing_lows if l < ob_idx]
+            if not prior_lows: continue
+            target_low_idx = prior_lows[-1]
+            bos_level = lows[target_low_idx]
             
             subsequent_lows = lows[ob_idx+1:]
             if len(subsequent_lows) == 0: continue
 
-            if np.min(subsequent_lows) < lows[ob_idx]: # Break of Structure
+            # If the move drops below the previous structural Swing Low = True BOS
+            if np.min(subsequent_lows) < bos_level: 
                 
-                # 🛡️ STRICT FILTER: Must have a Bearish Fair Value Gap (FVG) AND massive momentum
+                # Find exactly which candle broke the structure
+                break_idx = None
+                for i in range(ob_idx + 1, len(lows)):
+                    if lows[i] < bos_level:
+                        break_idx = i
+                        break
+
+                # 🛡️ FVG + Momentum Filter
                 has_fvg = highs[ob_idx+2] < lows[ob_idx]
                 has_momentum = (highs[ob_idx] - closes[ob_idx+2]) > atr[ob_idx]
                 
                 if not (has_fvg and has_momentum):
-                    continue # Discard weak/fake Order Blocks
+                    continue 
                 
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
@@ -149,27 +163,21 @@ def detect_smc_structures(df):
                 is_tested = False
                 mitigated_time = None
                 
-                # 🛑 MITIGATION TRACKER: Find exactly when it was hit
+                # 🛑 MITIGATION TRACKER
                 for future_idx in range(ob_idx + 2, len(highs)):
                     if highs[future_idx] >= ob_bottom:
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD BOS LINE COORDINATES
-                break_idx = None
-                for i in range(ob_idx + 1, len(lows)):
-                    if lows[i] < lows[ob_idx]:
-                        break_idx = i
-                        break
-                
+                # 🛑 RECORD TRUE STRUCTURAL BOS LINE
                 if break_idx:
                     lines.append({
-                        "level": float(lows[ob_idx]),
-                        "start_time": int(dates[ob_idx]),
+                        "level": float(bos_level), # The previous swing low
+                        "start_time": int(dates[target_low_idx]),
                         "end_time": int(dates[break_idx]),
                         "type": "BOS",
-                        "color": "rgba(239, 83, 80, 0.8)" # Red BOS
+                        "color": "rgba(239, 83, 80, 0.8)" 
                     })
                 
                 zones.append({
@@ -192,17 +200,31 @@ def detect_smc_structures(df):
                 
             if ob_idx + 3 >= len(lows): continue 
             
+            # 🎯 FIND PREVIOUS STRUCTURAL SWING HIGH (The level to break)
+            prior_highs = [h for h in swing_highs if h < ob_idx]
+            if not prior_highs: continue
+            target_high_idx = prior_highs[-1]
+            bos_level = highs[target_high_idx]
+
             subsequent_highs = highs[ob_idx+1:]
             if len(subsequent_highs) == 0: continue
 
-            if np.max(subsequent_highs) > highs[ob_idx]: # Break of Structure
+            # If the move rallies above the previous structural Swing High = True BOS
+            if np.max(subsequent_highs) > bos_level: 
                 
-                # 🛡️ STRICT FILTER: Must have a Bullish Fair Value Gap (FVG) AND massive momentum
+                # Find exactly which candle broke the structure
+                break_idx = None
+                for i in range(ob_idx + 1, len(highs)):
+                    if highs[i] > bos_level:
+                        break_idx = i
+                        break
+
+                # 🛡️ FVG + Momentum Filter
                 has_fvg = lows[ob_idx+2] > highs[ob_idx]
                 has_momentum = (closes[ob_idx+2] - lows[ob_idx]) > atr[ob_idx]
                 
                 if not (has_fvg and has_momentum):
-                    continue # Discard weak/fake Order Blocks
+                    continue 
                 
                 ob_top = highs[ob_idx]
                 ob_bottom = lows[ob_idx]
@@ -211,27 +233,21 @@ def detect_smc_structures(df):
                 is_tested = False
                 mitigated_time = None
                 
-                # 🛑 MITIGATION TRACKER: Find exactly when it was hit
+                # 🛑 MITIGATION TRACKER
                 for future_idx in range(ob_idx + 2, len(lows)):
                     if lows[future_idx] <= ob_top:
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD BOS LINE COORDINATES
-                break_idx = None
-                for i in range(ob_idx + 1, len(highs)):
-                    if highs[i] > highs[ob_idx]:
-                        break_idx = i
-                        break
-                
+                # 🛑 RECORD TRUE STRUCTURAL BOS LINE
                 if break_idx:
                     lines.append({
-                        "level": float(highs[ob_idx]),
-                        "start_time": int(dates[ob_idx]),
+                        "level": float(bos_level), # The previous swing high
+                        "start_time": int(dates[target_high_idx]),
                         "end_time": int(dates[break_idx]),
                         "type": "BOS",
-                        "color": "rgba(38, 166, 154, 0.8)" # Green BOS
+                        "color": "rgba(38, 166, 154, 0.8)" 
                     })
                 
                 zones.append({
@@ -244,7 +260,7 @@ def detect_smc_structures(df):
                     "is_mitigated": is_tested
                 })
 
-        return {"zones": zones, "lines": lines} # 👈 NEW: Return Both
+        return {"zones": zones, "lines": lines} 
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
         return {"zones": [], "lines": []}
@@ -290,7 +306,6 @@ async def analyze(req: AnalysisRequest):
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
-        # 🛡️ THE 100% ACCURATE TREND FILTER
         ema_50 = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
         ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
         rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
@@ -303,12 +318,10 @@ async def analyze(req: AnalysisRequest):
         else:
             trend = "RANGING"
         
-        # UNPACK NEW SMC DICTIONARY
         smc_data = detect_smc_structures(df) 
         smc_zones = smc_data.get("zones", [])
         bos_lines = smc_data.get("lines", [])
         
-        # Sort ONLY unmitigated zones for trading logic
         bullish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BULL' and not z['is_mitigated'] and z['top'] < current_price], key=lambda x: current_price - x['top'])
         bearish_zones = sorted([z for z in smc_zones if z['type'] == 'OB_BEAR' and not z['is_mitigated'] and z['bottom'] > current_price], key=lambda x: x['bottom'] - current_price)
         
@@ -318,7 +331,6 @@ async def analyze(req: AnalysisRequest):
         sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.985
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
 
-        # 🎯 TRUE LIQUIDITY POOL DETECTOR (BSL / SSL)
         highs_arr = df['High'].values
         lows_arr = df['Low'].values
         
@@ -335,7 +347,6 @@ async def analyze(req: AnalysisRequest):
         else:
             sell_side_liquidity = float(np.min(lows_arr[-50:-5]))
 
-        # 🚨 LIQUIDITY SWEEP
         recent_candles = df.tail(3)
         liquidity_sweep_bullish = False
         liquidity_sweep_bearish = False
@@ -350,7 +361,6 @@ async def analyze(req: AnalysisRequest):
                 if c['High'] > nearest_res['top'] and c['Close'] < nearest_res['top']:
                     liquidity_sweep_bearish = True
 
-        # 📰 FUNDAMENTALS
         news_bias = "NEUTRAL"
         news_string = "No recent impactful news data."
         
@@ -366,9 +376,6 @@ async def analyze(req: AnalysisRequest):
                 news_bias = "BULLISH_GOLD"
                 news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast}). Weak USD fuels Gold."
 
-        # =========================================================
-        # 🧠 PURE SMC CALCULATOR
-        # =========================================================
         signal = "NEUTRAL"
         confidence = 0
         strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
@@ -458,7 +465,7 @@ async def analyze(req: AnalysisRequest):
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
                 "smc_zones": smc_zones, 
-                "bos_lines": bos_lines # 👈 NEW: Sends BOS lines to React
+                "bos_lines": bos_lines 
             },
             "tradeSetup": trade_setup if confidence >= 60 else None
         }
