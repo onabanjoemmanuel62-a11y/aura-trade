@@ -280,14 +280,28 @@ async def analyze(req: AnalysisRequest):
         nearest_supp = bullish_zones[0] if bullish_zones else None
         nearest_res = bearish_zones[0] if bearish_zones else None
         
-        # 🎯 LIQUIDITY POOL DETECTOR (BSL / SSL)
-        recent_highs = df['High'].tail(50).values
-        recent_lows = df['Low'].tail(50).values
-        buy_side_liquidity = float(np.max(recent_highs))
-        sell_side_liquidity = float(np.min(recent_lows))
-
         sup_level = nearest_supp['top'] if nearest_supp else current_price * 0.985
         res_level = nearest_res['bottom'] if nearest_res else current_price * 1.015
+
+        # 🎯 TRUE LIQUIDITY POOL DETECTOR (BSL / SSL)
+        # We use scipy's argrelextrema to find CONFIRMED historical peaks, ignoring the live pumping price
+        highs_arr = df['High'].values
+        lows_arr = df['Low'].values
+        
+        conf_swing_highs = argrelextrema(highs_arr, np.greater, order=5)[0]
+        conf_swing_lows = argrelextrema(lows_arr, np.less, order=5)[0]
+        
+        if len(conf_swing_highs) > 0:
+            # Get the highest of the last 3 confirmed swing highs
+            buy_side_liquidity = float(np.max(highs_arr[conf_swing_highs[-3:]]))
+        else:
+            buy_side_liquidity = float(np.max(highs_arr[-50:-5])) # Fallback avoiding last 5 candles
+            
+        if len(conf_swing_lows) > 0:
+            # Get the lowest of the last 3 confirmed swing lows
+            sell_side_liquidity = float(np.min(lows_arr[conf_swing_lows[-3:]]))
+        else:
+            sell_side_liquidity = float(np.min(lows_arr[-50:-5]))
 
         # 🚨 LIQUIDITY SWEEP
         recent_candles = df.tail(3)
@@ -328,6 +342,7 @@ async def analyze(req: AnalysisRequest):
         strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
 
         if trend == "UPTREND" and nearest_supp:
+            # Print the Static Target
             strategy_logic.append(f"🎯 Target Liquidity (BSL): {round(buy_side_liquidity, 2)}")
             distance_to_ob = current_price - nearest_supp['top']
             
@@ -364,6 +379,7 @@ async def analyze(req: AnalysisRequest):
                 strategy_logic.append(f"Price is too far from support ({round(nearest_supp['top'], 2)}). Ignoring Sells against trend.")
 
         elif trend == "DOWNTREND" and nearest_res:
+            # Print the Static Target
             strategy_logic.append(f"🎯 Target Liquidity (SSL): {round(sell_side_liquidity, 2)}")
             distance_to_ob = nearest_res['bottom'] - current_price
             
