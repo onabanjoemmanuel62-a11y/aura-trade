@@ -157,10 +157,11 @@ class BOSRenderer {
                 ctx.stroke();
                 ctx.setLineDash([]);
 
-                // Draw the "BOS" text label
+                // 🔥 DYNAMIC TEXT LABEL: Extracts "CHoCH" or "BOS" from Python payload
+                const labelText = line.label || "BOS";
                 ctx.font = `bold ${13 * horizontalPixelRatio}px sans-serif`; // 🔥 Larger text
                 ctx.fillStyle = brightColor;
-                ctx.fillText("BOS", x2 + (20 * horizontalPixelRatio), y + (4 * horizontalPixelRatio));
+                ctx.fillText(labelText, x2 + (20 * horizontalPixelRatio), y + (4 * horizontalPixelRatio));
             });
         });
     }
@@ -182,7 +183,8 @@ class BOSPrimitive {
                 const x2 = timeScale.timeToCoordinate(line.end_time);
                 const y = series.priceToCoordinate(line.level);
                 if (x1 === null || x2 === null || y === null) return null;
-                return { x1, x2, y, color: line.color };
+                // 🔥 GRABS THE TYPE DIRECTLY FROM PYTHON
+                return { x1, x2, y, color: line.color, label: line.type || "BOS" };
             } catch(e) { return null; }
         }).filter(l => l !== null);
     }
