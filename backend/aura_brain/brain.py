@@ -110,7 +110,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 UPGRADED SMC ENGINE: TRUE STRUCTURAL BOS & FVG FILTER
+# 🧠 UPGRADED SMC ENGINE: TRUE STRUCTURAL BOS & CHOCH & FVG FILTER
 # =================================================================
 def detect_smc_structures(df):
     zones = []
@@ -150,10 +150,17 @@ def detect_smc_structures(df):
             target_low_idx = prior_lows[-1]
             bos_level = lows[target_low_idx]
             
+            # 🧠 CHOCH VS BOS LOGIC
+            line_label = "BOS"
+            if len(prior_lows) >= 2:
+                # If the broken low was HIGHER than the previous low, trend shifted = CHoCH
+                if lows[target_low_idx] >= lows[prior_lows[-2]]:
+                    line_label = "CHoCH"
+            
             subsequent_lows = lows[ob_idx+1:]
             if len(subsequent_lows) == 0: continue
 
-            # If the move drops below the previous structural Swing Low = True BOS
+            # If the move drops below the previous structural Swing Low = True Break
             if np.min(subsequent_lows) < bos_level: 
                 
                 # Find exactly which candle broke the structure
@@ -185,13 +192,13 @@ def detect_smc_structures(df):
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD TRUE STRUCTURAL BOS LINE
+                # 🛑 RECORD TRUE STRUCTURAL LINE
                 if break_idx:
                     lines.append({
                         "level": float(bos_level), # The previous swing low
                         "start_time": int(dates[target_low_idx]),
                         "end_time": int(dates[break_idx]),
-                        "type": "BOS",
+                        "type": line_label, # 👈 Sends CHoCH or BOS
                         "color": "rgba(239, 83, 80, 0.8)" 
                     })
                 
@@ -203,7 +210,7 @@ def detect_smc_structures(df):
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
                     "is_mitigated": is_tested,
-                    # 🧠 ML Features
+                    # ML Features
                     "fvg_size_pips": float(abs(lows[ob_idx] - highs[ob_idx+2])),
                     "momentum_ratio": float(momentum / atr[ob_idx])
                 })
@@ -224,10 +231,17 @@ def detect_smc_structures(df):
             target_high_idx = prior_highs[-1]
             bos_level = highs[target_high_idx]
 
+            # 🧠 CHOCH VS BOS LOGIC
+            line_label = "BOS"
+            if len(prior_highs) >= 2:
+                # If the broken high was LOWER than the previous high, trend shifted = CHoCH
+                if highs[target_high_idx] <= highs[prior_highs[-2]]:
+                    line_label = "CHoCH"
+
             subsequent_highs = highs[ob_idx+1:]
             if len(subsequent_highs) == 0: continue
 
-            # If the move rallies above the previous structural Swing High = True BOS
+            # If the move rallies above the previous structural Swing High = True Break
             if np.max(subsequent_highs) > bos_level: 
                 
                 # Find exactly which candle broke the structure
@@ -259,13 +273,13 @@ def detect_smc_structures(df):
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD TRUE STRUCTURAL BOS LINE
+                # 🛑 RECORD TRUE STRUCTURAL LINE
                 if break_idx:
                     lines.append({
                         "level": float(bos_level), # The previous swing high
                         "start_time": int(dates[target_high_idx]),
                         "end_time": int(dates[break_idx]),
-                        "type": "BOS",
+                        "type": line_label, # 👈 Sends CHoCH or BOS
                         "color": "rgba(38, 166, 154, 0.8)" 
                     })
                 
@@ -277,7 +291,7 @@ def detect_smc_structures(df):
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
                     "is_mitigated": is_tested,
-                    # 🧠 ML Features
+                    # ML Features
                     "fvg_size_pips": float(abs(lows[ob_idx+2] - highs[ob_idx])),
                     "momentum_ratio": float(momentum / atr[ob_idx])
                 })
