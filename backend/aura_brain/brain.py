@@ -16,6 +16,9 @@ from starlette.responses import Response
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator 
 
+# 🧠 MACHINE LEARNING LIBRARY
+import joblib
+
 # ⚙️ SETTINGS
 CSV_FILENAME = "1h.csv" 
 NODE_URL = "http://127.0.0.1:10000" 
@@ -24,6 +27,18 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
+
+# ==========================================
+# 🧠 LOAD THE MACHINE LEARNING MODEL
+# ==========================================
+base_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(base_dir, "aura_model.pkl")
+try:
+    ML_MODEL = joblib.load(model_path)
+    logger.info("🧠 ML Brain 'aura_model.pkl' successfully loaded!")
+except Exception as e:
+    ML_MODEL = None
+    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence. Error: {e}")
 
 def safe_float(value, default=0.0):
     try:
@@ -36,8 +51,7 @@ def safe_float(value, default=0.0):
 
 def load_csv_fallback():
     try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        file_path = os.path.join(base_dir, CSV_FILENAME)
+        file_path = os.path.join(os.path.dirname(base_dir), CSV_FILENAME)
 
         if not os.path.exists(file_path): return None
 
@@ -151,7 +165,8 @@ def detect_smc_structures(df):
 
                 # 🛡️ FVG + Momentum Filter
                 has_fvg = highs[ob_idx+2] < lows[ob_idx]
-                has_momentum = (highs[ob_idx] - closes[ob_idx+2]) > atr[ob_idx]
+                momentum = abs(highs[ob_idx] - closes[ob_idx+2])
+                has_momentum = momentum > atr[ob_idx]
                 
                 if not (has_fvg and has_momentum):
                     continue 
@@ -187,7 +202,10 @@ def detect_smc_structures(df):
                     "price": float(ob_bottom), 
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
-                    "is_mitigated": is_tested
+                    "is_mitigated": is_tested,
+                    # 🧠 ML Features
+                    "fvg_size_pips": float(abs(lows[ob_idx] - highs[ob_idx+2])),
+                    "momentum_ratio": float(momentum / atr[ob_idx])
                 })
 
         # B. BULLISH OB (Demand)
@@ -221,7 +239,8 @@ def detect_smc_structures(df):
 
                 # 🛡️ FVG + Momentum Filter
                 has_fvg = lows[ob_idx+2] > highs[ob_idx]
-                has_momentum = (closes[ob_idx+2] - lows[ob_idx]) > atr[ob_idx]
+                momentum = abs(closes[ob_idx+2] - lows[ob_idx])
+                has_momentum = momentum > atr[ob_idx]
                 
                 if not (has_fvg and has_momentum):
                     continue 
@@ -257,7 +276,10 @@ def detect_smc_structures(df):
                     "price": float(ob_top), 
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
-                    "is_mitigated": is_tested
+                    "is_mitigated": is_tested,
+                    # 🧠 ML Features
+                    "fvg_size_pips": float(abs(lows[ob_idx+2] - highs[ob_idx])),
+                    "momentum_ratio": float(momentum / atr[ob_idx])
                 })
 
         return {"zones": zones, "lines": lines} 
@@ -362,6 +384,7 @@ async def analyze(req: AnalysisRequest):
                     liquidity_sweep_bearish = True
 
         news_bias = "NEUTRAL"
+        news_val = 0
         news_string = "No recent impactful news data."
         
         if req.news_data:
@@ -371,13 +394,17 @@ async def analyze(req: AnalysisRequest):
             
             if actual > forecast:
                 news_bias = "BEARISH_GOLD"
+                news_val = -1
                 news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast}). Strong USD limits Gold."
             elif actual < forecast:
                 news_bias = "BULLISH_GOLD"
+                news_val = 1
                 news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast}). Weak USD fuels Gold."
 
         signal = "NEUTRAL"
         confidence = 0
+        base_conf = 0
+        target_zone = None
         strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
 
         if trend == "UPTREND" and nearest_supp:
@@ -386,6 +413,7 @@ async def analyze(req: AnalysisRequest):
             
             if distance_to_ob <= (atr * 3): 
                 signal = "BUY"
+                target_zone = nearest_supp
                 base_conf = 55
                 
                 if current_price <= nearest_supp['top'] and current_price >= nearest_supp['bottom']:
@@ -422,6 +450,7 @@ async def analyze(req: AnalysisRequest):
             
             if distance_to_ob <= (atr * 3):
                 signal = "SELL"
+                target_zone = nearest_res
                 base_conf = 55
                 
                 if current_price >= nearest_res['bottom'] and current_price <= nearest_res['top']:
@@ -453,6 +482,29 @@ async def analyze(req: AnalysisRequest):
                 strategy_logic.append(f"Price is too far from resistance ({round(nearest_res['bottom'], 2)}). Ignoring Buys against trend.")
         else:
             strategy_logic.append("No clear institutional setups in current range.")
+
+        # =========================================================
+        # 🧠 ML NEURAL PREDICTION OVERRIDE
+        # =========================================================
+        if signal != "NEUTRAL" and target_zone and ML_MODEL:
+            try:
+                features = pd.DataFrame([{
+                    'type': 1 if signal == "BUY" else 0,
+                    'fvg_size_pips': target_zone.get('fvg_size_pips', 0.0),
+                    'rsi_at_entry': rsi,
+                    'atr_at_entry': atr,
+                    'momentum_ratio': target_zone.get('momentum_ratio', 1.0),
+                    'news_bias': news_val
+                }])
+                
+                # Fetch ML Probability Score
+                prob = ML_MODEL.predict_proba(features)[0][1] 
+                confidence = int(prob * 100)
+                
+                strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Probability")
+            except Exception as e:
+                logger.error(f"ML Prediction Failed: {e}")
+                # Defaults back to the hardcoded base_conf calculated above
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 

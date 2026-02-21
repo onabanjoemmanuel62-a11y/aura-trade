@@ -3,6 +3,7 @@ uvicorn
 pandas
 numpy
 scikit-learn
+joblib
 scipy
 ta
 httpx
