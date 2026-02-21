@@ -70,7 +70,7 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 };
 
 // ==========================================
-// 🚀 MAIN CONTROLLER (UPDATED FOR SMC + NEWS)
+// 🚀 MAIN CONTROLLER (MULTI-TIMEFRAME MATRIX)
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
@@ -94,49 +94,52 @@ exports.analyzePattern = async (req, res) => {
         }
 
         // ------------------------------------
-        // PATH B: SMC BRAIN (The New Python Bridge)
+        // PATH B: SMC BRAIN (4H/1H Multi-Timeframe)
         // ------------------------------------
         
-        // 1. Fetch Fresh Data from MongoDB
-        const rawCandles = await Candle.find({ timeframe: timeframe || '1h' })
-                                       .sort({ time: -1 }) 
-                                       .limit(3000)        
-                                       .lean();            
+        // 1. Fetch Fresh Data from MongoDB for BOTH Timeframes simultaneously
+        console.log("⏱️ Fetching 1H and 4H Data Matrix from MongoDB...");
+        const [raw1HCandles, raw4HCandles] = await Promise.all([
+             Candle.find({ timeframe: '1h' }).sort({ time: -1 }).limit(3000).lean(),
+             Candle.find({ timeframe: '4h' }).sort({ time: -1 }).limit(1000).lean()
+        ]);
 
-        if (rawCandles.length < 100) {
-            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: ['Not enough data for SMC analysis.'] });
+        if (raw1HCandles.length < 100 || raw4HCandles.length < 50) {
+            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: ['Not enough data for Multi-Timeframe Matrix.'] });
         }
 
         // 2. Prepare Data for Python (Oldest -> Newest)
-        const cleanCandles = rawCandles.reverse().map(c => ({
-            open: c.open,
-            high: c.high,
-            low: c.low,
-            close: c.close,
+        const formatCandles = (candles) => candles.reverse().map(c => ({
+            open: c.open, 
+            high: c.high, 
+            low: c.low, 
+            close: c.close, 
             time: c.time, 
             volume: c.volume || 0
         }));
 
-        const currentPrice = cleanCandles[cleanCandles.length - 1].close;
+        const clean1HCandles = formatCandles(raw1HCandles);
+        const clean4HCandles = formatCandles(raw4HCandles);
+        const currentPrice = clean1HCandles[clean1HCandles.length - 1].close;
 
-        // 🆕 3. FETCH RECENT FUNDAMENTAL NEWS
-        // Grab the most recent high-impact USD news outcome to feed to Python
+        // 3. FETCH RECENT FUNDAMENTAL NEWS
         const latestNews = await NewsEvent.findOne({ 
             impact: 'High', 
             actual: { $ne: null }, 
             forecast: { $ne: null } 
         }).sort({ time: -1 }).lean();
 
-        // 4. Call the Python Brain
-        console.log(`📡 Contacting SMC Brain for ${cleanCandles.length} candles + News (${latestNews ? latestNews.event : 'None'})...`);
+        // 4. Call the Python Brain with BOTH arrays
+        console.log(`📡 Contacting SMC Brain: [1H: ${clean1HCandles.length}] + [4H: ${clean4HCandles.length}] + News...`);
         
         try {
             const pythonResponse = await axios.post(PYTHON_API_URL, {
-                timeframe: timeframe || '1h',
+                timeframe: timeframe || '1h', // Primary execution timeframe
                 currency: currency || 'XAUUSD',
                 current_price: currentPrice,
-                candles: cleanCandles,
-                news_data: latestNews // 👈 SENDING LIVE NEWS OUTCOME TO PYTHON
+                candles: clean1HCandles,          // 👈 Sends the 1H Execution Data
+                htf_candles: clean4HCandles,      // 👈 NEW: Sends the 4H Macro Data
+                news_data: latestNews 
             });
 
             // 5. Return the Smart Response
@@ -144,11 +147,10 @@ exports.analyzePattern = async (req, res) => {
 
         } catch (pyError) {
             console.error("⚠️ Python Brain Unreachable:", pyError.message);
-            // Fallback if Python is offline
             return res.json({
-                signal: 'NEUTRAL',
+                signal: 'NEUTRAL', 
                 confidence: 0,
-                reason: ['SMC Engine is offline. Please check Python service.'],
+                reason: ['SMC Engine is offline. Please check Python service.'], 
                 error: pyError.message
             });
         }

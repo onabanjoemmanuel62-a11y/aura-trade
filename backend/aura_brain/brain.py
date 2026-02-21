@@ -101,12 +101,13 @@ app = FastAPI(lifespan=lifespan)
 origins = ["*"] 
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# 📨 UPDATED REQUEST MODEL
+# 📨 UPDATED MATRIX REQUEST MODEL
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
     current_price: float = 0.0
     candles: Optional[List[Dict]] = None
+    htf_candles: Optional[List[Dict]] = None  # 👈 4H Matrix payload 
     news_data: Optional[Dict] = None
 
 # =================================================================
@@ -328,6 +329,7 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
 # --- 4. MAIN ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
+    # Process 1H Candles (Execution Timeframe)
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
         data_source = "LIVE_NODE_DATA"
@@ -342,17 +344,32 @@ async def analyze(req: AnalysisRequest):
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
+        # --- 1H MACRO ANALYSIS ---
         ema_50 = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
         ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
         rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
         atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
         
         if ema_50 > ema_200 and current_price > ema_200:
-            trend = "UPTREND"
+            ltf_trend = "UPTREND"
         elif ema_50 < ema_200 and current_price < ema_200:
-            trend = "DOWNTREND"
+            ltf_trend = "DOWNTREND"
         else:
-            trend = "RANGING"
+            ltf_trend = "RANGING"
+
+        # --- 4H MATRIX ANALYSIS ---
+        htf_trend = ltf_trend # Default to 1H trend if 4H data fails to load
+        if req.htf_candles and len(req.htf_candles) > 50:
+            df_htf = process_live_candles(req.htf_candles)
+            if df_htf is not None and not df_htf.empty:
+                htf_ema_50 = safe_float(EMAIndicator(close=df_htf['Close'], window=50).ema_indicator().iloc[-1], current_price)
+                htf_ema_200 = safe_float(EMAIndicator(close=df_htf['Close'], window=200).ema_indicator().iloc[-1], current_price)
+                if htf_ema_50 > htf_ema_200:
+                    htf_trend = "UPTREND"
+                elif htf_ema_50 < htf_ema_200:
+                    htf_trend = "DOWNTREND"
+                else:
+                    htf_trend = "RANGING"
         
         smc_data = detect_smc_structures(df) 
         smc_zones = smc_data.get("zones", [])
@@ -419,79 +436,88 @@ async def analyze(req: AnalysisRequest):
         confidence = 0
         base_conf = 0
         target_zone = None
-        strategy_logic = [f"Trend: {trend} (50/200 EMA)", news_string]
+        
+        # 🛡️ THE MULTI-TIMEFRAME MATRIX FILTER
+        strategy_logic = [f"Matrix [4H: {htf_trend}] | [1H: {ltf_trend}]", news_string]
+        trend_aligned = (ltf_trend == htf_trend)
 
-        if trend == "UPTREND" and nearest_supp:
+        if ltf_trend == "UPTREND" and nearest_supp:
             strategy_logic.append(f"🎯 Target Liquidity (BSL): {round(buy_side_liquidity, 2)}")
             distance_to_ob = current_price - nearest_supp['top']
             
             if distance_to_ob <= (atr * 3): 
-                signal = "BUY"
-                target_zone = nearest_supp
-                base_conf = 55
-                
-                if current_price <= nearest_supp['top'] and current_price >= nearest_supp['bottom']:
-                    base_conf += 20 
-                    strategy_logic.append("Premium Entry: Price inside High-Prob Bullish OB.")
-                elif distance_to_ob <= atr:
-                    base_conf += 10
-                    strategy_logic.append("Approaching Entry: Price near Bullish OB.")
+                if not trend_aligned and htf_trend == "DOWNTREND":
+                    strategy_logic.append("🚫 4H Matrix Block: Ignoring 1H Buy against 4H Bearish Macro.")
                 else:
-                    strategy_logic.append("Waiting for retracement into Order Block.")
+                    signal = "BUY"
+                    target_zone = nearest_supp
+                    base_conf = 55
                     
-                if liquidity_sweep_bullish:
-                    base_conf += 15
-                    strategy_logic.append("🚨 Bullish Stop Hunt Detected! Early sellers trapped.")
-                
-                if news_bias == "BULLISH_GOLD":
-                    base_conf += 15
-                    strategy_logic.append("🔥 News Aligns with Trend! Massive Bullish Confluence.")
-                elif news_bias == "BEARISH_GOLD":
-                    base_conf -= 25
-                    strategy_logic.append("⚠️ WARNING: Strong USD News contradicts technical setup.")
+                    if current_price <= nearest_supp['top'] and current_price >= nearest_supp['bottom']:
+                        base_conf += 20 
+                        strategy_logic.append("Premium Entry: Price inside High-Prob Bullish OB.")
+                    elif distance_to_ob <= atr:
+                        base_conf += 10
+                        strategy_logic.append("Approaching Entry: Price near Bullish OB.")
+                    else:
+                        strategy_logic.append("Waiting for retracement into Order Block.")
+                        
+                    if liquidity_sweep_bullish:
+                        base_conf += 15
+                        strategy_logic.append("🚨 Bullish Stop Hunt Detected! Early sellers trapped.")
+                    
+                    if news_bias == "BULLISH_GOLD":
+                        base_conf += 15
+                        strategy_logic.append("🔥 News Aligns with Trend! Massive Bullish Confluence.")
+                    elif news_bias == "BEARISH_GOLD":
+                        base_conf -= 25
+                        strategy_logic.append("⚠️ WARNING: Strong USD News contradicts technical setup.")
 
-                if rsi < 45:
-                    base_conf += 8
-                    strategy_logic.append("RSI favors an upward bounce.")
-                    
-                confidence = min(99, base_conf)
+                    if rsi < 45:
+                        base_conf += 8
+                        strategy_logic.append("RSI favors an upward bounce.")
+                        
+                    confidence = min(99, base_conf)
             else:
                 strategy_logic.append(f"Price is too far from support ({round(nearest_supp['top'], 2)}). Ignoring Sells against trend.")
 
-        elif trend == "DOWNTREND" and nearest_res:
+        elif ltf_trend == "DOWNTREND" and nearest_res:
             strategy_logic.append(f"🎯 Target Liquidity (SSL): {round(sell_side_liquidity, 2)}")
             distance_to_ob = nearest_res['bottom'] - current_price
             
             if distance_to_ob <= (atr * 3):
-                signal = "SELL"
-                target_zone = nearest_res
-                base_conf = 55
-                
-                if current_price >= nearest_res['bottom'] and current_price <= nearest_res['top']:
-                    base_conf += 20
-                    strategy_logic.append("Premium Entry: Price inside High-Prob Bearish OB.")
-                elif distance_to_ob <= atr:
-                    base_conf += 10
-                    strategy_logic.append("Approaching Entry: Price near Bearish OB.")
+                if not trend_aligned and htf_trend == "UPTREND":
+                    strategy_logic.append("🚫 4H Matrix Block: Ignoring 1H Sell against 4H Bullish Macro.")
                 else:
-                    strategy_logic.append("Waiting for rally into Order Block.")
+                    signal = "SELL"
+                    target_zone = nearest_res
+                    base_conf = 55
                     
-                if liquidity_sweep_bearish:
-                    base_conf += 15
-                    strategy_logic.append("🚨 Bearish Stop Hunt Detected! Early buyers trapped.")
-                    
-                if news_bias == "BEARISH_GOLD":
-                    base_conf += 15
-                    strategy_logic.append("🔥 News Aligns with Trend! Massive Bearish Confluence.")
-                elif news_bias == "BULLISH_GOLD":
-                    base_conf -= 25
-                    strategy_logic.append("⚠️ WARNING: Weak USD News contradicts technical setup.")
+                    if current_price >= nearest_res['bottom'] and current_price <= nearest_res['top']:
+                        base_conf += 20
+                        strategy_logic.append("Premium Entry: Price inside High-Prob Bearish OB.")
+                    elif distance_to_ob <= atr:
+                        base_conf += 10
+                        strategy_logic.append("Approaching Entry: Price near Bearish OB.")
+                    else:
+                        strategy_logic.append("Waiting for rally into Order Block.")
+                        
+                    if liquidity_sweep_bearish:
+                        base_conf += 15
+                        strategy_logic.append("🚨 Bearish Stop Hunt Detected! Early buyers trapped.")
+                        
+                    if news_bias == "BEARISH_GOLD":
+                        base_conf += 15
+                        strategy_logic.append("🔥 News Aligns with Trend! Massive Bearish Confluence.")
+                    elif news_bias == "BULLISH_GOLD":
+                        base_conf -= 25
+                        strategy_logic.append("⚠️ WARNING: Weak USD News contradicts technical setup.")
 
-                if rsi > 55:
-                    base_conf += 8
-                    strategy_logic.append("RSI favors a downward rejection.")
-                    
-                confidence = min(99, base_conf)
+                    if rsi > 55:
+                        base_conf += 8
+                        strategy_logic.append("RSI favors a downward rejection.")
+                        
+                    confidence = min(99, base_conf)
             else:
                 strategy_logic.append(f"Price is too far from resistance ({round(nearest_res['bottom'], 2)}). Ignoring Buys against trend.")
         else:
@@ -525,8 +551,8 @@ async def analyze(req: AnalysisRequest):
         return {
             "signal": signal,
             "confidence": int(confidence),
-            "trend": trend,
-            "pattern": f"Strict SMC + Fundamentals ({data_source})",
+            "trend": ltf_trend,
+            "pattern": f"Strict SMC + Matrix Align ({data_source})",
             "reasoning": strategy_logic,
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
             "visuals": {
