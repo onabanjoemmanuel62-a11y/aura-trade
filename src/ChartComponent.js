@@ -29,7 +29,7 @@ class BoxRenderer {
                 const yTop = zone.yTop * verticalPixelRatio;
                 const yBottom = zone.yBottom * verticalPixelRatio;
                 
-                // 🛑 GUARANTEED VISIBILITY: Ensure the box has a minimum width and engulfs the mitigating candle
+                // 🛑 GUARANTEED VISIBILITY
                 let width = x2 - x1;
                 if (zone.isMitigated) {
                     width = Math.max(width + (12 * horizontalPixelRatio), 20 * horizontalPixelRatio);
@@ -97,7 +97,6 @@ class BoxPrimitive {
             const isMitigated = zone.is_mitigated || false;
             let fillColor, borderColor;
 
-            // 🔥 MASSIVE BRIGHTNESS BOOST FOR ALL OBs
             if (isMitigated) {
                 fillColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.15)' : 'rgba(38, 166, 154, 0.15)';
                 borderColor = zone.type === 'OB_BEAR' ? 'rgba(239, 83, 80, 0.9)' : 'rgba(38, 166, 154, 0.9)';
@@ -144,22 +143,19 @@ class BOSRenderer {
                 const x2 = line.x2 * horizontalPixelRatio;
                 const y = line.y * verticalPixelRatio;
 
-                // Force solid 100% opacity color for the line
                 const brightColor = line.color.replace(/0\.\d+\)/, '1)');
 
-                // Draw the dashed line
                 ctx.beginPath();
                 ctx.moveTo(x1, y);
-                ctx.lineTo(x2 + (15 * horizontalPixelRatio), y); // Extend slightly past the break candle
+                ctx.lineTo(x2 + (15 * horizontalPixelRatio), y); 
                 ctx.strokeStyle = brightColor;
-                ctx.lineWidth = 2.5 * horizontalPixelRatio; // 🔥 Thicker line
-                ctx.setLineDash([8 * horizontalPixelRatio, 6 * horizontalPixelRatio]); // 🔥 Clearer dashes
+                ctx.lineWidth = 2.5 * horizontalPixelRatio; 
+                ctx.setLineDash([8 * horizontalPixelRatio, 6 * horizontalPixelRatio]); 
                 ctx.stroke();
                 ctx.setLineDash([]);
 
-                // 🔥 DYNAMIC TEXT LABEL: Extracts "CHoCH" or "BOS" from Python payload
                 const labelText = line.label || "BOS";
-                ctx.font = `bold ${13 * horizontalPixelRatio}px sans-serif`; // 🔥 Larger text
+                ctx.font = `bold ${13 * horizontalPixelRatio}px sans-serif`; 
                 ctx.fillStyle = brightColor;
                 ctx.fillText(labelText, x2 + (20 * horizontalPixelRatio), y + (4 * horizontalPixelRatio));
             });
@@ -183,7 +179,6 @@ class BOSPrimitive {
                 const x2 = timeScale.timeToCoordinate(line.end_time);
                 const y = series.priceToCoordinate(line.level);
                 if (x1 === null || x2 === null || y === null) return null;
-                // 🔥 GRABS THE TYPE DIRECTLY FROM PYTHON
                 return { x1, x2, y, color: line.color, label: line.type || "BOS" };
             } catch(e) { return null; }
         }).filter(l => l !== null);
@@ -215,28 +210,27 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const [newsData, setNewsData] = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
 
-  const getCandleStartTime = useCallback((timestamp, tf) => {
-    let seconds = Number(timestamp);
-    if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
-    let resolution = tf === '4h' ? 14400 : 3600;
-    return Math.floor(seconds / resolution) * resolution;
-  }, []);
-
-  const processCandles = useCallback((rawData, tf) => {
+  // 🔥 100% FIX: Removed all getCandleStartTime math. 
+  // Trust the API's database time completely.
+  const processCandles = useCallback((rawData) => {
       if (!Array.isArray(rawData)) return [];
       return rawData
-          .filter(d => d.open != null && d.close != null) 
-          .map(d => ({
-              time: getCandleStartTime(d.time, tf),
-              open: parseFloat(d.open),
-              high: parseFloat(d.high),
-              low: parseFloat(d.low),
-              close: parseFloat(d.close)
-          }))
+          .filter(d => d.open != null && d.close != null && d.time != null) 
+          .map(d => {
+              let seconds = Number(d.time);
+              if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
+              return {
+                  time: seconds,
+                  open: parseFloat(d.open),
+                  high: parseFloat(d.high),
+                  low: parseFloat(d.low),
+                  close: parseFloat(d.close)
+              };
+          })
           .filter(d => !isNaN(d.open) && !isNaN(d.close) && d.open > 0) 
           .sort((a, b) => a.time - b.time)
           .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i); 
-  }, [getCandleStartTime]);
+  }, []);
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -254,12 +248,10 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645'
     });
     
-    // Attach Order Block Plugin
     const boxPrimitive = new BoxPrimitive();
     newSeries.attachPrimitive(boxPrimitive);
     boxPrimitiveRef.current = boxPrimitive;
 
-    // Attach BOS Lines Plugin
     const bosPrimitive = new BOSPrimitive();
     newSeries.attachPrimitive(bosPrimitive);
     bosPrimitiveRef.current = bosPrimitive;
@@ -298,7 +290,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
               params: { limit: 500, before: oldestTime, timestamp: Date.now() }
           });
           
-          const newValidData = processCandles(res.data, timeframeRef.current);
+          const newValidData = processCandles(res.data);
           if (newValidData.length === 0) return;
 
           const combinedData = [...newValidData, ...allDataRef.current]
@@ -320,17 +312,22 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
             params: { limit: 1000, timestamp: Date.now() }
         });
         
-        const validData = processCandles(res.data, timeframe);
+        const validData = processCandles(res.data);
 
         if (isChartReady.current && candleSeriesRef.current) {
             allDataRef.current = validData;
             candleSeriesRef.current.setData(validData);
             if (validData.length > 0) currentBarRef.current = validData[validData.length - 1];
+
+            // 🔥 FORCE CHART TO RE-SCALE PROPERLY WHEN TIMEFRAME CHANGES
+            setTimeout(() => {
+                if (chartRef.current) chartRef.current.timeScale().fitContent();
+            }, 50);
         }
       } catch (err) {} 
     };
     loadInitialHistory();
-  }, [timeframe, getCandleStartTime, processCandles]);
+  }, [timeframe, processCandles]);
 
   // --- 🎨 RENDER VISUALS (OBS & BOS) ---
   useEffect(() => {
@@ -345,11 +342,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       }
 
       if (chartRef.current && candleSeriesRef.current) {
-          // Render OBs
           if (visuals?.smc_zones && boxPrimitiveRef.current) {
               boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, chartRef.current.timeScale());
           }
-          // Render BOS Lines
           if (visuals?.bos_lines && bosPrimitiveRef.current) {
               bosPrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, chartRef.current.timeScale());
           }
@@ -374,21 +369,25 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   useEffect(() => {
     if (newsData.length > 0 && isChartReady.current && candleSeriesRef.current) {
         try {
-            const markers = newsData.filter(n => n.time).map(n => ({
-                time: getCandleStartTime(n.time, timeframeRef.current),
-                position: 'aboveBar',
-                color: n.impact === 'High' ? '#ef5350' : '#ffa726',
-                shape: 'arrowDown',
-                text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
-                size: n.impact === 'High' ? 2 : 1,
-            })).sort((a, b) => a.time - b.time); 
+            const markers = newsData.filter(n => n.time).map(n => {
+                let seconds = Number(n.time);
+                if (seconds > 2000000000) seconds = Math.floor(seconds / 1000);
+                return {
+                    time: seconds,
+                    position: 'aboveBar',
+                    color: n.impact === 'High' ? '#ef5350' : '#ffa726',
+                    shape: 'arrowDown',
+                    text: n.impact === 'High' ? `🚩 ${n.event}` : '', 
+                    size: n.impact === 'High' ? 2 : 1,
+                };
+            }).sort((a, b) => a.time - b.time); 
             
             if (candleSeriesRef.current && typeof candleSeriesRef.current.setMarkers === 'function') {
                 candleSeriesRef.current.setMarkers(markers);
             }
         } catch (e) { }
     }
-  }, [newsData, timeframe, getCandleStartTime]);
+  }, [newsData]);
 
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
@@ -427,21 +426,23 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         
         if (isNaN(price) || price <= 0) return; 
         
-        const time = getCandleStartTime(data.time || Date.now(), timeframeRef.current);
+        // 🔥 FIX: Live socket ticks no longer create chaotic new candles. 
+        // We only update the current active database candle.
         const lastCandle = allDataRef.current[allDataRef.current.length - 1];
         
-        let updatedCandle;
-        if (lastCandle && time === lastCandle.time) {
-            updatedCandle = { ...lastCandle, high: Math.max(lastCandle.high, price), low: Math.min(lastCandle.low, price), close: price };
+        if (lastCandle) {
+            const updatedCandle = { 
+                ...lastCandle, 
+                high: Math.max(lastCandle.high, price), 
+                low: Math.min(lastCandle.low, price), 
+                close: price 
+            };
             allDataRef.current[allDataRef.current.length - 1] = updatedCandle;
-        } else {
-            updatedCandle = { time, open: price, high: price, low: price, close: price };
-            allDataRef.current.push(updatedCandle);
+            latestCandleRef.current = updatedCandle;
         }
-        latestCandleRef.current = updatedCandle;
     });
     return () => socket.disconnect();
-  }, [timeframe, getCandleStartTime]);
+  }, []); // Removed timeframe dependency so it doesn't refresh unncecessarily
 
   const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };
