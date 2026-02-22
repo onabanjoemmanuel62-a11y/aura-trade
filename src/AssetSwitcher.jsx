@@ -1,6 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
 
-// The full 8-man roster mapping database symbols to clean UI names
 const ASSETS = [
   { symbol: 'GC=F', name: 'Gold' },
   { symbol: 'EURUSD=X', name: 'EUR/USD' },
@@ -15,53 +14,70 @@ const ASSETS = [
 export default function AssetSwitcher({ selectedSymbol, onSymbolChange }) {
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef(null);
-
-  // Find the currently active asset to display its readable name
+  
   const activeAsset = ASSETS.find(a => a.symbol === selectedSymbol) || ASSETS[0];
 
-  // Close dropdown if the user clicks outside the tactical board
   useEffect(() => {
     const handleClickOutside = (event) => {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
-        setIsOpen(false);
-      }
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) setIsOpen(false);
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
   return (
-    <div className="relative inline-block text-left w-48" ref={dropdownRef}>
-      <button
+    <div ref={dropdownRef} style={{ position: 'relative', display: 'inline-block', width: '160px', zIndex: 100 }}>
+      {/* 🔘 THE MAIN BUTTON */}
+      <div
         onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center justify-between w-full px-4 py-2 text-sm font-medium text-white bg-slate-800 border border-slate-700 rounded-md shadow-sm hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        style={{
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          backgroundColor: '#1E222D', color: '#D9D9D9', padding: '10px 16px',
+          borderRadius: '8px', cursor: 'pointer', border: '1px solid #434651',
+          fontWeight: '600', fontSize: '14px', transition: 'all 0.2s ease',
+          boxShadow: '0 4px 6px rgba(0,0,0,0.3)'
+        }}
+        onMouseEnter={(e) => e.currentTarget.style.borderColor = '#26a69a'}
+        onMouseLeave={(e) => e.currentTarget.style.borderColor = '#434651'}
       >
         <span>{activeAsset.name}</span>
-        <svg className="w-4 h-4 ml-2 -mr-1 text-gray-400" viewBox="0 0 20 20" fill="currentColor">
-          <path fillRule="evenodd" d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z" clipRule="evenodd" />
-        </svg>
-      </button>
+        <span style={{ 
+            transform: isOpen ? 'rotate(180deg)' : 'rotate(0deg)', 
+            transition: 'transform 0.2s ease',
+            fontSize: '10px', color: '#9ca3af'
+        }}>▼</span>
+      </div>
 
+      {/* 🔽 THE DROPDOWN MENU */}
       {isOpen && (
-        <div className="absolute z-50 w-full mt-2 origin-top-right bg-slate-800 border border-slate-700 rounded-md shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none">
-          <div className="py-1">
-            {ASSETS.map((asset) => (
-              <button
-                key={asset.symbol}
-                onClick={() => {
-                  onSymbolChange(asset.symbol);
-                  setIsOpen(false); // Close the menu after substituting
-                }}
-                className={`block w-full px-4 py-2 text-sm text-left ${
-                  activeAsset.symbol === asset.symbol
-                    ? 'bg-blue-600 text-white' // Highlight the active player
-                    : 'text-gray-200 hover:bg-slate-700 hover:text-white'
-                }`}
-              >
-                {asset.name}
-              </button>
-            ))}
-          </div>
+        <div style={{
+          position: 'absolute', top: '110%', left: 0, right: 0,
+          backgroundColor: '#1E222D', border: '1px solid #434651',
+          borderRadius: '8px', overflow: 'hidden', boxShadow: '0 10px 25px rgba(0,0,0,0.7)'
+        }}>
+          {ASSETS.map((asset) => (
+            <div
+              key={asset.symbol}
+              onClick={() => {
+                onSymbolChange(asset.symbol);
+                setIsOpen(false);
+              }}
+              style={{
+                padding: '12px 16px', cursor: 'pointer', fontSize: '14px', fontWeight: '500',
+                color: activeAsset.symbol === asset.symbol ? '#26a69a' : '#D9D9D9',
+                backgroundColor: activeAsset.symbol === asset.symbol ? 'rgba(38, 166, 154, 0.1)' : 'transparent',
+                borderBottom: '1px solid #2B2F3A', transition: 'background 0.1s'
+              }}
+              onMouseEnter={(e) => {
+                  if (activeAsset.symbol !== asset.symbol) e.currentTarget.style.backgroundColor = '#2B2F3A';
+              }}
+              onMouseLeave={(e) => {
+                  if (activeAsset.symbol !== asset.symbol) e.currentTarget.style.backgroundColor = 'transparent';
+              }}
+            >
+              {asset.name}
+            </div>
+          ))}
         </div>
       )}
     </div>
