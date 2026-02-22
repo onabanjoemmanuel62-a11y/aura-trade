@@ -4,7 +4,7 @@ import ChartComponent from './ChartComponent';
 import SignalCard from './SignalCard';
 import HistoryTable from './HistoryTable';
 // Make sure the path matches where you saved it!
-import AssetSwitcher from './components/AssetSwitcher'; 
+import AssetSwitcher from './AssetSwitcher';
 import './App.css';
 
 // ⚠️ CRITICAL UPDATE: Use the URL from your Render Dashboard
