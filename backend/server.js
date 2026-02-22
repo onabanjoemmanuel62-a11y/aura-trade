@@ -21,6 +21,9 @@ const newsRoutes = require('./routes/newsRoutes');
 // 👈 CRITICAL FIX: Import the midfield controller that gathers candle data
 const analysisController = require('./controllers/analysisController'); 
 
+// 🤖 NEW: Import the Telegram Sniper Bot
+const { startTelegramBot } = require('./scripts/telegramBot');
+
 try {
   dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
   console.log('🌍 DNS configured to bypass ISP');
@@ -270,6 +273,9 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Node.js Server running on port ${PORT}`);
   console.log(`🔌 Socket.io initialized`);
   console.log(`🧠 AI Matrix midwife active via AnalysisController`);
+  
+  // 🤖 NEW: Wake up the Telegram Bot Background Worker
+  startTelegramBot(); 
 });
 
 module.exports = { app, server, io };
