@@ -18,6 +18,9 @@ const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
 const newsRoutes = require('./routes/newsRoutes');
 
+// 👈 CRITICAL FIX: Import the midfield controller that gathers candle data
+const analysisController = require('./controllers/analysisController'); 
+
 try {
   dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
   console.log('🌍 DNS configured to bypass ISP');
@@ -75,17 +78,16 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 10000; 
-const BRAIN_URL = 'http://127.0.0.1:8000';
 
 // 🏆 THE SQUAD: Gold + 7 Forex Majors (Yahoo Finance Tickers)
 const ASSETS = [
   'GC=F',      // Gold
   'EURUSD=X',  // EUR/USD
   'GBPUSD=X',  // GBP/USD
-  'JPY=X',     // USD/JPY (Yahoo uses JPY=X)
+  'JPY=X',     // USD/JPY
   'AUDUSD=X',  // AUD/USD
-  'CAD=X',     // USD/CAD (Yahoo uses CAD=X)
-  'CHF=X',     // USD/CHF (Yahoo uses CHF=X)
+  'CAD=X',     // USD/CAD
+  'CHF=X',     // USD/CHF
   'NZDUSD=X'   // NZD/USD
 ];
 
@@ -94,30 +96,9 @@ app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
 
-// ✅ PYTHON BRIDGE 
-app.post('/api/analyze', async (req, res) => {
-    try {
-        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
-        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
-        res.json(response.data);
-    } catch (error) {
-        console.error("🧠 Brain Connection Error:", error.message);
-        res.status(200).json({ 
-            signal: "HOLD", confidence: 0, trend: "NEUTRAL",
-            reason: ["AI Brain is initializing or unreachable..."],
-            keyLevels: { resistance: 0, support: 0, ema: 0 }
-        });
-    }
-});
-
-app.get('/health', async (req, res) => {
-    try {
-        const response = await axios.get(`${BRAIN_URL}/health`);
-        res.json({ node_status: "Healthy", python_brain: response.data });
-    } catch (error) {
-        res.status(503).json({ node_status: "Healthy", python_brain: "OFFLINE", error: error.message });
-    }
-});
+// 🛑 CRITICAL RE-ROUTE: 
+// Instead of a direct proxy, we now go through the controller to fetch 3,000+ candles!
+app.post('/api/analyze', analysisController.analyzePattern);
 
 app.get('/healthcheck', (req, res) => {
   res.status(200).json({ status: 'OK', service: 'node-backend', timestamp: new Date().toISOString() });
@@ -150,7 +131,6 @@ const getBucketTime = (timestamp, timeframe) => {
   return timestamp;
 };
 
-// ✅ FIX: Added `symbol` parameter to handle multi-asset routing
 const handleNewTick = async (data, symbol) => {
   try {
     const weekendFlag = isMarketClosed(data.time);
@@ -158,21 +138,17 @@ const handleNewTick = async (data, symbol) => {
 
     const updatePromises = targetTimeframes.map(async (tf) => {
       const bucketTime = getBucketTime(data.time, tf);
-      // ✅ FIX: Query includes the symbol
       const query = { symbol: symbol, time: bucketTime, timeframe: tf };
       const update = {
         $max: { high: data.high },
         $min: { low: data.low },
         $set: { close: data.close, isWeekend: weekendFlag },
-        // ✅ FIX: Insert includes the symbol
         $setOnInsert: { symbol: symbol, open: data.open, time: bucketTime, timeframe: tf }
       };
       await Candle.findOneAndUpdate(query, update, { upsert: true, new: true });
     });
 
     await Promise.all(updatePromises);
-    
-    // ✅ FIX: Emit the symbol so the frontend knows who scored the update
     io.emit('price-update', { symbol, ...data });
 
   } catch (err) {
@@ -181,7 +157,7 @@ const handleNewTick = async (data, symbol) => {
 };
 
 // ==========================================
-// 🔄 AUTO-CATCH-UP (Fills gaps when server was off)
+// 🔄 AUTO-CATCH-UP
 // ==========================================
 const syncHistoricalData = async () => {
     console.log("🔄 AUTO-CATCH-UP: Patching missing candles for ALL assets...");
@@ -190,7 +166,6 @@ const syncHistoricalData = async () => {
         startDate.setDate(startDate.getDate() - 7);
         const period1 = startDate.toISOString().split('T')[0];
 
-        // ✅ FIX: Loop through the entire squad
         for (const symbol of ASSETS) {
             try {
                 const result = await yahooFinance.chart(symbol, { period1, interval: '1h' });
@@ -206,13 +181,11 @@ const syncHistoricalData = async () => {
 
                         return {
                             updateOne: {
-                                // ✅ FIX: Added symbol to DB filter
                                 filter: { symbol: symbol, time: bucketTime, timeframe: tf },
                                 update: {
                                     $max: { high: candle.high },
                                     $min: { low: candle.low },
                                     $set: { close: candle.close, isWeekend: isMarketClosed(timeInSeconds) },
-                                    // ✅ FIX: Added symbol to insert payload
                                     $setOnInsert: { symbol: symbol, open: candle.open, time: bucketTime, timeframe: tf }
                                 },
                                 upsert: true
@@ -235,7 +208,7 @@ const syncHistoricalData = async () => {
 };
 
 // ==========================================
-// 🛡️ LIVE PRICE FEED (Yahoo Finance Polling)
+// 🛡️ LIVE PRICE FEED
 // ==========================================
 const startLivePriceFeed = () => {
     console.log(`🔌 Starting Live Yahoo Finance Feed for 8 Assets...`);
@@ -245,7 +218,6 @@ const startLivePriceFeed = () => {
         startDate.setDate(startDate.getDate() - 1);
         const period1 = startDate.toISOString().split('T')[0];
 
-        // ✅ FIX: Map through the assets and fetch them concurrently but safely
         const fetchPromises = ASSETS.map(async (symbol) => {
             try {
                 const result = await yahooFinance.chart(symbol, { period1, interval: '1m' });
@@ -264,7 +236,6 @@ const startLivePriceFeed = () => {
                         close: latest.close,
                     };
 
-                    // ✅ FIX: Pass the symbol to the handler
                     await handleNewTick(candlePayload, symbol);
                 }
             } catch (error) {
@@ -272,19 +243,15 @@ const startLivePriceFeed = () => {
             }
         });
 
-        // Promise.allSettled ensures one failed ticker doesn't crash the loop for the others
         await Promise.allSettled(fetchPromises);
 
-    }, 30000); // 30 second updates
+    }, 30000); 
 };
 
-// ==========================================
-// 🕒 STARTUP & AUTOMATION RUNNERS
-// ==========================================
 const initializeDataEngines = async () => {
-    await syncHistoricalData(); // 1. Patch holes for all pairs
-    startLivePriceFeed();       // 2. Start real-time feed for all pairs
-    fetchLiveNews();            // 3. Fetch initial news
+    await syncHistoricalData(); 
+    startLivePriceFeed();       
+    fetchLiveNews();            
 };
 
 initializeDataEngines();
@@ -292,24 +259,17 @@ initializeDataEngines();
 cron.schedule('0 */4 * * *', () => syncHistoricalData());
 cron.schedule('0 */6 * * *', () => fetchLiveNews());     
 
-// ==========================================
-// 💓 KEEP ALIVE PING
-// ==========================================
 if (process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL) {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL || 'https://aura-trade.onrender.com';
   setInterval(() => {
-    axios.get(`${RENDER_URL}/healthcheck`)
-      .catch(() => {});
+    axios.get(`${RENDER_URL}/healthcheck`).catch(() => {});
   }, 300000); 
 }
 
-// ==========================================
-// 🚀 START SERVER
-// ==========================================
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Node.js Server running on port ${PORT}`);
   console.log(`🔌 Socket.io initialized`);
-  console.log(`🧠 Ready to receive requests from Python gateway`);
+  console.log(`🧠 AI Matrix midwife active via AnalysisController`);
 });
 
 module.exports = { app, server, io };
