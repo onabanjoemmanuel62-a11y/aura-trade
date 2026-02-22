@@ -52,9 +52,7 @@ def safe_float(value, default=0.0):
 def load_csv_fallback():
     try:
         file_path = os.path.join(os.path.dirname(base_dir), CSV_FILENAME)
-
         if not os.path.exists(file_path): return None
-
         try:
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',')
@@ -97,25 +95,23 @@ async def lifespan(app: FastAPI):
     MARKET_MEMORY["df"] = None
 
 app = FastAPI(lifespan=lifespan)
-
 origins = ["*"] 
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# 📨 UPDATED MATRIX REQUEST MODEL
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
     current_price: float = 0.0
     candles: Optional[List[Dict]] = None
-    htf_candles: Optional[List[Dict]] = None  # 👈 4H Matrix payload 
+    htf_candles: Optional[List[Dict]] = None  
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 UPGRADED SMC ENGINE: TRUE STRUCTURAL BOS & CHOCH & FVG FILTER
+# 🧠 UPGRADED SMC ENGINE: ALGORITHMIC NOISE REDUCTION
 # =================================================================
 def detect_smc_structures(df):
     zones = []
-    lines = [] 
+    raw_lines = [] 
     try:
         if 'Date' in df.columns:
             dates = df['Date'].values
@@ -127,7 +123,6 @@ def detect_smc_structures(df):
         highs = df['High'].values
         lows = df['Low'].values
         
-        # Calculate True Range for strict momentum threshold
         tr = np.maximum(highs - lows, np.abs(highs - np.roll(closes, 1)))
         atr = pd.Series(tr).rolling(14).mean().bfill().values
 
@@ -135,43 +130,34 @@ def detect_smc_structures(df):
         swing_highs = argrelextrema(highs, np.greater, order=swing_period)[0]
         swing_lows = argrelextrema(lows, np.less, order=swing_period)[0]
 
-        # A. BEARISH OB (Supply)
+        # --- A. BEARISH OB (Supply) ---
         for idx in swing_highs[-40:]: 
             ob_idx = idx
-            
-            # SMC RULE: Find the true institutional buy-to-sell candle.
             if closes[ob_idx] < opens[ob_idx] and ob_idx > 0 and closes[ob_idx-1] > opens[ob_idx-1]:
                 ob_idx = ob_idx - 1 
                 
             if ob_idx + 3 >= len(highs): continue 
 
-            # 🎯 FIND PREVIOUS STRUCTURAL SWING LOW (The level to break)
             prior_lows = [l for l in swing_lows if l < ob_idx]
             if not prior_lows: continue
             target_low_idx = prior_lows[-1]
             bos_level = lows[target_low_idx]
             
-            # 🧠 CHOCH VS BOS LOGIC
             line_label = "BOS"
             if len(prior_lows) >= 2:
-                # If the broken low was HIGHER than the previous low, trend shifted = CHoCH
                 if lows[target_low_idx] >= lows[prior_lows[-2]]:
                     line_label = "CHoCH"
             
             subsequent_lows = lows[ob_idx+1:]
             if len(subsequent_lows) == 0: continue
 
-            # If the move drops below the previous structural Swing Low = True Break
             if np.min(subsequent_lows) < bos_level: 
-                
-                # Find exactly which candle broke the structure
                 break_idx = None
                 for i in range(ob_idx + 1, len(lows)):
                     if lows[i] < bos_level:
                         break_idx = i
                         break
 
-                # 🛡️ FVG + Momentum Filter
                 has_fvg = highs[ob_idx+2] < lows[ob_idx]
                 momentum = abs(highs[ob_idx] - closes[ob_idx+2])
                 has_momentum = momentum > atr[ob_idx]
@@ -186,20 +172,22 @@ def detect_smc_structures(df):
                 is_tested = False
                 mitigated_time = None
                 
-                # 🛑 MITIGATION TRACKER
                 for future_idx in range(ob_idx + 2, len(highs)):
                     if highs[future_idx] >= ob_bottom:
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD TRUE STRUCTURAL LINE
+                # 🛑 RULE 1: TRUNCATE MITIGATED ZONES (Don't append if it was heavily violated)
+                if is_tested and (highs[-1] > ob_top): 
+                    continue # It's fully destroyed, ignore it.
+
                 if break_idx:
-                    lines.append({
-                        "level": float(bos_level), # The previous swing low
+                    raw_lines.append({
+                        "level": float(bos_level),
                         "start_time": int(dates[target_low_idx]),
                         "end_time": int(dates[break_idx]),
-                        "type": line_label, # 👈 Sends CHoCH or BOS
+                        "type": line_label, 
                         "color": "rgba(239, 83, 80, 0.8)" 
                     })
                 
@@ -211,48 +199,38 @@ def detect_smc_structures(df):
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
                     "is_mitigated": is_tested,
-                    # ML Features
                     "fvg_size_pips": float(abs(lows[ob_idx] - highs[ob_idx+2])),
                     "momentum_ratio": float(momentum / atr[ob_idx])
                 })
 
-        # B. BULLISH OB (Demand)
+        # --- B. BULLISH OB (Demand) ---
         for idx in swing_lows[-40:]:
             ob_idx = idx
-            
-            # SMC RULE: Find the true institutional sell-to-buy candle.
             if closes[ob_idx] > opens[ob_idx] and ob_idx > 0 and closes[ob_idx-1] < opens[ob_idx-1]:
                 ob_idx = ob_idx - 1 
                 
             if ob_idx + 3 >= len(lows): continue 
             
-            # 🎯 FIND PREVIOUS STRUCTURAL SWING HIGH (The level to break)
             prior_highs = [h for h in swing_highs if h < ob_idx]
             if not prior_highs: continue
             target_high_idx = prior_highs[-1]
             bos_level = highs[target_high_idx]
 
-            # 🧠 CHOCH VS BOS LOGIC
             line_label = "BOS"
             if len(prior_highs) >= 2:
-                # If the broken high was LOWER than the previous high, trend shifted = CHoCH
                 if highs[target_high_idx] <= highs[prior_highs[-2]]:
                     line_label = "CHoCH"
 
             subsequent_highs = highs[ob_idx+1:]
             if len(subsequent_highs) == 0: continue
 
-            # If the move rallies above the previous structural Swing High = True Break
             if np.max(subsequent_highs) > bos_level: 
-                
-                # Find exactly which candle broke the structure
                 break_idx = None
                 for i in range(ob_idx + 1, len(highs)):
                     if highs[i] > bos_level:
                         break_idx = i
                         break
 
-                # 🛡️ FVG + Momentum Filter
                 has_fvg = lows[ob_idx+2] > highs[ob_idx]
                 momentum = abs(closes[ob_idx+2] - lows[ob_idx])
                 has_momentum = momentum > atr[ob_idx]
@@ -267,20 +245,22 @@ def detect_smc_structures(df):
                 is_tested = False
                 mitigated_time = None
                 
-                # 🛑 MITIGATION TRACKER
                 for future_idx in range(ob_idx + 2, len(lows)):
                     if lows[future_idx] <= ob_top:
                         is_tested = True
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RECORD TRUE STRUCTURAL LINE
+                # 🛑 RULE 1: TRUNCATE MITIGATED ZONES
+                if is_tested and (lows[-1] < ob_bottom): 
+                    continue # Fully destroyed
+
                 if break_idx:
-                    lines.append({
-                        "level": float(bos_level), # The previous swing high
+                    raw_lines.append({
+                        "level": float(bos_level),
                         "start_time": int(dates[target_high_idx]),
                         "end_time": int(dates[break_idx]),
-                        "type": line_label, # 👈 Sends CHoCH or BOS
+                        "type": line_label, 
                         "color": "rgba(38, 166, 154, 0.8)" 
                     })
                 
@@ -292,17 +272,30 @@ def detect_smc_structures(df):
                     "time": int(ob_time),
                     "mitigated_time": int(mitigated_time) if is_tested else None,
                     "is_mitigated": is_tested,
-                    # ML Features
                     "fvg_size_pips": float(abs(lows[ob_idx+2] - highs[ob_idx])),
                     "momentum_ratio": float(momentum / atr[ob_idx])
                 })
 
-        return {"zones": zones, "lines": lines} 
+        # 🛑 RULE 2: THE RULE OF 2 (Pruning Old Data)
+        # Sort by time (newest first) and only keep the 2 most recent valid zones for each direction
+        bull_zones = sorted([z for z in zones if z['type'] == 'OB_BULL'], key=lambda x: x['time'], reverse=True)[:2]
+        bear_zones = sorted([z for z in zones if z['type'] == 'OB_BEAR'], key=lambda x: x['time'], reverse=True)[:2]
+        clean_zones = bull_zones + bear_zones
+
+        # 🛑 RULE 3: DEDUPLICATE BOS/CHOCH LINES
+        clean_lines = []
+        seen_levels = set()
+        for line in reversed(raw_lines): # Iterate newest to oldest
+            level_rounded = round(line['level'], 1)
+            if level_rounded not in seen_levels:
+                clean_lines.append(line)
+                seen_levels.add(level_rounded)
+
+        return {"zones": clean_zones, "lines": clean_lines} 
     except Exception as e:
         logger.warning(f"SMC Error: {e}")
         return {"zones": [], "lines": []}
 
-# --- 3. TRADE CALCULATOR ---
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value):
     try:
         entry = current_price
@@ -326,10 +319,8 @@ def calculate_trade_levels(current_price, signal, support, resistance, atr_value
     except:
         return None
 
-# --- 4. MAIN ENDPOINT ---
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    # Process 1H Candles (Execution Timeframe)
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
         data_source = "LIVE_NODE_DATA"
@@ -344,7 +335,6 @@ async def analyze(req: AnalysisRequest):
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
-        # --- 1H MACRO ANALYSIS ---
         ema_50 = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
         ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
         rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
@@ -357,8 +347,7 @@ async def analyze(req: AnalysisRequest):
         else:
             ltf_trend = "RANGING"
 
-        # --- 4H MATRIX ANALYSIS ---
-        htf_trend = ltf_trend # Default to 1H trend if 4H data fails to load
+        htf_trend = ltf_trend 
         if req.htf_candles and len(req.htf_candles) > 50:
             df_htf = process_live_candles(req.htf_candles)
             if df_htf is not None and not df_htf.empty:
@@ -437,7 +426,6 @@ async def analyze(req: AnalysisRequest):
         base_conf = 0
         target_zone = None
         
-        # 🛡️ THE MULTI-TIMEFRAME MATRIX FILTER
         strategy_logic = [f"Matrix [4H: {htf_trend}] | [1H: {ltf_trend}]", news_string]
         trend_aligned = (ltf_trend == htf_trend)
 
@@ -537,14 +525,12 @@ async def analyze(req: AnalysisRequest):
                     'news_bias': news_val
                 }])
                 
-                # Fetch ML Probability Score
                 prob = ML_MODEL.predict_proba(features)[0][1] 
                 confidence = int(prob * 100)
                 
                 strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Probability")
             except Exception as e:
                 logger.error(f"ML Prediction Failed: {e}")
-                # Defaults back to the hardcoded base_conf calculated above
 
         trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr)
 
