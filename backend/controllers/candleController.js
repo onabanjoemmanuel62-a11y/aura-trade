@@ -1,7 +1,7 @@
 const Candle = require('../models/Candle');
 
 // @desc    Get candles with Cursor-Based Pagination
-// @route   GET /api/candles/:timeframe?limit=100&before=1738000000
+// @route   GET /api/candles/:timeframe?limit=100&before=1738000000&symbol=GC=F
 const getCandles = async (req, res) => {
   try {
     const { timeframe } = req.params;
@@ -10,13 +10,14 @@ const getCandles = async (req, res) => {
     // We default to 100 for speed, but allow the frontend to ask for more.
     const limit = parseInt(req.query.limit) || 100; 
     
-    // 2. CURSOR LOGIC (The "Before" Filter)
-    // If 'before' is missing, it behaves exactly like your old code (gets newest).
-    // If 'before' exists, it gets data OLDER than that timestamp.
+    // 2. CURSOR LOGIC & SYMBOL (The "Before" Filter)
     const before = req.query.before; 
+    
+    // 👈 NEW: Grab the symbol from the query, default to Gold so nothing breaks
+    const symbol = req.query.symbol || 'GC=F'; 
 
     // Build the Query Object
-    let query = { timeframe };
+    let query = { timeframe, symbol }; // 👈 We now strictly filter by symbol!
 
     if (before) {
       query.time = { $lt: parseInt(before) };

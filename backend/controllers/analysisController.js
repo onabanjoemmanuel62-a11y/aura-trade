@@ -32,7 +32,9 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
             if (deviation === 0) continue;
 
             const candleTime = news.time - (news.time % 3600);
-            const candle = await Candle.findOne({ time: candleTime, timeframe: '1h' });
+            
+            // 🛑 LEGACY SAFEGUARD: Kept this locked to Gold so historical news logic holds
+            const candle = await Candle.findOne({ time: candleTime, timeframe: '1h', symbol: 'GC=F' });
 
             if (!candle) continue;
 
@@ -74,7 +76,10 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 // ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
-        const { timeframe, eventName, currency } = req.body;
+        const { timeframe, eventName, currency, symbol } = req.body;
+
+        // 👈 NEW: Safely grab the symbol, default to Gold if the frontend forgets to send it
+        const targetSymbol = symbol || 'GC=F';
 
         // ------------------------------------
         // PATH A: NEWS EVENT ANALYSIS (Legacy Logic)
@@ -97,15 +102,16 @@ exports.analyzePattern = async (req, res) => {
         // PATH B: SMC BRAIN (4H/1H Multi-Timeframe)
         // ------------------------------------
         
-        // 1. Fetch Fresh Data from MongoDB for BOTH Timeframes simultaneously
-        console.log("⏱️ Fetching 1H and 4H Data Matrix from MongoDB...");
+        console.log(`⏱️ Fetching 1H and 4H Data Matrix for ${targetSymbol}...`);
+        
+        // 👈 NEW: Both queries strictly filter by the selected targetSymbol!
         const [raw1HCandles, raw4HCandles] = await Promise.all([
-             Candle.find({ timeframe: '1h' }).sort({ time: -1 }).limit(3000).lean(),
-             Candle.find({ timeframe: '4h' }).sort({ time: -1 }).limit(1000).lean()
+             Candle.find({ timeframe: '1h', symbol: targetSymbol }).sort({ time: -1 }).limit(3000).lean(),
+             Candle.find({ timeframe: '4h', symbol: targetSymbol }).sort({ time: -1 }).limit(1000).lean()
         ]);
 
         if (raw1HCandles.length < 100 || raw4HCandles.length < 50) {
-            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: ['Not enough data for Multi-Timeframe Matrix.'] });
+            return res.json({ signal: 'NEUTRAL', confidence: 0, reason: [`Not enough data for ${targetSymbol}.`] });
         }
 
         // 2. Prepare Data for Python (Oldest -> Newest)
@@ -130,15 +136,15 @@ exports.analyzePattern = async (req, res) => {
         }).sort({ time: -1 }).lean();
 
         // 4. Call the Python Brain with BOTH arrays
-        console.log(`📡 Contacting SMC Brain: [1H: ${clean1HCandles.length}] + [4H: ${clean4HCandles.length}] + News...`);
+        console.log(`📡 Contacting SMC Brain for ${targetSymbol}: [1H: ${clean1HCandles.length}] + [4H: ${clean4HCandles.length}] + News...`);
         
         try {
             const pythonResponse = await axios.post(PYTHON_API_URL, {
-                timeframe: timeframe || '1h', // Primary execution timeframe
-                currency: currency || 'XAUUSD',
+                timeframe: timeframe || '1h', 
+                currency: targetSymbol, // 👈 Send the explicit symbol to Python
                 current_price: currentPrice,
-                candles: clean1HCandles,          // 👈 Sends the 1H Execution Data
-                htf_candles: clean4HCandles,      // 👈 NEW: Sends the 4H Macro Data
+                candles: clean1HCandles,          
+                htf_candles: clean4HCandles,      
                 news_data: latestNews 
             });
 

@@ -190,7 +190,8 @@ class BOSPrimitive {
 // ==========================================
 // 🚀 MAIN REACT COMPONENT
 // ==========================================
-const ChartComponent = ({ levels, visuals, tradeSetup }) => {
+// ✅ FIX 1: Add the `symbol` prop so the chart knows who is playing
+const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef = useRef(null);
   const chartRef = useRef(null);
   const candleSeriesRef = useRef(null); 
@@ -204,11 +205,19 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
   const allDataRef = useRef([]);
   const isLoadingRef = useRef(false); 
   const latestCandleRef = useRef(null); 
+  
+  // Create a ref for the symbol so the socket listener always has the latest one without rebinding
+  const symbolRef = useRef(symbol);
 
   const [timeframe, setTimeframe] = useState('1h');
   const [connectionStatus, setConnectionStatus] = useState('Connecting...');
   const [newsData, setNewsData] = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
+
+  // Update the ref whenever the prop changes
+  useEffect(() => {
+      symbolRef.current = symbol;
+  }, [symbol]);
 
   // 🔥 100% FIX: Removed all getCandleStartTime math. 
   // Trust the API's database time completely.
@@ -286,8 +295,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       const oldestTime = allDataRef.current[0].time; 
       
       try {
+          // ✅ FIX 2: Pass the symbol to the backend API
           const res = await axios.get(`${API_URL}/api/candles/${timeframeRef.current}`, {
-              params: { limit: 500, before: oldestTime, timestamp: Date.now() }
+              params: { symbol: symbolRef.current, limit: 500, before: oldestTime, timestamp: Date.now() }
           });
           
           const newValidData = processCandles(res.data);
@@ -308,8 +318,9 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
     const loadInitialHistory = async () => {
       try {
+        // ✅ FIX 3: Fetch fresh history whenever the timeframe OR symbol changes
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
-            params: { limit: 1000, timestamp: Date.now() }
+            params: { symbol, limit: 1000, timestamp: Date.now() }
         });
         
         const validData = processCandles(res.data);
@@ -327,7 +338,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
       } catch (err) {} 
     };
     loadInitialHistory();
-  }, [timeframe, processCandles]);
+  }, [timeframe, symbol, processCandles]); // Added `symbol` to dependency array!
 
   // --- 🎨 RENDER VISUALS (OBS & BOS) ---
   useEffect(() => {
@@ -409,7 +420,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
 
     if (tradeSetup) {
         if (tradeSetup.take_profit) addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2); 
-        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);     
+        if (tradeSetup.stop_loss) addLine(tradeSetup.stop_loss, '#FF1744', 'SL 🛑', 0, 2);    
         if (tradeSetup.entry) addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);          
     }
     if (levels && levels.ema) addLine(levels.ema, '#FFD700', '200 EMA', false, 1);
@@ -420,14 +431,16 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socket.on('connect', () => setConnectionStatus('Connected'));
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
+    
     socket.on('price-update', (data) => {
+        // ✅ FIX 4: Only accept the pass if the ball is meant for our current player!
+        if (data.symbol !== symbolRef.current) return;
+
         if (!isChartReady.current || !currentBarRef.current) return; 
         const price = parseFloat(data.close || data.c);
         
         if (isNaN(price) || price <= 0) return; 
         
-        // 🔥 FIX: Live socket ticks no longer create chaotic new candles. 
-        // We only update the current active database candle.
         const lastCandle = allDataRef.current[allDataRef.current.length - 1];
         
         if (lastCandle) {
@@ -442,7 +455,7 @@ const ChartComponent = ({ levels, visuals, tradeSetup }) => {
         }
     });
     return () => socket.disconnect();
-  }, []); // Removed timeframe dependency so it doesn't refresh unncecessarily
+  }, []); 
 
   const handleTimeframeChange = (newTf) => { setTimeframe(newTf); timeframeRef.current = newTf; };
   const handleReset = () => { if(chartRef.current) chartRef.current.timeScale().scrollToPosition(0, false); };

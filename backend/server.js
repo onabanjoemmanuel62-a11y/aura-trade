@@ -18,9 +18,6 @@ const tradeRoutes = require('./routes/tradeRoutes');
 const candleRoutes = require('./routes/candleRoutes');
 const newsRoutes = require('./routes/newsRoutes');
 
-// 👈 NEW: Import your Analysis Controller
-const analysisController = require('./controllers/analysisController'); 
-
 try {
   dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
   console.log('🌍 DNS configured to bypass ISP');
@@ -80,13 +77,38 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 10000; 
 const BRAIN_URL = 'http://127.0.0.1:8000';
 
+// 🏆 THE SQUAD: Gold + 7 Forex Majors (Yahoo Finance Tickers)
+const ASSETS = [
+  'GC=F',      // Gold
+  'EURUSD=X',  // EUR/USD
+  'GBPUSD=X',  // GBP/USD
+  'JPY=X',     // USD/JPY (Yahoo uses JPY=X)
+  'AUDUSD=X',  // AUD/USD
+  'CAD=X',     // USD/CAD (Yahoo uses CAD=X)
+  'CHF=X',     // USD/CHF (Yahoo uses CHF=X)
+  'NZDUSD=X'   // NZD/USD
+];
+
 // 3. REGISTER NODE ROUTES
 app.use('/api/trades', tradeRoutes);
 app.use('/api/candles', candleRoutes);
 app.use('/api/news', newsRoutes);
 
-// ✅ THE FIX: Route the request through your controller so it fetches the 3000 candles!
-app.post('/api/analyze', analysisController.analyzePattern);
+// ✅ PYTHON BRIDGE 
+app.post('/api/analyze', async (req, res) => {
+    try {
+        console.log("🧠 Node: Forwarding analysis request to internal Python Brain...");
+        const response = await axios.post(`${BRAIN_URL}/api/analyze`, req.body);
+        res.json(response.data);
+    } catch (error) {
+        console.error("🧠 Brain Connection Error:", error.message);
+        res.status(200).json({ 
+            signal: "HOLD", confidence: 0, trend: "NEUTRAL",
+            reason: ["AI Brain is initializing or unreachable..."],
+            keyLevels: { resistance: 0, support: 0, ema: 0 }
+        });
+    }
+});
 
 app.get('/health', async (req, res) => {
     try {
@@ -128,28 +150,33 @@ const getBucketTime = (timestamp, timeframe) => {
   return timestamp;
 };
 
-const handleNewTick = async (data) => {
+// ✅ FIX: Added `symbol` parameter to handle multi-asset routing
+const handleNewTick = async (data, symbol) => {
   try {
     const weekendFlag = isMarketClosed(data.time);
     const targetTimeframes = ['1h', '4h'];
 
     const updatePromises = targetTimeframes.map(async (tf) => {
       const bucketTime = getBucketTime(data.time, tf);
-      const query = { time: bucketTime, timeframe: tf };
+      // ✅ FIX: Query includes the symbol
+      const query = { symbol: symbol, time: bucketTime, timeframe: tf };
       const update = {
         $max: { high: data.high },
         $min: { low: data.low },
         $set: { close: data.close, isWeekend: weekendFlag },
-        $setOnInsert: { open: data.open, time: bucketTime, timeframe: tf }
+        // ✅ FIX: Insert includes the symbol
+        $setOnInsert: { symbol: symbol, open: data.open, time: bucketTime, timeframe: tf }
       };
       await Candle.findOneAndUpdate(query, update, { upsert: true, new: true });
     });
 
     await Promise.all(updatePromises);
-    io.emit('price-update', data);
+    
+    // ✅ FIX: Emit the symbol so the frontend knows who scored the update
+    io.emit('price-update', { symbol, ...data });
 
   } catch (err) {
-    console.error("❌ DB SAVE FAILED: ", err.message);
+    console.error(`❌ DB SAVE FAILED for ${symbol}: `, err.message);
   }
 };
 
@@ -157,44 +184,53 @@ const handleNewTick = async (data) => {
 // 🔄 AUTO-CATCH-UP (Fills gaps when server was off)
 // ==========================================
 const syncHistoricalData = async () => {
-    console.log("🔄 AUTO-CATCH-UP: Patching missing candles from server downtime...");
+    console.log("🔄 AUTO-CATCH-UP: Patching missing candles for ALL assets...");
     try {
         const startDate = new Date();
         startDate.setDate(startDate.getDate() - 7);
         const period1 = startDate.toISOString().split('T')[0];
 
-        const result = await yahooFinance.chart('GC=F', { period1, interval: '1h' });
-        const rawData = result?.quotes || [];
+        // ✅ FIX: Loop through the entire squad
+        for (const symbol of ASSETS) {
+            try {
+                const result = await yahooFinance.chart(symbol, { period1, interval: '1h' });
+                const rawData = result?.quotes || [];
 
-        if (rawData.length === 0) return;
+                if (rawData.length === 0) continue;
 
-        for (const tf of ['1h', '4h']) {
-            const bulkOps = rawData.map(candle => {
-                if (!candle.date || !candle.close) return null;
-                const timeInSeconds = Math.floor(new Date(candle.date).getTime() / 1000);
-                const bucketTime = getBucketTime(timeInSeconds, tf);
+                for (const tf of ['1h', '4h']) {
+                    const bulkOps = rawData.map(candle => {
+                        if (!candle.date || !candle.close) return null;
+                        const timeInSeconds = Math.floor(new Date(candle.date).getTime() / 1000);
+                        const bucketTime = getBucketTime(timeInSeconds, tf);
 
-                return {
-                    updateOne: {
-                        filter: { time: bucketTime, timeframe: tf },
-                        update: {
-                            $max: { high: candle.high },
-                            $min: { low: candle.low },
-                            $set: { close: candle.close, isWeekend: isMarketClosed(timeInSeconds) },
-                            $setOnInsert: { open: candle.open, time: bucketTime, timeframe: tf }
-                        },
-                        upsert: true
+                        return {
+                            updateOne: {
+                                // ✅ FIX: Added symbol to DB filter
+                                filter: { symbol: symbol, time: bucketTime, timeframe: tf },
+                                update: {
+                                    $max: { high: candle.high },
+                                    $min: { low: candle.low },
+                                    $set: { close: candle.close, isWeekend: isMarketClosed(timeInSeconds) },
+                                    // ✅ FIX: Added symbol to insert payload
+                                    $setOnInsert: { symbol: symbol, open: candle.open, time: bucketTime, timeframe: tf }
+                                },
+                                upsert: true
+                            }
+                        };
+                    }).filter(Boolean);
+
+                    if (bulkOps.length > 0) {
+                        await Candle.bulkWrite(bulkOps);
                     }
-                };
-            }).filter(Boolean);
-
-            if (bulkOps.length > 0) {
-                await Candle.bulkWrite(bulkOps);
+                }
+                console.log(`✅ AUTO-CATCH-UP Complete for ${symbol}.`);
+            } catch (err) {
+                console.error(`⚠️ Catch-Up Failed for ${symbol}:`, err.message);
             }
         }
-        console.log("✅ AUTO-CATCH-UP Complete. Database gaps are patched!");
     } catch (err) {
-        console.error("❌ Catch-Up Failed:", err.message);
+        console.error("❌ Catch-Up Process Failed:", err.message);
     }
 };
 
@@ -202,35 +238,43 @@ const syncHistoricalData = async () => {
 // 🛡️ LIVE PRICE FEED (Yahoo Finance Polling)
 // ==========================================
 const startLivePriceFeed = () => {
-    console.log('🔌 Starting Live Yahoo Finance Feed (GC=F)...');
+    console.log(`🔌 Starting Live Yahoo Finance Feed for 8 Assets...`);
     
     setInterval(async () => {
-        try {
-            const startDate = new Date();
-            startDate.setDate(startDate.getDate() - 1);
-            const period1 = startDate.toISOString().split('T')[0];
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() - 1);
+        const period1 = startDate.toISOString().split('T')[0];
 
-            const result = await yahooFinance.chart('GC=F', { period1, interval: '1m' });
-            
-            if (result && result.quotes && result.quotes.length > 0) {
-                const latest = result.quotes[result.quotes.length - 1];
-                if (!latest.close) return; 
-
-                const timeInSeconds = Math.floor(new Date(latest.date).getTime() / 1000);
+        // ✅ FIX: Map through the assets and fetch them concurrently but safely
+        const fetchPromises = ASSETS.map(async (symbol) => {
+            try {
+                const result = await yahooFinance.chart(symbol, { period1, interval: '1m' });
                 
-                const candlePayload = {
-                    time: timeInSeconds,
-                    open: latest.open,
-                    high: latest.high,
-                    low: latest.low,
-                    close: latest.close,
-                };
+                if (result && result.quotes && result.quotes.length > 0) {
+                    const latest = result.quotes[result.quotes.length - 1];
+                    if (!latest.close) return; 
 
-                await handleNewTick(candlePayload);
+                    const timeInSeconds = Math.floor(new Date(latest.date).getTime() / 1000);
+                    
+                    const candlePayload = {
+                        time: timeInSeconds,
+                        open: latest.open,
+                        high: latest.high,
+                        low: latest.low,
+                        close: latest.close,
+                    };
+
+                    // ✅ FIX: Pass the symbol to the handler
+                    await handleNewTick(candlePayload, symbol);
+                }
+            } catch (error) {
+                console.error(`⚠️ Yahoo Feed slight delay for ${symbol}...`);
             }
-        } catch (error) {
-            console.error('⚠️ Yahoo Feed slight delay...', error.message);
-        }
+        });
+
+        // Promise.allSettled ensures one failed ticker doesn't crash the loop for the others
+        await Promise.allSettled(fetchPromises);
+
     }, 30000); // 30 second updates
 };
 
@@ -238,15 +282,15 @@ const startLivePriceFeed = () => {
 // 🕒 STARTUP & AUTOMATION RUNNERS
 // ==========================================
 const initializeDataEngines = async () => {
-    await syncHistoricalData(); // 1. Patch holes (No more schema errors)
-    startLivePriceFeed();       // 2. Start real-time feed
+    await syncHistoricalData(); // 1. Patch holes for all pairs
+    startLivePriceFeed();       // 2. Start real-time feed for all pairs
     fetchLiveNews();            // 3. Fetch initial news
 };
 
 initializeDataEngines();
 
 cron.schedule('0 */4 * * *', () => syncHistoricalData());
-cron.schedule('0 */6 * * *', () => fetchLiveNews());      
+cron.schedule('0 */6 * * *', () => fetchLiveNews());     
 
 // ==========================================
 // 💓 KEEP ALIVE PING
