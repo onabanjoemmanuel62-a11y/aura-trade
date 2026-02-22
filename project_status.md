@@ -1,5 +1,8 @@
+Gemini said
+Here is your officially updated project roadmap, reflecting the massive architectural cleanups we just completed. Phase 8 is entirely locked in, and the engine is now running with absolute precision.
+
 PROJECT: AuraTrade AI (Multi-Asset SMC System)
-STATUS: [Phase 8: Multi-Asset Evolution (Forex Majors) - COMPLETED]
+STATUS: [Phase 9: The Execution Pipeline - IN PROGRESS]
 1. TECH STACK (Confirmed)
 Frontend: React (Vercel) - Running Lightweight Charts v5 with Custom SMC BoxRenderer & dynamic BOSRenderer (CHoCH/BOS detection enabled).
 
@@ -41,7 +44,15 @@ How do we fix the 4H Chart looking like a broken barcode? [SOLVED]
 
 Solution: Removed the frontend time-bucketing math that was causing overlapping timezones to overwrite and delete candles. React now strictly trusts the database's epoch timestamps and forces fitContent() to automatically scale the view.
 
-4. MULTI-ASSET EVOLUTION (FOREX MAJORS)
+How do we fix "Algorithmic ADHD" (Chaotic overlapping chart visuals)? [SOLVED]
+
+Solution: Implemented Algorithmic Noise Reduction in Python. Applied the "Rule of 2" (only sending the two most recent zones), forcefully truncated fully violated zones, and built a deduplicator to merge overlapping CHoCH/BOS lines.
+
+How do we fix "Asset Lock" (Chart freezing on Gold when switching to EUR/USD)? [SOLVED]
+
+Solution: Applied a React "Nuclear Key Hack" in App.js and a state-wiping useEffect inside ChartComponent.js to physically destroy and rebuild the chart canvas the exact millisecond a new pair is selected.
+
+4. MULTI-ASSET EVOLUTION (FOREX MAJORS) - [COMPLETED]
 [x] Database Schema Upgrade: Updated MongoDB Candle model to include a symbol property, smoothly defaulting to 'GC=F' for backward compatibility.
 
 [x] Historical Data Fetcher: Successfully downloaded 720 days (~190,000 candles) of 1H and 4H historical data for Gold and all 7 Forex Majors.
@@ -50,4 +61,11 @@ Solution: Removed the frontend time-bucketing math that was causing overlapping 
 
 [x] Dynamic Live Feed: Updated server.js Live Loop to poll all 8 assets simultaneously using Promise.allSettled.
 
-[x] Frontend Asset Switcher: Built the AssetSwitcher.jsx dropdown in the React UI to let the user seamlessly switch the chart and AI analysis between different pairs.
+[x] Frontend Asset Switcher: Built the custom dropdown in the React UI to let the user seamlessly switch the chart and AI analysis between different pairs.
+
+5. CURRENT TASK: THE EXECUTION PIPELINE (PHASE 9)
+[ ] Decide on the primary notification/execution method.
+
+[ ] Build the background monitor to constantly check AI probability scores across all 8 assets.
+
+[ ] Implement secure routing (Telegram API or Broker Webhook) to push the final trade parameters (Entry, SL, TP).

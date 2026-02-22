@@ -178,9 +178,8 @@ def detect_smc_structures(df):
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RULE 1: TRUNCATE MITIGATED ZONES (Don't append if it was heavily violated)
                 if is_tested and (highs[-1] > ob_top): 
-                    continue # It's fully destroyed, ignore it.
+                    continue 
 
                 if break_idx:
                     raw_lines.append({
@@ -251,9 +250,8 @@ def detect_smc_structures(df):
                         mitigated_time = dates[future_idx]
                         break
 
-                # 🛑 RULE 1: TRUNCATE MITIGATED ZONES
                 if is_tested and (lows[-1] < ob_bottom): 
-                    continue # Fully destroyed
+                    continue 
 
                 if break_idx:
                     raw_lines.append({
@@ -276,16 +274,13 @@ def detect_smc_structures(df):
                     "momentum_ratio": float(momentum / atr[ob_idx])
                 })
 
-        # 🛑 RULE 2: THE RULE OF 2 (Pruning Old Data)
-        # Sort by time (newest first) and only keep the 2 most recent valid zones for each direction
         bull_zones = sorted([z for z in zones if z['type'] == 'OB_BULL'], key=lambda x: x['time'], reverse=True)[:2]
         bear_zones = sorted([z for z in zones if z['type'] == 'OB_BEAR'], key=lambda x: x['time'], reverse=True)[:2]
         clean_zones = bull_zones + bear_zones
 
-        # 🛑 RULE 3: DEDUPLICATE BOS/CHOCH LINES
         clean_lines = []
         seen_levels = set()
-        for line in reversed(raw_lines): # Iterate newest to oldest
+        for line in reversed(raw_lines): 
             level_rounded = round(line['level'], 1)
             if level_rounded not in seen_levels:
                 clean_lines.append(line)
@@ -426,8 +421,20 @@ async def analyze(req: AnalysisRequest):
         base_conf = 0
         target_zone = None
         
-        strategy_logic = [f"Matrix [4H: {htf_trend}] | [1H: {ltf_trend}]", news_string]
+        # 🔥 CRITICAL FIX: The clean Master Bias logic!
         trend_aligned = (ltf_trend == htf_trend)
+        master_bias = "NEUTRAL"
+        
+        if trend_aligned:
+            master_bias = ltf_trend
+        elif htf_trend == "UPTREND" and ltf_trend == "DOWNTREND":
+            master_bias = "PULLBACK (Waiting to Buy)"
+        elif htf_trend == "DOWNTREND" and ltf_trend == "UPTREND":
+            master_bias = "PULLBACK (Waiting to Sell)"
+        else:
+            master_bias = htf_trend
+
+        strategy_logic = [f"🧭 Master Bias: {master_bias}", news_string]
 
         if ltf_trend == "UPTREND" and nearest_supp:
             strategy_logic.append(f"🎯 Target Liquidity (BSL): {round(buy_side_liquidity, 2)}")
@@ -435,7 +442,7 @@ async def analyze(req: AnalysisRequest):
             
             if distance_to_ob <= (atr * 3): 
                 if not trend_aligned and htf_trend == "DOWNTREND":
-                    strategy_logic.append("🚫 4H Matrix Block: Ignoring 1H Buy against 4H Bearish Macro.")
+                    strategy_logic.append("🚫 Matrix Block: Ignoring 1H Buy against 4H Bearish Macro.")
                 else:
                     signal = "BUY"
                     target_zone = nearest_supp
@@ -475,7 +482,7 @@ async def analyze(req: AnalysisRequest):
             
             if distance_to_ob <= (atr * 3):
                 if not trend_aligned and htf_trend == "UPTREND":
-                    strategy_logic.append("🚫 4H Matrix Block: Ignoring 1H Sell against 4H Bullish Macro.")
+                    strategy_logic.append("🚫 Matrix Block: Ignoring 1H Sell against 4H Bullish Macro.")
                 else:
                     signal = "SELL"
                     target_zone = nearest_res
@@ -537,7 +544,7 @@ async def analyze(req: AnalysisRequest):
         return {
             "signal": signal,
             "confidence": int(confidence),
-            "trend": ltf_trend,
+            "trend": master_bias, # 👈 Outputs the clean Master Bias to the React UI
             "pattern": f"Strict SMC + Matrix Align ({data_source})",
             "reasoning": strategy_logic,
             "keyLevels": {"resistance": res_level, "support": sup_level, "ema": ema_200},
