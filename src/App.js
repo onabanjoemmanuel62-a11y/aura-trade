@@ -112,9 +112,10 @@ function App() {
           
           {/* Chart Area */}
           <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden', background: '#161A25' }}>
-            {/* 🛑 CRITICAL FIX: Passed 'currentSymbol' exactly as ChartComponent expects it */}
+            {/* 🛑 CRITICAL FIX: Add key to force re-render, and change prop name to match ChartComponent */}
             <ChartComponent 
-               currentSymbol={activeSymbol}
+               key={activeSymbol}
+               symbol={activeSymbol}
                levels={aiData?.keyLevels || { resistance: 0, support: 0, ema: 0 }} 
                visuals={aiData?.visuals || {}}
                tradeSetup={aiData?.tradeSetup} 
