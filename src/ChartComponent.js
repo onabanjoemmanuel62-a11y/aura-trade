@@ -214,9 +214,15 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const [newsData, setNewsData] = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
 
-  // Update the ref whenever the prop changes
+  // 🔥 THE CRITICAL FIX: Instantly WIPE the chart memory when the symbol changes!
   useEffect(() => {
       symbolRef.current = symbol;
+      
+      // If the chart is active, delete everything so Gold doesn't bleed into EUR/USD
+      if (candleSeriesRef.current) {
+          allDataRef.current = [];
+          candleSeriesRef.current.setData([]); 
+      }
   }, [symbol]);
 
   // 🔥 100% FIX: Removed all getCandleStartTime math. 
@@ -290,7 +296,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   }, []);
 
   const fetchOlderHistory = async () => {
+      // ✅ Safety Check: Don't fetch older history if we just wiped the chart
       if (isLoadingRef.current || !allDataRef.current.length) return;
+      
       isLoadingRef.current = true;
       const oldestTime = allDataRef.current[0].time; 
       
