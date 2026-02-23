@@ -38,7 +38,7 @@ try:
     logger.info("🧠 ML Brain 'aura_model.pkl' successfully loaded!")
 except Exception as e:
     ML_MODEL = None
-    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence.")
+    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence. Error: {e}")
 
 def safe_float(value, default=0.0):
     try:
@@ -107,7 +107,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V2 1H MMM ENGINE: TRUE PEAKS & PRECISE ORDER BLOCKS
+# 🧠 V3 TRUE MMM ENGINE: STRUCTURAL SWING COUNTING
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -117,6 +117,9 @@ def detect_mmm_cycle(df):
         opens = df['Open'].values
         dates = df['Date'].values if 'Date' in df.columns else df.index.values
 
+        atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
+        if atr == 0: atr = 0.001
+
         # 1. FIND TRUE WEEKLY PEAK ANCHOR (Lookback 120 candles / 5 days)
         lookback = 120
         if len(highs) < lookback: lookback = len(highs)
@@ -124,30 +127,57 @@ def detect_mmm_cycle(df):
         highest_idx = np.argmax(highs[-lookback:]) + (len(highs) - lookback)
         lowest_idx = np.argmin(lows[-lookback:]) + (len(lows) - lookback)
 
-        # The Peak that happened most recently is our active cycle
         if highest_idx > lowest_idx:
             cycle = "BEARISH"
             anchor_idx = highest_idx
             anchor_price = highs[anchor_idx]
-            max_excursion = anchor_price - np.min(lows[anchor_idx:])
         else:
             cycle = "BULLISH"
             anchor_idx = lowest_idx
             anchor_price = lows[anchor_idx]
-            max_excursion = np.max(highs[anchor_idx:]) - anchor_price
 
-        # 2. COUNT LEVELS BASED ON ATR
-        atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
-        if atr == 0: atr = 0.001
-        
-        # MMM typically pushes 2.5x to 3x ATR per level
-        current_level = min(3, math.floor(max_excursion / (atr * 2.5)) + 1)
+        # 2. STRUCTURAL LEVEL COUNTING (No more fake ATR distance math)
+        swing_order = 4
+        swing_h = argrelextrema(highs, np.greater, order=swing_order)[0]
+        swing_l = argrelextrema(lows, np.less, order=swing_order)[0]
 
-        # 3. IDENTIFY TRUE INSTITUTIONAL ORDER BLOCK
+        valid_pushes = 0
+        latest_pullback_idx = anchor_idx
+
+        if cycle == "BEARISH":
+            swings_since_peak = [l for l in swing_l if l > anchor_idx]
+            last_low = anchor_price
+            for idx in swings_since_peak:
+                # Must be a true structural push lower
+                if lows[idx] < last_low - (atr * 0.5): 
+                    valid_pushes += 1
+                    last_low = lows[idx]
+                    # Find the exact trap candle (lower high) where they pulled back before dropping
+                    pullbacks = [h for h in swing_h if anchor_idx < h < idx]
+                    if pullbacks: 
+                        latest_pullback_idx = pullbacks[-1]
+
+        else:
+            swings_since_peak = [h for h in swing_h if h > anchor_idx]
+            last_high = anchor_price
+            for idx in swings_since_peak:
+                # Must be a true structural push higher
+                if highs[idx] > last_high + (atr * 0.5): 
+                    valid_pushes += 1
+                    last_high = highs[idx]
+                    # Find the exact trap candle (higher low) where they pulled back before rallying
+                    pullbacks = [l for l in swing_l if anchor_idx < l < idx]
+                    if pullbacks: 
+                        latest_pullback_idx = pullbacks[-1]
+
+        # Max level is 3 (Exhaustion)
+        current_level = min(3, valid_pushes + 1)
+        if current_level < 1: current_level = 1
+
+        # 3. IDENTIFY TRUE INSTITUTIONAL ORDER BLOCK (At the exact pullback pivot)
         zones = []
         lines = [] 
         
-        # Draw the Peak Anchor Line
         lines.append({
             "level": float(anchor_price),
             "start_time": int(dates[anchor_idx]),
@@ -156,32 +186,20 @@ def detect_mmm_cycle(df):
             "color": "rgba(255, 215, 0, 0.8)" 
         })
 
-        if current_level < 3 and anchor_idx < len(closes) - 2:
-            # Find the largest impulsive momentum candle since the peak
-            bodies = np.abs(closes[anchor_idx:] - opens[anchor_idx:])
-            if len(bodies) > 0:
-                biggest_impulse_idx = anchor_idx + np.argmax(bodies)
-                
-                # The Order Block is the last opposite-colored candle BEFORE the impulse
-                ob_idx = biggest_impulse_idx - 1
-                while ob_idx > anchor_idx:
-                    if cycle == "BEARISH" and closes[ob_idx] >= opens[ob_idx]: # Bullish candle before drop
-                        break
-                    if cycle == "BULLISH" and closes[ob_idx] <= opens[ob_idx]: # Bearish candle before rally
-                        break
-                    ob_idx -= 1
-                    
-                if ob_idx >= anchor_idx:
-                    zones.append({
-                        "type": "OB_BEAR" if cycle == "BEARISH" else "OB_BULL", 
-                        "top": float(highs[ob_idx]),
-                        "bottom": float(lows[ob_idx]),
-                        "price": float(highs[ob_idx] if cycle == "BULLISH" else lows[ob_idx]),
-                        "time": int(dates[ob_idx]),
-                        "is_mitigated": False,
-                        "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
-                        "momentum_ratio": 2.0 
-                    })
+        if current_level < 3 and latest_pullback_idx > anchor_idx:
+            ob_idx = latest_pullback_idx
+            
+            # Wrap the exact trap candle at the latest structural pullback pivot
+            zones.append({
+                "type": "OB_BEAR" if cycle == "BEARISH" else "OB_BULL", 
+                "top": float(highs[ob_idx]),
+                "bottom": float(lows[ob_idx]),
+                "price": float(highs[ob_idx] if cycle == "BULLISH" else lows[ob_idx]),
+                "time": int(dates[ob_idx]),
+                "is_mitigated": False,
+                "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                "momentum_ratio": 2.0 
+            })
 
         return {
             "cycle": cycle,
