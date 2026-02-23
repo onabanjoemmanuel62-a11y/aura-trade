@@ -1,71 +1,39 @@
-Gemini said
-Here is your officially updated project roadmap, reflecting the massive architectural cleanups we just completed. Phase 8 is entirely locked in, and the engine is now running with absolute precision.
-
-PROJECT: AuraTrade AI (Multi-Asset SMC System)
-STATUS: [Phase 9: The Execution Pipeline - IN PROGRESS]
+PROJECT: AuraTrade AI (Multi-Asset MMM Evolution)
+STATUS: [Phase 9: The Execution Pipeline - COMPLETED]
 1. TECH STACK (Confirmed)
-Frontend: React (Vercel) - Running Lightweight Charts v5 with Custom SMC BoxRenderer & dynamic BOSRenderer (CHoCH/BOS detection enabled).
+Frontend: React (Vercel) - Transparent SMC/MMM Zone Rendering & "Nuclear Reset" on symbol switch.
 
-Backend Manager: Node.js/Express (Render) - Auto-Patching Yahoo Finance Live Feed + Multi-News Fetcher.
+Backend Manager: Node.js/Express (Render) - 8-Asset Live Feed + News Matrix.
 
-Logic Engine: Python (aura_brain/brain.py) - Strict SMC Engine powered by a live scikit-learn Machine Learning model (aura_model.pkl).
+Logic Engine: Python (aura_brain/brain.py) - 1H MMM Specialist (Transitioning from generic SMC).
 
-Database: MongoDB (Stores Continuous, Clean Candle Data & News)
+Alert System: Telegram Bot API - Specialized "Anti-Spam" Sniper Alerts.
 
-2. COMPLETED TASKS (Architecture, UI, and ML)
-[x] Solve "Split Brain": Python accepts live 3000-candle payloads from Node.js.
+Database: MongoDB - Stores 720 days of historical data for 8 assets.
 
-[x] Fix "Whitespace Gap": Upgraded React chart to strip closed-market hours for a continuous layout.
+2. COMPLETED TASKS (Architecture & Infrastructure)
+[x] Multi-Asset Live Loop: Node.js polls and saves 1m ticks for Gold + 7 Forex Majors every 30 seconds.
 
-[x] Institutional Trend Lock: AI uses 50/200 EMA to lock trading direction.
+[x] The "Nuclear" Switch: Frontend physically destroys and rebuilds charts on pair change to prevent data bleeding.
 
-[x] Strict FVG & Mitigation Filter: brain.py requires FVG + ATR displacement. React visually truncates mitigated OBs into dashed footprints.
+[x] Telegram Sniper Bot: Background worker built to scan all 8 assets every 15 minutes for >70% setups.
 
-[x] Dynamic Structural Breaks (CHoCH vs BOS): Python mathematically analyzes swing peak sequences to label breaks as trend-shifting (CHoCH) or trend-continuing (BOS).
+[x] Anti-Spam Logic: Telegram bot implements a 4-hour cooldown per asset to prevent notification fatigue.
 
-[x] Feature Engineering: Built Python extraction script to convert 20 years of SMC Gold data into machine-readable parameters.
+[x] Zone Transparency: Chart boxes updated to 0.12 opacity so candles remain visible within the entry zones.
 
-[x] Backtest Labeling: Auto-graded historical OBs as Winners (1) or Losers (0) using an automated simulation loop.
+3. COMPLETED EXECUTION PIPELINE (PHASE 9)
+[x] Notification Method: Telegram chosen for its rock-solid API and developer-friendly reliability.
 
-[x] Model Training: Trained a Random Forest Classifier to replace the hardcoded confidence point system, achieving a profitable baseline edge.
+[x] Background Monitor: Built telegramBot.js to scan AI scores without requiring the dashboard to be open.
 
-[x] Live Inference: Successfully injected the aura_model.pkl Brain into the production backend for real-time win probability scoring.
+[x] Secure Routing: Integrated process.env keys on Render to keep Bot Tokens and Chat IDs hidden.
 
-3. CRITICAL SOLUTIONS
-How do we transition from Rule-Based points to True AI? [SOLVED]
+4. CURRENT TASK: 1H MMM LOGIC INJECTION (PHASE 10)
+[ ] Peak Formation Anchor: Implement cross-session M/W detection to find the "Anchor Point".
 
-Solution: Built a local data harvester to map 20 years of Gold OHLC data against 17 years of Forex Factory news. Trained a .pkl Random Forest model on features like FVG Size, RSI, Momentum Ratio, and News Bias to output a literal mathematical win probability.
+[ ] Level Counting Engine: Build the mathematical ATR-based logic to track the 3 levels of Rise/Drop.
 
-How do we stop the 1H AI from trading against the Macro Trend? [SOLVED]
+[ ] The "Wait" Rule: Force the AI to ignore Level 1 and only look for snipers on Level 2 and Level 3 pullbacks.
 
-Solution: Built a Multi-Timeframe Matrix. Node.js now queries MongoDB for both 1H and 4H arrays simultaneously (Promise.all) and ships them to Python. Python calculates the 4H trend independently and completely blocks 1H setups if they oppose the HTF.
-
-How do we fix the 4H Chart looking like a broken barcode? [SOLVED]
-
-Solution: Removed the frontend time-bucketing math that was causing overlapping timezones to overwrite and delete candles. React now strictly trusts the database's epoch timestamps and forces fitContent() to automatically scale the view.
-
-How do we fix "Algorithmic ADHD" (Chaotic overlapping chart visuals)? [SOLVED]
-
-Solution: Implemented Algorithmic Noise Reduction in Python. Applied the "Rule of 2" (only sending the two most recent zones), forcefully truncated fully violated zones, and built a deduplicator to merge overlapping CHoCH/BOS lines.
-
-How do we fix "Asset Lock" (Chart freezing on Gold when switching to EUR/USD)? [SOLVED]
-
-Solution: Applied a React "Nuclear Key Hack" in App.js and a state-wiping useEffect inside ChartComponent.js to physically destroy and rebuild the chart canvas the exact millisecond a new pair is selected.
-
-4. MULTI-ASSET EVOLUTION (FOREX MAJORS) - [COMPLETED]
-[x] Database Schema Upgrade: Updated MongoDB Candle model to include a symbol property, smoothly defaulting to 'GC=F' for backward compatibility.
-
-[x] Historical Data Fetcher: Successfully downloaded 720 days (~190,000 candles) of 1H and 4H historical data for Gold and all 7 Forex Majors.
-
-[x] API Safe-Filtered: Upgraded candleController.js and analysisController.js to strictly filter queries by symbol, ensuring the AI never mixes up assets.
-
-[x] Dynamic Live Feed: Updated server.js Live Loop to poll all 8 assets simultaneously using Promise.allSettled.
-
-[x] Frontend Asset Switcher: Built the custom dropdown in the React UI to let the user seamlessly switch the chart and AI analysis between different pairs.
-
-5. CURRENT TASK: THE EXECUTION PIPELINE (PHASE 9)
-[ ] Decide on the primary notification/execution method.
-
-[ ] Build the background monitor to constantly check AI probability scores across all 8 assets.
-
-[ ] Implement secure routing (Telegram API or Broker Webhook) to push the final trade parameters (Entry, SL, TP).
+[ ] MMM Entry Confirmation: Program the AI to wait for a 1H Rejection Candle (Pin Bar/Engulfing) inside the Level OB to beat stop-hunts.
