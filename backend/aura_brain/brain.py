@@ -38,7 +38,7 @@ try:
     logger.info("🧠 ML Brain 'aura_model.pkl' successfully loaded!")
 except Exception as e:
     ML_MODEL = None
-    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence. Error: {e}")
+    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence.")
 
 def safe_float(value, default=0.0):
     try:
@@ -107,7 +107,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V3 TRUE MMM ENGINE: STRUCTURAL SWING COUNTING
+# 🧠 V4 TRUE MMM ENGINE: THE INVERTED LOGIC FIX
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -120,78 +120,85 @@ def detect_mmm_cycle(df):
         atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
         if atr == 0: atr = 0.001
 
-        # 1. FIND TRUE WEEKLY PEAK ANCHOR (Lookback 120 candles / 5 days)
+        # 1. FIND TRUE WEEKLY PEAK ANCHOR
         lookback = 120
         if len(highs) < lookback: lookback = len(highs)
         
         highest_idx = np.argmax(highs[-lookback:]) + (len(highs) - lookback)
         lowest_idx = np.argmin(lows[-lookback:]) + (len(lows) - lookback)
 
+        # 🔥 THE CRITICAL FIX: 
+        # If the highest point is MORE RECENT than the lowest point, the market is RALLYING.
+        # Therefore, the cycle is BULLISH, and the anchor is the "W" at the bottom.
         if highest_idx > lowest_idx:
-            cycle = "BEARISH"
-            anchor_idx = highest_idx
-            anchor_price = highs[anchor_idx]
-        else:
             cycle = "BULLISH"
             anchor_idx = lowest_idx
             anchor_price = lows[anchor_idx]
+        else:
+            cycle = "BEARISH"
+            anchor_idx = highest_idx
+            anchor_price = highs[anchor_idx]
 
-        # 2. STRUCTURAL LEVEL COUNTING (No more fake ATR distance math)
+        # 2. TRUE STRUCTURAL LEVEL COUNTING
         swing_order = 4
         swing_h = argrelextrema(highs, np.greater, order=swing_order)[0]
         swing_l = argrelextrema(lows, np.less, order=swing_order)[0]
 
-        valid_pushes = 0
-        latest_pullback_idx = anchor_idx
+        current_level = 1
+        in_pullback = False
+        ob_idx = anchor_idx
 
-        if cycle == "BEARISH":
-            swings_since_peak = [l for l in swing_l if l > anchor_idx]
-            last_low = anchor_price
-            for idx in swings_since_peak:
-                # Must be a true structural push lower
-                if lows[idx] < last_low - (atr * 0.5): 
-                    valid_pushes += 1
-                    last_low = lows[idx]
-                    # Find the exact trap candle (lower high) where they pulled back before dropping
-                    pullbacks = [h for h in swing_h if anchor_idx < h < idx]
-                    if pullbacks: 
-                        latest_pullback_idx = pullbacks[-1]
+        if cycle == "BULLISH":
+            watermark = anchor_price
+            swings_since_anchor = [h for h in swing_h if h > anchor_idx]
+            for h in swings_since_anchor:
+                # Requires a solid 1.5 ATR push to count as a new MMM Level
+                if highs[h] > watermark + (atr * 1.5):
+                    current_level += 1
+                    watermark = highs[h]
+                    # The OB is the higher-low (trap) just before this push
+                    pullbacks = [l for l in swing_l if anchor_idx < l < h]
+                    if pullbacks:
+                        ob_idx = pullbacks[-1]
+            
+            # Check if currently in a pullback from the highest point
+            current_max = np.max(highs[anchor_idx:])
+            if closes[-1] < current_max - atr:
+                in_pullback = True
 
-        else:
-            swings_since_peak = [h for h in swing_h if h > anchor_idx]
-            last_high = anchor_price
-            for idx in swings_since_peak:
-                # Must be a true structural push higher
-                if highs[idx] > last_high + (atr * 0.5): 
-                    valid_pushes += 1
-                    last_high = highs[idx]
-                    # Find the exact trap candle (higher low) where they pulled back before rallying
-                    pullbacks = [l for l in swing_l if anchor_idx < l < idx]
-                    if pullbacks: 
-                        latest_pullback_idx = pullbacks[-1]
+        else: # BEARISH
+            watermark = anchor_price
+            swings_since_anchor = [l for l in swing_l if l > anchor_idx]
+            for l in swings_since_anchor:
+                # Requires a solid 1.5 ATR drop to count as a new MMM Level
+                if lows[l] < watermark - (atr * 1.5):
+                    current_level += 1
+                    watermark = lows[l]
+                    # The OB is the lower-high (trap) just before this drop
+                    pullbacks = [h for h in swing_h if anchor_idx < h < l]
+                    if pullbacks:
+                        ob_idx = pullbacks[-1]
 
-        # Max level is 3 (Exhaustion)
-        current_level = min(3, valid_pushes + 1)
-        if current_level < 1: current_level = 1
+            # Check if currently in a pullback from the lowest point
+            current_min = np.min(lows[anchor_idx:])
+            if closes[-1] > current_min + atr:
+                in_pullback = True
 
-        # 3. IDENTIFY TRUE INSTITUTIONAL ORDER BLOCK (At the exact pullback pivot)
+        current_level = min(3, current_level)
+
+        # 3. IDENTIFY TRUE INSTITUTIONAL ORDER BLOCK
         zones = []
-        lines = [] 
-        
-        lines.append({
+        lines = [{
             "level": float(anchor_price),
             "start_time": int(dates[anchor_idx]),
             "end_time": int(dates[-1]),
             "type": f"{cycle} PEAK (Anchor)",
-            "color": "rgba(255, 215, 0, 0.8)" 
-        })
+            "color": "rgba(38, 166, 154, 0.8)" if cycle == "BULLISH" else "rgba(239, 83, 80, 0.8)"
+        }]
 
-        if current_level < 3 and latest_pullback_idx > anchor_idx:
-            ob_idx = latest_pullback_idx
-            
-            # Wrap the exact trap candle at the latest structural pullback pivot
+        if current_level < 3 and ob_idx != anchor_idx:
             zones.append({
-                "type": "OB_BEAR" if cycle == "BEARISH" else "OB_BULL", 
+                "type": "OB_BULL" if cycle == "BULLISH" else "OB_BEAR", 
                 "top": float(highs[ob_idx]),
                 "bottom": float(lows[ob_idx]),
                 "price": float(highs[ob_idx] if cycle == "BULLISH" else lows[ob_idx]),
@@ -204,15 +211,15 @@ def detect_mmm_cycle(df):
         return {
             "cycle": cycle,
             "level": current_level,
+            "in_pullback": in_pullback,
             "zones": zones,
             "lines": lines,
             "anchor": float(anchor_price)
         }
     except Exception as e:
         logger.error(f"MMM Logic Error: {e}")
-        return {"cycle": "NEUTRAL", "level": 0, "zones": [], "lines": [], "anchor": 0}
+        return {"cycle": "NEUTRAL", "level": 0, "in_pullback": False, "zones": [], "lines": [], "anchor": 0}
 
-# 🎯 PASS THE DECIMALS PARAMETER FOR FOREX/GOLD PRECISION
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value, decimals):
     try:
         entry = current_price
@@ -252,10 +259,9 @@ async def analyze(req: AnalysisRequest):
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price = req.current_price if req.current_price > 0 else csv_last_price
         
-        # 🎯 DYNAMIC DECIMAL PRECISION (Crucial for correct Telegram outputs)
-        decimals = 5 # Default Forex
-        if current_price > 500: decimals = 2 # Gold
-        elif current_price > 10: decimals = 3 # JPY pairs
+        decimals = 5 
+        if current_price > 500: decimals = 2 
+        elif current_price > 10: decimals = 3 
         
         ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
         rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
@@ -265,6 +271,7 @@ async def analyze(req: AnalysisRequest):
         mmm_data = detect_mmm_cycle(df)
         master_bias = f"{mmm_data.get('cycle', 'NEUTRAL')} CYCLE"
         current_level = mmm_data.get('level', 0)
+        in_pullback = mmm_data.get('in_pullback', False)
         
         smc_zones = mmm_data.get("zones", [])
         bos_lines = mmm_data.get("lines", [])
@@ -298,49 +305,45 @@ async def analyze(req: AnalysisRequest):
         base_conf = 0
         target_zone = None
         
+        phase_string = f"LEVEL {current_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
+        
         strategy_logic = [
             f"🧭 Master Bias: {master_bias}", 
-            f"📊 MMM Phase: LEVEL {current_level}",
+            f"📊 MMM Phase: {phase_string}",
             news_string
         ]
 
-        # 🛑 THE NEW ENTRY LOGIC: Trade the Lvl 1 & Lvl 2 pullbacks, stop at Lvl 3.
-        if current_level >= 3:
-            strategy_logic.append("⏳ Level 3 Exhaustion Reached: Waiting for new Peak Formation (M/W). No trade.")
-        elif current_level in [1, 2]:
+        # 🛑 TRUE MMM EXECUTION LOGIC
+        if current_level >= 3 and not in_pullback:
+            strategy_logic.append("⏳ Level 3 Exhaustion Reached: Do not trade. Waiting for new Peak.")
+        elif not in_pullback:
+            strategy_logic.append(f"⏳ Market is in Level {current_level} EXPANSION. Waiting for pullback to enter.")
+        else:
+            # We are actively in a Pullback! Hunt for the entry.
             if mmm_data['cycle'] == 'BULLISH' and nearest_supp:
                 distance_to_ob = current_price - nearest_supp['top']
-                
-                # Check if price is pulling back into the OB
-                if current_price <= nearest_supp['top'] and current_price >= (nearest_supp['bottom'] - (atr*0.3)): 
+                if current_price <= nearest_supp['top'] and current_price >= (nearest_supp['bottom'] - (atr*0.5)): 
                     signal = "BUY"
                     target_zone = nearest_supp
                     base_conf = 78
-                    strategy_logic.append(f"🔥 KILLZONE: Price tapped Level {current_level} Demand OB. Targeting Level {current_level + 1} push.")
+                    strategy_logic.append(f"🔥 KILLZONE: Price tapped Level {current_level} Demand OB.")
                 elif distance_to_ob <= atr:
                     strategy_logic.append(f"Approaching Level {current_level} Demand OB. Waiting for tap.")
                 else:
-                    strategy_logic.append(f"Waiting for pullback into Level {current_level} Demand OB.")
+                    strategy_logic.append(f"Waiting for pullback to reach Level {current_level} Demand OB.")
                     
             elif mmm_data['cycle'] == 'BEARISH' and nearest_res:
                 distance_to_ob = nearest_res['bottom'] - current_price
-                
-                # Check if price is rallying back into the OB
-                if current_price >= nearest_res['bottom'] and current_price <= (nearest_res['top'] + (atr*0.3)): 
+                if current_price >= nearest_res['bottom'] and current_price <= (nearest_res['top'] + (atr*0.5)): 
                     signal = "SELL"
                     target_zone = nearest_res
                     base_conf = 78
-                    strategy_logic.append(f"🔥 KILLZONE: Price tapped Level {current_level} Supply OB. Targeting Level {current_level + 1} push.")
+                    strategy_logic.append(f"🔥 KILLZONE: Price tapped Level {current_level} Supply OB.")
                 elif distance_to_ob <= atr:
                     strategy_logic.append(f"Approaching Level {current_level} Supply OB. Waiting for tap.")
                 else:
-                    strategy_logic.append(f"Waiting for rally into Level {current_level} Supply OB.")
-        else:
-            strategy_logic.append("Searching for valid Peak Formation.")
+                    strategy_logic.append(f"Waiting for rally to reach Level {current_level} Supply OB.")
 
-        # =========================================================
-        # 🧠 ML NEURAL PREDICTION OVERRIDE
-        # =========================================================
         if signal != "NEUTRAL" and target_zone and ML_MODEL:
             try:
                 features = pd.DataFrame([{
@@ -351,15 +354,12 @@ async def analyze(req: AnalysisRequest):
                     'momentum_ratio': target_zone.get('momentum_ratio', 1.0),
                     'news_bias': news_val
                 }])
-                
                 prob = ML_MODEL.predict_proba(features)[0][1] 
                 confidence = int(max(base_conf, prob * 100)) 
-                
                 strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Probability")
             except Exception as e:
-                logger.error(f"ML Prediction Failed: {e}")
+                pass
 
-        # If we have no ML model, fallback to the base logic confidence
         if confidence == 0 and signal != "NEUTRAL":
             confidence = base_conf
 
