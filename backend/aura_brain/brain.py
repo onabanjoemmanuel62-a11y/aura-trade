@@ -71,7 +71,6 @@ def load_csv_fallback():
         df.dropna(subset=numeric_cols, inplace=True)
         return df if len(df) > 50 else None
     except Exception as e:
-        logger.error(f"❌ CSV Load Failed: {e}")
         return None
 
 def process_live_candles(candles_data: List[Dict]):
@@ -79,13 +78,11 @@ def process_live_candles(candles_data: List[Dict]):
         df = pd.DataFrame(candles_data)
         rename_map = {'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'time': 'Date', 'timestamp': 'Date'}
         df.rename(columns=rename_map, inplace=True)
-        
         cols = ['Open', 'High', 'Low', 'Close']
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
         return df
     except Exception as e:
-        logger.error(f"❌ Live Data Conversion Failed: {e}")
         return None
 
 @asynccontextmanager
@@ -107,7 +104,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V4 TRUE MMM ENGINE: THE INVERTED LOGIC FIX
+# 🧠 V5 TRUE BTMM ENGINE: DEEP PULLBACK VALIDATION
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -120,16 +117,14 @@ def detect_mmm_cycle(df):
         atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
         if atr == 0: atr = 0.001
 
-        # 1. FIND TRUE WEEKLY PEAK ANCHOR
-        lookback = 120
+        # 1. THE ABSOLUTE 5-DAY ANCHOR
+        lookback = 120 
         if len(highs) < lookback: lookback = len(highs)
         
         highest_idx = np.argmax(highs[-lookback:]) + (len(highs) - lookback)
         lowest_idx = np.argmin(lows[-lookback:]) + (len(lows) - lookback)
 
-        # 🔥 THE CRITICAL FIX: 
-        # If the highest point is MORE RECENT than the lowest point, the market is RALLYING.
-        # Therefore, the cycle is BULLISH, and the anchor is the "W" at the bottom.
+        # Bullish if the lowest point happened BEFORE the highest point
         if highest_idx > lowest_idx:
             cycle = "BULLISH"
             anchor_idx = lowest_idx
@@ -139,54 +134,55 @@ def detect_mmm_cycle(df):
             anchor_idx = highest_idx
             anchor_price = highs[anchor_idx]
 
-        # 2. TRUE STRUCTURAL LEVEL COUNTING
-        swing_order = 4
-        swing_h = argrelextrema(highs, np.greater, order=swing_order)[0]
-        swing_l = argrelextrema(lows, np.less, order=swing_order)[0]
-
+        # 2. BTMM LEVEL COUNTING (Requires 1.5 ATR deep pullbacks)
         current_level = 1
         in_pullback = False
-        ob_idx = anchor_idx
+        local_extreme = anchor_price
+        pullback_extreme_idx = anchor_idx
 
-        if cycle == "BULLISH":
-            watermark = anchor_price
-            swings_since_anchor = [h for h in swing_h if h > anchor_idx]
-            for h in swings_since_anchor:
-                # Requires a solid 1.5 ATR push to count as a new MMM Level
-                if highs[h] > watermark + (atr * 1.5):
-                    current_level += 1
-                    watermark = highs[h]
-                    # The OB is the higher-low (trap) just before this push
-                    pullbacks = [l for l in swing_l if anchor_idx < l < h]
-                    if pullbacks:
-                        ob_idx = pullbacks[-1]
-            
-            # Check if currently in a pullback from the highest point
-            current_max = np.max(highs[anchor_idx:])
-            if closes[-1] < current_max - atr:
-                in_pullback = True
+        for i in range(anchor_idx + 1, len(closes)):
+            if cycle == "BULLISH":
+                # Market makes a new high
+                if highs[i] > local_extreme:
+                    local_extreme = highs[i]
+                    if in_pullback:
+                        # Price broke the high, meaning the pullback is over. Level up!
+                        current_level += 1
+                        in_pullback = False
+                
+                # Market drops significantly from the high (A true BTMM Pullback)
+                elif lows[i] < local_extreme - (atr * 1.5):
+                    if not in_pullback:
+                        in_pullback = True
+                        pullback_extreme_idx = i
+                    else:
+                        # Track the absolute bottom of this specific pullback
+                        if lows[i] < lows[pullback_extreme_idx]:
+                            pullback_extreme_idx = i
 
-        else: # BEARISH
-            watermark = anchor_price
-            swings_since_anchor = [l for l in swing_l if l > anchor_idx]
-            for l in swings_since_anchor:
-                # Requires a solid 1.5 ATR drop to count as a new MMM Level
-                if lows[l] < watermark - (atr * 1.5):
-                    current_level += 1
-                    watermark = lows[l]
-                    # The OB is the lower-high (trap) just before this drop
-                    pullbacks = [h for h in swing_h if anchor_idx < h < l]
-                    if pullbacks:
-                        ob_idx = pullbacks[-1]
+            elif cycle == "BEARISH":
+                # Market makes a new low
+                if lows[i] < local_extreme:
+                    local_extreme = lows[i]
+                    if in_pullback:
+                        # Price broke the low, meaning the rally is over. Level up!
+                        current_level += 1
+                        in_pullback = False
+                
+                # Market rallies significantly from the low (A true BTMM Pullback)
+                elif highs[i] > local_extreme + (atr * 1.5):
+                    if not in_pullback:
+                        in_pullback = True
+                        pullback_extreme_idx = i
+                    else:
+                        # Track the absolute top of this specific rally
+                        if highs[i] > highs[pullback_extreme_idx]:
+                            pullback_extreme_idx = i
 
-            # Check if currently in a pullback from the lowest point
-            current_min = np.min(lows[anchor_idx:])
-            if closes[-1] > current_min + atr:
-                in_pullback = True
-
+        # Cap at Level 3
         current_level = min(3, current_level)
 
-        # 3. IDENTIFY TRUE INSTITUTIONAL ORDER BLOCK
+        # 3. IDENTIFY THE TRUE PIVOT ORDER BLOCK
         zones = []
         lines = [{
             "level": float(anchor_price),
@@ -196,17 +192,45 @@ def detect_mmm_cycle(df):
             "color": "rgba(38, 166, 154, 0.8)" if cycle == "BULLISH" else "rgba(239, 83, 80, 0.8)"
         }]
 
-        if current_level < 3 and ob_idx != anchor_idx:
-            zones.append({
-                "type": "OB_BULL" if cycle == "BULLISH" else "OB_BEAR", 
-                "top": float(highs[ob_idx]),
-                "bottom": float(lows[ob_idx]),
-                "price": float(highs[ob_idx] if cycle == "BULLISH" else lows[ob_idx]),
-                "time": int(dates[ob_idx]),
-                "is_mitigated": False,
-                "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
-                "momentum_ratio": 2.0 
-            })
+        if current_level < 3 and pullback_extreme_idx > anchor_idx:
+            # We found the deep pivot. Now find the exact trap candle.
+            ob_idx = pullback_extreme_idx
+            
+            if cycle == "BULLISH":
+                # Look backwards 5 candles from the pivot to find the last Bearish candle
+                for j in range(pullback_extreme_idx, max(anchor_idx, pullback_extreme_idx - 5), -1):
+                    if closes[j] < opens[j]: 
+                        ob_idx = j
+                        break
+                
+                zones.append({
+                    "type": "OB_BULL", 
+                    "top": float(highs[ob_idx]),
+                    "bottom": float(lows[ob_idx]),
+                    "price": float(highs[ob_idx]),
+                    "time": int(dates[ob_idx]),
+                    "is_mitigated": False,
+                    "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                    "momentum_ratio": 2.0 
+                })
+
+            elif cycle == "BEARISH":
+                # Look backwards 5 candles from the pivot to find the last Bullish candle
+                for j in range(pullback_extreme_idx, max(anchor_idx, pullback_extreme_idx - 5), -1):
+                    if closes[j] > opens[j]: 
+                        ob_idx = j
+                        break
+
+                zones.append({
+                    "type": "OB_BEAR", 
+                    "top": float(highs[ob_idx]),
+                    "bottom": float(lows[ob_idx]),
+                    "price": float(lows[ob_idx]),
+                    "time": int(dates[ob_idx]),
+                    "is_mitigated": False,
+                    "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                    "momentum_ratio": 2.0 
+                })
 
         return {
             "cycle": cycle,
@@ -290,13 +314,10 @@ async def analyze(req: AnalysisRequest):
             actual = safe_float(req.news_data.get('actual', 0))
             forecast = safe_float(req.news_data.get('forecast', 0))
             event_name = req.news_data.get('event', 'News Event')
-            
             if actual > forecast:
-                news_bias = "BEARISH_GOLD"
                 news_val = -1
                 news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast})."
             elif actual < forecast:
-                news_bias = "BULLISH_GOLD"
                 news_val = 1
                 news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast})."
 
@@ -319,7 +340,6 @@ async def analyze(req: AnalysisRequest):
         elif not in_pullback:
             strategy_logic.append(f"⏳ Market is in Level {current_level} EXPANSION. Waiting for pullback to enter.")
         else:
-            # We are actively in a Pullback! Hunt for the entry.
             if mmm_data['cycle'] == 'BULLISH' and nearest_supp:
                 distance_to_ob = current_price - nearest_supp['top']
                 if current_price <= nearest_supp['top'] and current_price >= (nearest_supp['bottom'] - (atr*0.5)): 
@@ -357,7 +377,7 @@ async def analyze(req: AnalysisRequest):
                 prob = ML_MODEL.predict_proba(features)[0][1] 
                 confidence = int(max(base_conf, prob * 100)) 
                 strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Probability")
-            except Exception as e:
+            except Exception:
                 pass
 
         if confidence == 0 and signal != "NEUTRAL":
