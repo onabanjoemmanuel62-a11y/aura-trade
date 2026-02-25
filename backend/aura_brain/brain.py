@@ -104,7 +104,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V6 DIAGNOSTIC: ISOLATING THE TRUE M/W PEAK ANCHOR
+# 🧠 V7 TRUE VISUAL ENGINE: PEAK -> PULLBACK -> BOS -> 1H-OB
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -117,61 +117,187 @@ def detect_mmm_cycle(df):
         atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
         if atr == 0: atr = 0.001
 
-        # 1. FIND THE MACRO ZONE (The true highest/lowest point of the week)
+        # 1. FIND THE ABSOLUTE MACRO ANCHOR (PFH / PFL)
         lookback = 120 
         if len(highs) < lookback: lookback = len(highs)
         
         macro_high_idx = np.argmax(highs[-lookback:]) + (len(highs) - lookback)
         macro_low_idx = np.argmin(lows[-lookback:]) + (len(lows) - lookback)
 
-        # 2. HUNT FOR THE TRAP CANDLE (Leg 2 of the M or W)
         if macro_high_idx > macro_low_idx:
             cycle = "BEARISH"
             anchor_idx = macro_high_idx
-            
-            # Scan the candles immediately at/after the macro high to find the actual Rejection Trap
-            for i in range(macro_high_idx, min(len(closes), macro_high_idx + 10)):
-                if closes[i] < opens[i]: # The first strong bearish rejection (Trap confirmed)
-                    anchor_idx = i
-                    break
             anchor_price = highs[anchor_idx]
-            pattern_name = "'M' Peak Formation High"
+            pattern_name = "PFH ↓ (Anchor)"
         else:
             cycle = "BULLISH"
             anchor_idx = macro_low_idx
-            
-            # Scan the candles immediately at/after the macro low to find the actual Rejection Trap
-            for i in range(macro_low_idx, min(len(closes), macro_low_idx + 10)):
-                if closes[i] > opens[i]: # The first strong bullish rejection (Trap confirmed)
-                    anchor_idx = i
-                    break
             anchor_price = lows[anchor_idx]
-            pattern_name = "'W' Peak Formation Low"
+            pattern_name = "PFL ↑ (Anchor)"
 
-        # 3. DRAW ONLY THE SOLID GOLD ANCHOR LINE
+        zones = []
         lines = [{
             "level": float(anchor_price),
             "start_time": int(dates[anchor_idx]),
             "end_time": int(dates[-1]),
-            "type": f"{pattern_name} (Anchor)",
-            "color": "rgba(255, 215, 0, 1)" # Solid Gold line
+            "type": pattern_name,
+            "color": "rgba(255, 215, 0, 1)" # Solid Gold for the Peak
         }]
+
+        # 2. THE VISUAL EYE-TRACKING STATE MACHINE
+        current_level = 0
+        state = "PUSHING" 
+        
+        if cycle == "BEARISH":
+            current_low_val = anchor_price
+            current_low_idx = anchor_idx
+            pullback_high_val = None
+            pullback_high_idx = None
+
+            for i in range(anchor_idx + 1, len(closes)):
+                if state == "PUSHING":
+                    if lows[i] < current_low_val:
+                        current_low_val = lows[i] # Pushing to a new low
+                        current_low_idx = i
+                    elif highs[i] > current_low_val + atr: # Starts pulling back up
+                        state = "PULLBACK"
+                        pullback_high_val = highs[i]
+                        pullback_high_idx = i
+                
+                elif state == "PULLBACK":
+                    if highs[i] > pullback_high_val:
+                        pullback_high_val = highs[i] # Pullback goes deeper
+                        pullback_high_idx = i
+                    elif closes[i] < current_low_val: # BOOM! Break of Structure downward
+                        current_level += 1
+                        
+                        # Draw the Blue BOS Line (From the low to the breakout)
+                        lines.append({
+                            "level": float(current_low_val),
+                            "start_time": int(dates[current_low_idx]),
+                            "end_time": int(dates[i]),
+                            "type": f"BOS {current_level}",
+                            "color": "rgba(33, 150, 243, 0.8)" # Blue line just like reference
+                        })
+
+                        # Find the actual trap candle at the peak of the pullback to draw the 1H-OB
+                        ob_idx = pullback_high_idx
+                        for k in range(pullback_high_idx, max(anchor_idx, pullback_high_idx - 5), -1):
+                            if closes[k] > opens[k]: # The last bullish trap candle before the drop
+                                ob_idx = k
+                                break
+
+                        # Draw the 1H-OB Box
+                        zones.append({
+                            "type": "OB_BEAR", 
+                            "top": float(highs[ob_idx]),
+                            "bottom": float(lows[ob_idx]),
+                            "price": float(lows[ob_idx]),
+                            "time": int(dates[ob_idx]),
+                            "is_mitigated": False,
+                            "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                            "momentum_ratio": 2.0 
+                        })
+
+                        # Reset state for the next level down
+                        current_low_val = lows[i]
+                        current_low_idx = i
+                        state = "PUSHING"
+
+        elif cycle == "BULLISH":
+            current_high_val = anchor_price
+            current_high_idx = anchor_idx
+            pullback_low_val = None
+            pullback_low_idx = None
+
+            for i in range(anchor_idx + 1, len(closes)):
+                if state == "PUSHING":
+                    if highs[i] > current_high_val:
+                        current_high_val = highs[i] # Pushing to a new high
+                        current_high_idx = i
+                    elif lows[i] < current_high_val - atr: # Starts pulling back down
+                        state = "PULLBACK"
+                        pullback_low_val = lows[i]
+                        pullback_low_idx = i
+                
+                elif state == "PULLBACK":
+                    if lows[i] < pullback_low_val:
+                        pullback_low_val = lows[i] # Pullback goes deeper
+                        pullback_low_idx = i
+                    elif closes[i] > current_high_val: # BOOM! Break of Structure upward
+                        current_level += 1
+                        
+                        # Draw the Blue BOS Line (From the high to the breakout)
+                        lines.append({
+                            "level": float(current_high_val),
+                            "start_time": int(dates[current_high_idx]),
+                            "end_time": int(dates[i]),
+                            "type": f"BOS {current_level}",
+                            "color": "rgba(33, 150, 243, 0.8)" # Blue line just like reference
+                        })
+
+                        # Find the actual trap candle at the bottom of the pullback to draw the 1H-OB
+                        ob_idx = pullback_low_idx
+                        for k in range(pullback_low_idx, max(anchor_idx, pullback_low_idx - 5), -1):
+                            if closes[k] < opens[k]: # The last bearish trap candle before the rally
+                                ob_idx = k
+                                break
+
+                        # Draw the 1H-OB Box
+                        zones.append({
+                            "type": "OB_BULL", 
+                            "top": float(highs[ob_idx]),
+                            "bottom": float(lows[ob_idx]),
+                            "price": float(highs[ob_idx]),
+                            "time": int(dates[ob_idx]),
+                            "is_mitigated": False,
+                            "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                            "momentum_ratio": 2.0 
+                        })
+
+                        # Reset state for the next level up
+                        current_high_val = highs[i]
+                        current_high_idx = i
+                        state = "PUSHING"
+
+        # Limit UI readout to max level 3
+        display_level = min(3, current_level + 1)
+        in_pullback = (state == "PULLBACK")
 
         return {
             "cycle": cycle,
-            "level": 0,
-            "in_pullback": False,
-            "zones": [], # Disabled for isolation testing
+            "level": display_level,
+            "in_pullback": in_pullback,
+            "zones": zones,
             "lines": lines,
-            "anchor": float(anchor_price),
-            "pattern_name": pattern_name
+            "anchor": float(anchor_price)
         }
     except Exception as e:
         logger.error(f"MMM Logic Error: {e}")
-        return {"cycle": "NEUTRAL", "level": 0, "in_pullback": False, "zones": [], "lines": [], "anchor": 0, "pattern_name": ""}
+        return {"cycle": "NEUTRAL", "level": 0, "in_pullback": False, "zones": [], "lines": [], "anchor": 0}
 
 def calculate_trade_levels(current_price, signal, support, resistance, atr_value, decimals):
-    return None # Disabled for isolation testing
+    try:
+        entry = current_price
+        atr_buffer = atr_value * 1.5 if atr_value else entry * 0.002
+        
+        if signal == "BUY":
+            stop_loss = support if (support > 0 and support < entry) else entry - atr_buffer
+            take_profit = resistance if (resistance > entry) else entry + (abs(entry - stop_loss) * 2)
+        elif signal == "SELL":
+            stop_loss = resistance if (resistance > 0 and resistance > entry) else entry + atr_buffer
+            take_profit = support if (support < entry and support > 0) else entry - (abs(entry - stop_loss) * 2)
+        else:
+            return None
+        
+        return {
+            "entry": round(entry, decimals),
+            "stop_loss": round(stop_loss, decimals),
+            "take_profit": round(take_profit, decimals),
+            "risk_reward": round(abs(take_profit - entry) / max(0.00001, abs(entry - stop_loss)), 2)
+        }
+    except:
+        return None
 
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
@@ -186,30 +312,124 @@ async def analyze(req: AnalysisRequest):
         return {"signal": "HOLD", "confidence": 0, "reasoning": ["Waiting for data..."]}
 
     try:
-        # --- EXECUTE DIAGNOSTIC MMM LOGIC ---
+        csv_last_price = safe_float(df['Close'].iloc[-1])
+        current_price = req.current_price if req.current_price > 0 else csv_last_price
+        
+        decimals = 5 
+        if current_price > 500: decimals = 2 
+        elif current_price > 10: decimals = 3 
+        
+        ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
+        rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
+        atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
+        
+        # --- EXECUTE MMM LOGIC ---
         mmm_data = detect_mmm_cycle(df)
         master_bias = f"{mmm_data.get('cycle', 'NEUTRAL')} CYCLE"
-        pattern_name = mmm_data.get('pattern_name', '')
+        current_level = mmm_data.get('level', 0)
+        in_pullback = mmm_data.get('in_pullback', False)
+        
+        smc_zones = mmm_data.get("zones", [])
+        bos_lines = mmm_data.get("lines", [])
+        
+        # Look for the most recent unmitigated OB
+        nearest_supp = next((z for z in reversed(smc_zones) if z['type'] == 'OB_BULL'), None)
+        nearest_res = next((z for z in reversed(smc_zones) if z['type'] == 'OB_BEAR'), None)
+        
+        sup_level = nearest_supp['top'] if nearest_supp else current_price - (atr * 2)
+        res_level = nearest_res['bottom'] if nearest_res else current_price + (atr * 2)
+
+        news_bias = "NEUTRAL"
+        news_val = 0
+        news_string = "No recent impactful news data."
+        
+        if req.news_data:
+            actual = safe_float(req.news_data.get('actual', 0))
+            forecast = safe_float(req.news_data.get('forecast', 0))
+            event_name = req.news_data.get('event', 'News Event')
+            if actual > forecast:
+                news_val = -1
+                news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast})."
+            elif actual < forecast:
+                news_val = 1
+                news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast})."
+
+        signal = "NEUTRAL"
+        confidence = 0
+        base_conf = 0
+        target_zone = None
+        
+        phase_string = f"LEVEL {current_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
         
         strategy_logic = [
-            f"🎯 ANCHOR ISOLATION MODE",
-            f"🧭 Detected Trend: {master_bias}", 
-            f"🔍 Pattern: {pattern_name}",
-            "⚠️ Levels and Order Blocks are temporarily disabled for visual testing."
+            f"🧭 Master Bias: {master_bias}", 
+            f"📊 Phase: {phase_string}",
+            news_string
         ]
 
+        # 🛑 TRUE MMM EXECUTION LOGIC
+        if current_level >= 4 and not in_pullback:
+            strategy_logic.append("⏳ Exhaustion Reached: Do not trade. Waiting for new Anchor.")
+        elif not in_pullback:
+            strategy_logic.append(f"⏳ Market is pushing. Waiting for pullback to 1H-OB to enter.")
+        else:
+            if mmm_data['cycle'] == 'BULLISH' and nearest_supp:
+                distance_to_ob = current_price - nearest_supp['top']
+                if current_price <= nearest_supp['top'] and current_price >= (nearest_supp['bottom'] - (atr*0.5)): 
+                    signal = "BUY"
+                    target_zone = nearest_supp
+                    base_conf = 78
+                    strategy_logic.append(f"🔥 KILLZONE: Price tapped 1H-OB.")
+                elif distance_to_ob <= atr:
+                    strategy_logic.append(f"Approaching 1H-OB. Waiting for tap.")
+                else:
+                    strategy_logic.append(f"Pulling back. Waiting for price to reach 1H-OB.")
+                    
+            elif mmm_data['cycle'] == 'BEARISH' and nearest_res:
+                distance_to_ob = nearest_res['bottom'] - current_price
+                if current_price >= nearest_res['bottom'] and current_price <= (nearest_res['top'] + (atr*0.5)): 
+                    signal = "SELL"
+                    target_zone = nearest_res
+                    base_conf = 78
+                    strategy_logic.append(f"🔥 KILLZONE: Price tapped 1H-OB.")
+                elif distance_to_ob <= atr:
+                    strategy_logic.append(f"Approaching 1H-OB. Waiting for tap.")
+                else:
+                    strategy_logic.append(f"Rallying. Waiting for price to reach 1H-OB.")
+
+        if signal != "NEUTRAL" and target_zone and ML_MODEL:
+            try:
+                features = pd.DataFrame([{
+                    'type': 1 if signal == "BUY" else 0,
+                    'fvg_size_pips': target_zone.get('fvg_size_pips', 0.0),
+                    'rsi_at_entry': rsi,
+                    'atr_at_entry': atr,
+                    'momentum_ratio': target_zone.get('momentum_ratio', 1.0),
+                    'news_bias': news_val
+                }])
+                prob = ML_MODEL.predict_proba(features)[0][1] 
+                confidence = int(max(base_conf, prob * 100)) 
+                strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Prob.")
+            except Exception:
+                pass
+
+        if confidence == 0 and signal != "NEUTRAL":
+            confidence = base_conf
+
+        trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr, decimals)
+
         return {
-            "signal": "NEUTRAL",
-            "confidence": 0,
+            "signal": signal,
+            "confidence": int(confidence),
             "trend": master_bias, 
-            "pattern": f"Anchor Isolation Test", 
+            "pattern": f"MMM Pullback", 
             "reasoning": strategy_logic,
-            "keyLevels": {"resistance": 0, "support": 0, "ema": 0},
+            "keyLevels": {"resistance": round(res_level, decimals), "support": round(sup_level, decimals), "ema": round(ema_200, decimals)},
             "visuals": {
-                "smc_zones": [], 
-                "bos_lines": mmm_data.get("lines", []) 
+                "smc_zones": smc_zones, 
+                "bos_lines": bos_lines 
             },
-            "tradeSetup": None
+            "tradeSetup": trade_setup if confidence >= 70 else None
         }
 
     except Exception as e:
