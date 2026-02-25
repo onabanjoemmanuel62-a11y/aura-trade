@@ -104,7 +104,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V8 TRUE VISUAL ENGINE: CORRECTED ORIGIN TRACE
+# 🧠 V9 TRUE VISUAL ENGINE: THE FINAL ANCHOR FIX
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -117,26 +117,28 @@ def detect_mmm_cycle(df):
         atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
         if atr == 0: atr = 0.001
 
-        # 1. FIND THE VISIBLE MACRO EXTREMES
-        lookback = 150 
+        # 1. FIND THE VISIBLE MACRO EXTREMES (Expanded to 300 candles for true weekly peaks)
+        lookback = 300 
         start_idx = max(0, len(closes) - lookback)
         
         highest_idx = start_idx + np.argmax(highs[start_idx:])
         lowest_idx = start_idx + np.argmin(lows[start_idx:])
 
-        # 2. THE ORIGIN TRACE LOGIC
-        # If the highest point happened BEFORE the lowest point, the market dropped. Bearish Cycle.
-        if highest_idx < lowest_idx:
-            cycle = "BEARISH"
-            anchor_idx = highest_idx
-            anchor_price = highs[anchor_idx]
-            pattern_name = "PFH ↓ (Anchor)"
-        # If the lowest point happened BEFORE the highest point, the market rallied. Bullish Cycle.
-        else:
+        # 2. THE CORRECTED ORIGIN TRACE LOGIC
+        # If the LOWEST point happened AFTER the HIGHEST point...
+        if lowest_idx > highest_idx:
+            # The Low is the most recent extreme. Market bottomed out and is now RISING.
             cycle = "BULLISH"
             anchor_idx = lowest_idx
             anchor_price = lows[anchor_idx]
             pattern_name = "PFL ↑ (Anchor)"
+        # If the HIGHEST point happened AFTER the LOWEST point...
+        else:
+            # The High is the most recent extreme. Market topped out and is now DROPPING.
+            cycle = "BEARISH"
+            anchor_idx = highest_idx
+            anchor_price = highs[anchor_idx]
+            pattern_name = "PFH ↓ (Anchor)"
 
         zones = []
         lines = [{
@@ -147,7 +149,7 @@ def detect_mmm_cycle(df):
             "color": "rgba(255, 215, 0, 1)" # Solid Gold Peak
         }]
 
-        # 3. VISUAL BOS & OB MAPPING (Just like the reference images)
+        # 3. VISUAL BOS & OB MAPPING (Preserved from V8 because it worked perfectly)
         current_level = 0
         state = "PUSHING" 
         
@@ -174,22 +176,22 @@ def detect_mmm_cycle(df):
                     elif closes[i] < current_low_val: 
                         current_level += 1
                         
-                        # Draw Blue BOS Line
                         lines.append({
                             "level": float(current_low_val),
                             "start_time": int(dates[current_low_idx]),
                             "end_time": int(dates[i]),
-                            "type": f"BOS",
+                            "type": f"BOS {current_level}",
                             "color": "rgba(33, 150, 243, 0.8)" 
                         })
 
                         # Find Trap Candle for OB
                         ob_idx = pullback_high_idx
                         for k in range(pullback_high_idx, max(anchor_idx, pullback_high_idx - 5), -1):
-                            if closes[k] > opens[k]: 
+                            if closes[k] > opens[k]: # Last bullish candle before drop
                                 ob_idx = k
                                 break
 
+                        # Draw tightly wrapped OB box
                         zones.append({
                             "type": "OB_BEAR", 
                             "top": float(highs[ob_idx]),
@@ -228,22 +230,22 @@ def detect_mmm_cycle(df):
                     elif closes[i] > current_high_val: 
                         current_level += 1
                         
-                        # Draw Blue BOS Line
                         lines.append({
                             "level": float(current_high_val),
                             "start_time": int(dates[current_high_idx]),
                             "end_time": int(dates[i]),
-                            "type": f"BOS",
+                            "type": f"BOS {current_level}",
                             "color": "rgba(33, 150, 243, 0.8)" 
                         })
 
                         # Find Trap Candle for OB
                         ob_idx = pullback_low_idx
                         for k in range(pullback_low_idx, max(anchor_idx, pullback_low_idx - 5), -1):
-                            if closes[k] < opens[k]: 
+                            if closes[k] < opens[k]: # Last bearish candle before rally
                                 ob_idx = k
                                 break
 
+                        # Draw tightly wrapped OB box
                         zones.append({
                             "type": "OB_BULL", 
                             "top": float(highs[ob_idx]),
