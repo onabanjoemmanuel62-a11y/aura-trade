@@ -163,44 +163,55 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
     """
     A liquidity sweep (stop hunt) occurs when price wicks THROUGH a prior
     swing high/low but the CANDLE BODY CLOSES BACK on the other side.
-    This is the #1 trap retail traders fall into.
+
+    Rules to avoid noise:
+    - Wick must be > 0.3× ATR (significant, not random noise)
+    - Only check swings from the last 200 candles (recent liquidity pools)
+    - Sweep candle must occur within 80 bars of the original swing
     """
     sweeps = []
     closes = df['Close'].values
-    opens  = df['Open'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    min_wick = atr * 0.3
+    total    = len(closes)
+    cutoff   = max(0, total - 200)  # Only recent swings matter
 
-    # Build a simple list of prior swing levels to check against
-    for sh_idx in swing_highs:
+    recent_highs = swing_highs[swing_highs >= cutoff]
+    recent_lows  = swing_lows[swing_lows   >= cutoff]
+
+    for sh_idx in recent_highs:
         sh_price = highs[sh_idx]
-        # Look ahead for a sweep: wick above + close below
-        for i in range(sh_idx + 1, min(sh_idx + 60, len(closes))):
-            if highs[i] > sh_price and closes[i] < sh_price:
+        for i in range(sh_idx + 1, min(sh_idx + 80, total)):
+            wick_above = highs[i] - sh_price
+            if wick_above >= min_wick and closes[i] < sh_price:
                 sweeps.append({
-                    "type": "BULL_SWEEP",      # Price swept sell-side liquidity above, reversed bearish
-                    "level": float(sh_price),
+                    "type":      "BULL_SWEEP",
+                    "level":     float(sh_price),
                     "sweep_idx": int(i),
-                    "time": int(dates[i]),
-                    "wick_size": float(highs[i] - sh_price),
-                })
-                break  # Only record first sweep per swing high
-
-    for sl_idx in swing_lows:
-        sl_price = lows[sl_idx]
-        for i in range(sl_idx + 1, min(sl_idx + 60, len(closes))):
-            if lows[i] < sl_price and closes[i] > sl_price:
-                sweeps.append({
-                    "type": "BEAR_SWEEP",      # Price swept buy-side liquidity below, reversed bullish
-                    "level": float(sl_price),
-                    "sweep_idx": int(i),
-                    "time": int(dates[i]),
-                    "wick_size": float(sl_price - lows[i]),
+                    "time":      int(dates[i]),
+                    "wick_size": float(wick_above),
                 })
                 break
 
-    return sweeps
+    for sl_idx in recent_lows:
+        sl_price = lows[sl_idx]
+        for i in range(sl_idx + 1, min(sl_idx + 80, total)):
+            wick_below = sl_price - lows[i]
+            if wick_below >= min_wick and closes[i] > sl_price:
+                sweeps.append({
+                    "type":      "BEAR_SWEEP",
+                    "level":     float(sl_price),
+                    "sweep_idx": int(i),
+                    "time":      int(dates[i]),
+                    "wick_size": float(wick_below),
+                })
+                break
+
+    # Sort by time and only return last 5
+    sweeps.sort(key=lambda x: x['sweep_idx'])
+    return sweeps[-5:]
 
 
 def find_displacement_candle(df: pd.DataFrame, start_idx: int, direction: str,
@@ -422,28 +433,59 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
     if len(raw_lows)  == 0: raw_lows  = np.array([int(np.argmin(lows))])
 
     # ── STEP 1: FIND THE TRUE MACRO ANCHOR ────────────────────────────────────
-    # The anchor is the highest-significance swing in recent history.
-    # We look at the last 3 swing highs and 3 swing lows and pick the
-    # most recent SIGNIFICANT one (not just the last chronologically).
-    recent_highs = raw_highs[-4:] if len(raw_highs) >= 4 else raw_highs
-    recent_lows  = raw_lows[-4:]  if len(raw_lows)  >= 4 else raw_lows
+    # Score swings by CONSEQUENCE: how much did price move AFTER each swing?
+    # This mirrors how a human looks at the chart — the peak that caused the
+    # biggest drop is the real PFH anchor, not just the most recent swing high.
 
-    last_high_idx = int(recent_highs[-1])
-    last_low_idx  = int(recent_lows[-1])
+    ANCHOR_LOOKBACK = min(len(closes), 600)  # ~25 days on 1H
+    search_highs = raw_highs[raw_highs >= len(closes) - ANCHOR_LOOKBACK]
+    search_lows  = raw_lows[raw_lows   >= len(closes) - ANCHOR_LOOKBACK]
 
-    # The ANCHOR is the MOST RECENTLY FORMED significant swing
-    if last_high_idx > last_low_idx:
-        cycle         = "BEARISH"
-        anchor_idx    = last_high_idx
-        anchor_price  = float(highs[anchor_idx])
-        pattern_name  = "PFH ↓ (Anchor)"
-        anchor_color  = "rgba(255, 59, 59, 1)"
+    if len(search_highs) == 0: search_highs = raw_highs[-3:]
+    if len(search_lows)  == 0: search_lows  = raw_lows[-3:]
+
+    # Score each swing high: how far did price DROP after it?
+    best_high_score = -1.0
+    best_high_idx   = int(search_highs[-1])
+    for sh in search_highs:
+        subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
+        drop = float(highs[sh]) - subsequent_low
+        if drop > best_high_score:
+            best_high_score = drop
+            best_high_idx   = int(sh)
+
+    # Score each swing low: how far did price RALLY after it?
+    best_low_score = -1.0
+    best_low_idx   = int(search_lows[-1])
+    for sl in search_lows:
+        subsequent_high = float(np.max(highs[sl:])) if sl < len(highs) - 1 else float(lows[sl])
+        rally = subsequent_high - float(lows[sl])
+        if rally > best_low_score:
+            best_low_score = rally
+            best_low_idx   = int(sl)
+
+    # Composite score: 60% price significance + 40% recency
+    high_recency = best_high_idx / len(closes)
+    low_recency  = best_low_idx  / len(closes)
+    denom = best_high_score + best_low_score + 1e-9
+    high_composite = (best_high_score / denom * 0.6) + (high_recency * 0.4)
+    low_composite  = (best_low_score  / denom * 0.6) + (low_recency  * 0.4)
+
+    if high_composite > low_composite:
+        cycle        = "BEARISH"
+        anchor_idx   = best_high_idx
+        anchor_price = float(highs[anchor_idx])
+        pattern_name = "PFH ↓ (Anchor)"
+        anchor_color = "rgba(255, 59, 59, 1)"
     else:
-        cycle         = "BULLISH"
-        anchor_idx    = last_low_idx
-        anchor_price  = float(lows[anchor_idx])
-        pattern_name  = "PFL ↑ (Anchor)"
-        anchor_color  = "rgba(59, 255, 130, 1)"
+        cycle        = "BULLISH"
+        anchor_idx   = best_low_idx
+        anchor_price = float(lows[anchor_idx])
+        pattern_name = "PFL ↑ (Anchor)"
+        anchor_color = "rgba(59, 255, 130, 1)"
+
+    logger.info(f"Anchor: {cycle} @ {anchor_price:.2f} idx={anchor_idx} "
+                f"(H-score={best_high_score:.1f} L-score={best_low_score:.1f})")
 
     # ── STEP 2: LIQUIDITY SWEEP DETECTION ────────────────────────────────────
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
@@ -480,13 +522,10 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                     pb_extreme_val = float(highs[i])
                     pb_extreme_idx = i
 
-                # BOS DOWN: body close below the last swing low (not just a wick)
-                body_close = min(closes[i], opens[i])  # Bottom of body
-                if body_close < ref_extreme_val:
+                # BOS DOWN: candle CLOSE (not body) breaks below swing low.
+                # Using close (not body min) so we catch displacement candles.
+                if closes[i] < ref_extreme_val:
                     current_level += 1
-
-                    # Find displacement candle
-                    disp_idx = find_displacement_candle(df, i, "DOWN", atr)
 
                     bos_lines.append({
                         "level": float(ref_extreme_val),
@@ -497,10 +536,9 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                         "is_choch": False
                     })
 
-                    # Build OB from the pullback — last bullish candle before the drop
+                    # OB = last bullish candle in the pullback (before drop)
                     ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates)
                     if ob:
-                        # Check if already mitigated
                         ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
                         if not ob['is_mitigated']:
                             zones.append(ob)
@@ -530,9 +568,8 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                     pb_extreme_val = float(lows[i])
                     pb_extreme_idx = i
 
-                # BOS UP: body close above the last swing high
-                body_close = max(closes[i], opens[i])  # Top of body
-                if body_close > ref_extreme_val:
+                # BOS UP: candle CLOSE breaks above swing high
+                if closes[i] > ref_extreme_val:
                     current_level += 1
 
                     bos_lines.append({
@@ -544,6 +581,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                         "is_choch": False
                     })
 
+                    # OB = last bearish candle in the pullback (before rally)
                     ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates)
                     if ob:
                         ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
@@ -785,14 +823,15 @@ async def analyze(req: AnalysisRequest):
         sweep_str    = ""
         if sweeps:
             last_sweep = sweeps[-1]
-            recent_enough = True  # Could add time filter here
-            if recent_enough:
+            # Only relevant if sweep happened in the last 20 candles
+            candle_age = len(df) - 1 - last_sweep['sweep_idx']
+            if candle_age <= 20:
                 if last_sweep['type'] == "BEAR_SWEEP" and cycle == "BULLISH":
                     sweep_nearby = True
-                    sweep_str    = f"🎯 Buy-side liquidity swept at {last_sweep['level']:.{decimals}f} — potential reversal zone."
+                    sweep_str    = f"🎯 Buy-side liq. swept at {last_sweep['level']:.{decimals}f} — stop hunt reversal zone."
                 elif last_sweep['type'] == "BULL_SWEEP" and cycle == "BEARISH":
                     sweep_nearby = True
-                    sweep_str    = f"🎯 Sell-side liquidity swept at {last_sweep['level']:.{decimals}f} — potential reversal zone."
+                    sweep_str    = f"🎯 Sell-side liq. swept at {last_sweep['level']:.{decimals}f} — stop hunt reversal zone."
 
         # ── SIGNAL LOGIC ──────────────────────────────────────────────────────
         signal     = "NEUTRAL"
