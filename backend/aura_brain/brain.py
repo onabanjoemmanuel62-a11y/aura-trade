@@ -12,78 +12,91 @@ from contextlib import asynccontextmanager
 import httpx
 from starlette.responses import Response
 
-# ✅ TECHNICAL ANALYSIS LIBRARY
 from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator 
+from ta.momentum import RSIIndicator
 
-# 🧠 MACHINE LEARNING LIBRARY
 import joblib
 
-# ⚙️ SETTINGS
-CSV_FILENAME = "1h.csv" 
-NODE_URL = "http://127.0.0.1:10000" 
+CSV_FILENAME = "1h.csv"
+NODE_URL = "http://127.0.0.1:10000"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
-# ==========================================
-# 🧠 LOAD THE MACHINE LEARNING MODEL
-# ==========================================
 base_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(base_dir, "aura_model.pkl")
 try:
     ML_MODEL = joblib.load(model_path)
-    logger.info("🧠 ML Brain 'aura_model.pkl' successfully loaded!")
+    logger.info("🧠 ML Brain loaded!")
 except Exception as e:
     ML_MODEL = None
-    logger.warning(f"⚠️ ML Brain not found. Falling back to rule-based confidence.")
+    logger.warning("⚠️ ML Brain not found. Rule-based confidence active.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def safe_float(value, default=0.0):
     try:
-        if value is None: return default
+        if value is None:
+            return default
         num = float(value)
-        if math.isnan(num) or math.isinf(num): return default
-        return num
+        return default if (math.isnan(num) or math.isinf(num)) else num
     except:
         return default
+
 
 def load_csv_fallback():
     try:
         file_path = os.path.join(os.path.dirname(base_dir), CSV_FILENAME)
-        if not os.path.exists(file_path): return None
+        if not os.path.exists(file_path):
+            return None
         try:
             df = pd.read_csv(file_path, sep=';')
-            if len(df.columns) < 2: df = pd.read_csv(file_path, sep=',')
+            if len(df.columns) < 2:
+                df = pd.read_csv(file_path, sep=',')
         except:
             df = pd.read_csv(file_path, sep=',')
-        
+
         df.columns = [c.lower().strip() for c in df.columns]
-        rename_map = {'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'date': 'Date', 'time': 'Date', 'timestamp': 'Date'}
+        rename_map = {
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open',
+            'date': 'Date', 'time': 'Date', 'timestamp': 'Date'
+        }
         df.rename(columns=rename_map, inplace=True)
-        
+
         numeric_cols = ['Open', 'High', 'Low', 'Close']
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df.dropna(subset=numeric_cols, inplace=True)
+        df.reset_index(drop=True, inplace=True)
         return df if len(df) > 50 else None
     except Exception as e:
+        logger.error(f"CSV load failed: {e}")
         return None
+
 
 def process_live_candles(candles_data: List[Dict]):
     try:
         df = pd.DataFrame(candles_data)
-        rename_map = {'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open', 'time': 'Date', 'timestamp': 'Date'}
+        rename_map = {
+            'close': 'Close', 'high': 'High', 'low': 'Low', 'open': 'Open',
+            'time': 'Date', 'timestamp': 'Date'
+        }
         df.rename(columns=rename_map, inplace=True)
-        cols = ['Open', 'High', 'Low', 'Close']
-        for c in cols:
+        for c in ['Open', 'High', 'Low', 'Close']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
+        df.reset_index(drop=True, inplace=True)
         return df
     except Exception as e:
+        logger.error(f"Live candle processing failed: {e}")
         return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -91,228 +104,598 @@ async def lifespan(app: FastAPI):
     yield
     MARKET_MEMORY["df"] = None
 
+
 app = FastAPI(lifespan=lifespan)
-origins = ["*"] 
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
     current_price: float = 0.0
     candles: Optional[List[Dict]] = None
-    htf_candles: Optional[List[Dict]] = None  
+    htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
-# =================================================================
-# 🧠 V9 TRUE VISUAL ENGINE: MACRO ANCHORS & TIGHT OBs
-# =================================================================
-def detect_mmm_cycle(df):
-    try:
-        highs = df['High'].values
-        lows = df['Low'].values
-        closes = df['Close'].values
-        opens = df['Open'].values
-        dates = df['Date'].values if 'Date' in df.columns else df.index.values
 
-        atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
-        if atr == 0: atr = 0.001
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE ENGINE  — "AURA SMC v10"
+# ─────────────────────────────────────────────────────────────────────────────
 
-        # 1. FIND THE TRUE MACRO ANCHOR (No more blind slicing)
-        swing_order = 40 # Scans ~2 days left and right to guarantee a true weekly peak
-        p_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
-        p_lows = argrelextrema(lows, np.less, order=swing_order)[0]
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """True ATR using high-low-prevclose, not just H-L."""
+    high = df['High'].values
+    low  = df['Low'].values
+    close = df['Close'].values
+    tr_list = []
+    for i in range(1, len(close)):
+        tr = max(high[i] - low[i],
+                 abs(high[i] - close[i-1]),
+                 abs(low[i]  - close[i-1]))
+        tr_list.append(tr)
+    tr_series = pd.Series(tr_list)
+    return float(tr_series.rolling(period).mean().iloc[-1]) if len(tr_list) >= period else float(tr_series.mean())
 
-        # Failsafe if the chart is a straight line
-        if len(p_highs) == 0: p_highs = [np.argmax(highs)]
-        if len(p_lows) == 0: p_lows = [np.argmin(lows)]
 
-        last_high_idx = p_highs[-1]
-        last_low_idx = p_lows[-1]
+def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
+    """
+    Choose swing detection order based on average candle range vs ATR.
+    Quieter markets → smaller order (detect smaller swings).
+    Volatile markets → larger order (avoid noise peaks).
+    """
+    avg_range = float((df['High'] - df['Low']).tail(50).mean())
+    ratio = avg_range / atr if atr > 0 else 1.0
+    # ratio < 0.5 → very quiet → use order 5
+    # ratio ≈ 1.0 → normal     → use order 10
+    # ratio > 2.0 → very noisy → use order 20
+    order = int(np.clip(ratio * 10, 5, 25))
+    return order
 
-        # The extreme that happened MOST RECENTLY dictates the current cycle
-        if last_high_idx > last_low_idx:
-            cycle = "BEARISH"
-            anchor_idx = last_high_idx
-            anchor_price = highs[anchor_idx]
-            pattern_name = "PFH ↓ (Anchor)"
-        else:
-            cycle = "BULLISH"
-            anchor_idx = last_low_idx
-            anchor_price = lows[anchor_idx]
-            pattern_name = "PFL ↑ (Anchor)"
 
-        zones = []
-        lines = [{
-            "level": float(anchor_price),
+def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
+                             swing_lows: np.ndarray, atr: float) -> List[Dict]:
+    """
+    A liquidity sweep (stop hunt) occurs when price wicks THROUGH a prior
+    swing high/low but the CANDLE BODY CLOSES BACK on the other side.
+    This is the #1 trap retail traders fall into.
+    """
+    sweeps = []
+    closes = df['Close'].values
+    opens  = df['Open'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+
+    # Build a simple list of prior swing levels to check against
+    for sh_idx in swing_highs:
+        sh_price = highs[sh_idx]
+        # Look ahead for a sweep: wick above + close below
+        for i in range(sh_idx + 1, min(sh_idx + 60, len(closes))):
+            if highs[i] > sh_price and closes[i] < sh_price:
+                sweeps.append({
+                    "type": "BULL_SWEEP",      # Price swept sell-side liquidity above, reversed bearish
+                    "level": float(sh_price),
+                    "sweep_idx": int(i),
+                    "time": int(dates[i]),
+                    "wick_size": float(highs[i] - sh_price),
+                })
+                break  # Only record first sweep per swing high
+
+    for sl_idx in swing_lows:
+        sl_price = lows[sl_idx]
+        for i in range(sl_idx + 1, min(sl_idx + 60, len(closes))):
+            if lows[i] < sl_price and closes[i] > sl_price:
+                sweeps.append({
+                    "type": "BEAR_SWEEP",      # Price swept buy-side liquidity below, reversed bullish
+                    "level": float(sl_price),
+                    "sweep_idx": int(i),
+                    "time": int(dates[i]),
+                    "wick_size": float(sl_price - lows[i]),
+                })
+                break
+
+    return sweeps
+
+
+def find_displacement_candle(df: pd.DataFrame, start_idx: int, direction: str,
+                              atr: float, lookback: int = 5) -> int:
+    """
+    A displacement candle is a large-body candle (>1.5× ATR body) that
+    confirms institutional intent after a sweep or OB tap.
+    Returns the index of the displacement candle, or -1 if not found.
+    """
+    closes = df['Close'].values
+    opens  = df['Open'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    body_threshold = atr * 1.5
+
+    for i in range(start_idx, min(start_idx + lookback, len(closes))):
+        body = abs(closes[i] - opens[i])
+        if body >= body_threshold:
+            if direction == "DOWN" and closes[i] < opens[i]:
+                return i
+            elif direction == "UP" and closes[i] > opens[i]:
+                return i
+    return -1
+
+
+def build_order_block(df: pd.DataFrame, anchor_idx: int, direction: str,
+                      atr: float, dates) -> Optional[Dict]:
+    """
+    TRUE Order Block definition:
+    - BEARISH OB: The LAST BULLISH candle before a strong bearish move
+    - BULLISH OB: The LAST BEARISH candle before a strong bullish move
+
+    We scan BACKWARDS from the anchor (sweep/BOS point) to find it.
+    The OB body is used, NOT the full wick — wicks are stop hunt territory.
+    """
+    closes = df['Close'].values
+    opens  = df['Open'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+
+    scan_start = max(0, anchor_idx - 10)  # Look back max 10 candles
+
+    if direction == "BEAR":  # Find last bullish candle before bearish move
+        for k in range(anchor_idx, scan_start, -1):
+            if closes[k] > opens[k]:  # Bullish candle
+                body_top    = max(closes[k], opens[k])
+                body_bottom = min(closes[k], opens[k])
+                ob_top    = body_top    + (atr * 0.1)   # Tiny wick allowance
+                ob_bottom = body_bottom - (atr * 0.1)
+                # Cap OB height to 2× ATR to avoid massive zones
+                if (ob_top - ob_bottom) > atr * 2.0:
+                    ob_bottom = ob_top - atr * 2.0
+                return {
+                    "type": "OB_BEAR",
+                    "top": float(ob_top),
+                    "bottom": float(ob_bottom),
+                    "price": float(ob_top),       # Entry: top of bearish OB
+                    "time": int(dates[k]),
+                    "candle_idx": int(k),
+                    "is_mitigated": False,
+                    "fvg_size_pips": float(ob_top - ob_bottom),
+                    "momentum_ratio": 2.0,
+                    "label": "Bearish OB"
+                }
+
+    elif direction == "BULL":  # Find last bearish candle before bullish move
+        for k in range(anchor_idx, scan_start, -1):
+            if closes[k] < opens[k]:  # Bearish candle
+                body_top    = max(closes[k], opens[k])
+                body_bottom = min(closes[k], opens[k])
+                ob_top    = body_top    + (atr * 0.1)
+                ob_bottom = body_bottom - (atr * 0.1)
+                if (ob_top - ob_bottom) > atr * 2.0:
+                    ob_top = ob_bottom + atr * 2.0
+                return {
+                    "type": "OB_BULL",
+                    "top": float(ob_top),
+                    "bottom": float(ob_bottom),
+                    "price": float(ob_bottom),    # Entry: bottom of bullish OB
+                    "time": int(dates[k]),
+                    "candle_idx": int(k),
+                    "is_mitigated": False,
+                    "fvg_size_pips": float(ob_top - ob_bottom),
+                    "momentum_ratio": 2.0,
+                    "label": "Bullish OB"
+                }
+
+    return None
+
+
+def check_ob_mitigation(df: pd.DataFrame, ob: Dict, from_idx: int) -> bool:
+    """
+    An OB is mitigated (invalidated) when price CLOSES through its 50% level
+    (the 'consequent encroachment' — the midpoint of the OB body).
+    """
+    closes = df['Close'].values
+    midpoint = (ob['top'] + ob['bottom']) / 2.0
+    for i in range(from_idx, len(closes)):
+        if ob['type'] == "OB_BEAR" and closes[i] > midpoint:
+            return True
+        if ob['type'] == "OB_BULL" and closes[i] < midpoint:
+            return True
+    return False
+
+
+def detect_choch(df: pd.DataFrame, swing_highs: np.ndarray,
+                 swing_lows: np.ndarray, current_cycle: str) -> Dict:
+    """
+    Change of Character (CHoCH): The FIRST structural shift AGAINST the
+    current trend. Different from BOS (which CONFIRMS the trend).
+
+    In a BEARISH cycle: CHoCH = price closes ABOVE the most recent lower high
+    In a BULLISH cycle: CHoCH = price closes BELOW the most recent higher low
+    """
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+
+    result = {"detected": False, "level": 0.0, "time": 0, "idx": -1}
+
+    if current_cycle == "BEARISH" and len(swing_highs) >= 2:
+        # Last lower high
+        last_lower_high_price = highs[swing_highs[-1]]
+        last_lower_high_idx   = swing_highs[-1]
+        for i in range(last_lower_high_idx + 1, len(closes)):
+            if closes[i] > last_lower_high_price:
+                result = {
+                    "detected": True,
+                    "level": float(last_lower_high_price),
+                    "time": int(dates[i]),
+                    "idx": int(i)
+                }
+                break
+
+    elif current_cycle == "BULLISH" and len(swing_lows) >= 2:
+        last_higher_low_price = lows[swing_lows[-1]]
+        last_higher_low_idx   = swing_lows[-1]
+        for i in range(last_higher_low_idx + 1, len(closes)):
+            if closes[i] < last_higher_low_price:
+                result = {
+                    "detected": True,
+                    "level": float(last_higher_low_price),
+                    "time": int(dates[i]),
+                    "idx": int(i)
+                }
+                break
+
+    return result
+
+
+def detect_fair_value_gaps(df: pd.DataFrame, atr: float) -> List[Dict]:
+    """
+    FVG: A 3-candle imbalance where candle[i-2].high < candle[i].low (bullish FVG)
+    or candle[i-2].low > candle[i].high (bearish FVG).
+    Only return SIGNIFICANT FVGs (gap > 0.3× ATR).
+    """
+    fvgs = []
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    min_gap = atr * 0.3
+
+    for i in range(2, len(highs)):
+        bull_gap = lows[i] - highs[i-2]
+        bear_gap = lows[i-2] - highs[i]
+
+        if bull_gap > min_gap:
+            fvgs.append({
+                "type": "FVG_BULL",
+                "top": float(lows[i]),
+                "bottom": float(highs[i-2]),
+                "time": int(dates[i-1]),
+                "gap_size": float(bull_gap)
+            })
+        elif bear_gap > min_gap:
+            fvgs.append({
+                "type": "FVG_BEAR",
+                "top": float(lows[i-2]),
+                "bottom": float(highs[i]),
+                "time": int(dates[i-1]),
+                "gap_size": float(bear_gap)
+            })
+
+    # Only return the 3 most recent significant FVGs
+    return fvgs[-3:] if fvgs else []
+
+
+def analyze_market_structure(df: pd.DataFrame) -> Dict:
+    """
+    MASTER STRUCTURE ANALYSIS
+    ──────────────────────────
+    1. Adaptive swing detection (not hard-coded order=40)
+    2. True Peak Formation High/Low identification
+    3. BOS vs CHoCH differentiation
+    4. Proper OB placement (last opposing candle before impulse)
+    5. Liquidity sweep detection (stop hunt awareness)
+    6. FVG mapping
+    7. Multi-level MMM cycle tracking
+    """
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    closes = df['Close'].values
+    opens  = df['Open'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+
+    atr = calculate_atr(df, 14)
+    if atr == 0:
+        atr = float(df['Close'].mean()) * 0.001
+
+    swing_order = adaptive_swing_order(df, atr)
+    logger.info(f"Swing detection order: {swing_order} (ATR={atr:.4f})")
+
+    # Raw swing pivots
+    raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
+    raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
+
+    if len(raw_highs) == 0: raw_highs = np.array([int(np.argmax(highs))])
+    if len(raw_lows)  == 0: raw_lows  = np.array([int(np.argmin(lows))])
+
+    # ── STEP 1: FIND THE TRUE MACRO ANCHOR ────────────────────────────────────
+    # The anchor is the highest-significance swing in recent history.
+    # We look at the last 3 swing highs and 3 swing lows and pick the
+    # most recent SIGNIFICANT one (not just the last chronologically).
+    recent_highs = raw_highs[-4:] if len(raw_highs) >= 4 else raw_highs
+    recent_lows  = raw_lows[-4:]  if len(raw_lows)  >= 4 else raw_lows
+
+    last_high_idx = int(recent_highs[-1])
+    last_low_idx  = int(recent_lows[-1])
+
+    # The ANCHOR is the MOST RECENTLY FORMED significant swing
+    if last_high_idx > last_low_idx:
+        cycle         = "BEARISH"
+        anchor_idx    = last_high_idx
+        anchor_price  = float(highs[anchor_idx])
+        pattern_name  = "PFH ↓ (Anchor)"
+        anchor_color  = "rgba(255, 59, 59, 1)"
+    else:
+        cycle         = "BULLISH"
+        anchor_idx    = last_low_idx
+        anchor_price  = float(lows[anchor_idx])
+        pattern_name  = "PFL ↑ (Anchor)"
+        anchor_color  = "rgba(59, 255, 130, 1)"
+
+    # ── STEP 2: LIQUIDITY SWEEP DETECTION ────────────────────────────────────
+    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    # Recent sweeps only (last 5)
+    recent_sweeps = sweeps[-5:] if sweeps else []
+
+    # ── STEP 3: BOS MAPPING + OB BUILDING ─────────────────────────────────────
+    zones       = []
+    bos_lines   = []
+    choch_lines = []
+    current_level = 0
+    state = "IMPULSE"
+
+    # Track swing extremes as we iterate
+    if cycle == "BEARISH":
+        ref_extreme_val = float(highs[anchor_idx])  # Peak to beat downward
+        ref_extreme_idx = anchor_idx
+        pb_extreme_val  = -np.inf                   # Pullback high
+        pb_extreme_idx  = anchor_idx
+
+        for i in range(anchor_idx + 1, len(closes)):
+            if state == "IMPULSE":
+                if lows[i] < ref_extreme_val:
+                    ref_extreme_val = float(lows[i])
+                    ref_extreme_idx = i
+                # Pullback starts when price moves up > 0.5× ATR from the low
+                elif highs[i] > ref_extreme_val + (atr * 0.5):
+                    state = "PULLBACK"
+                    pb_extreme_val = float(highs[i])
+                    pb_extreme_idx = i
+
+            elif state == "PULLBACK":
+                if highs[i] > pb_extreme_val:
+                    pb_extreme_val = float(highs[i])
+                    pb_extreme_idx = i
+
+                # BOS DOWN: body close below the last swing low (not just a wick)
+                body_close = min(closes[i], opens[i])  # Bottom of body
+                if body_close < ref_extreme_val:
+                    current_level += 1
+
+                    # Find displacement candle
+                    disp_idx = find_displacement_candle(df, i, "DOWN", atr)
+
+                    bos_lines.append({
+                        "level": float(ref_extreme_val),
+                        "start_time": int(dates[ref_extreme_idx]),
+                        "end_time": int(dates[i]),
+                        "type": f"BOS {current_level}",
+                        "color": "rgba(33, 150, 243, 0.9)",
+                        "is_choch": False
+                    })
+
+                    # Build OB from the pullback — last bullish candle before the drop
+                    ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates)
+                    if ob:
+                        # Check if already mitigated
+                        ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
+                        if not ob['is_mitigated']:
+                            zones.append(ob)
+
+                    ref_extreme_val = float(lows[i])
+                    ref_extreme_idx = i
+                    state = "IMPULSE"
+
+    elif cycle == "BULLISH":
+        ref_extreme_val = float(lows[anchor_idx])
+        ref_extreme_idx = anchor_idx
+        pb_extreme_val  = np.inf
+        pb_extreme_idx  = anchor_idx
+
+        for i in range(anchor_idx + 1, len(closes)):
+            if state == "IMPULSE":
+                if highs[i] > ref_extreme_val:
+                    ref_extreme_val = float(highs[i])
+                    ref_extreme_idx = i
+                elif lows[i] < ref_extreme_val - (atr * 0.5):
+                    state = "PULLBACK"
+                    pb_extreme_val = float(lows[i])
+                    pb_extreme_idx = i
+
+            elif state == "PULLBACK":
+                if lows[i] < pb_extreme_val:
+                    pb_extreme_val = float(lows[i])
+                    pb_extreme_idx = i
+
+                # BOS UP: body close above the last swing high
+                body_close = max(closes[i], opens[i])  # Top of body
+                if body_close > ref_extreme_val:
+                    current_level += 1
+
+                    bos_lines.append({
+                        "level": float(ref_extreme_val),
+                        "start_time": int(dates[ref_extreme_idx]),
+                        "end_time": int(dates[i]),
+                        "type": f"BOS {current_level}",
+                        "color": "rgba(33, 150, 243, 0.9)",
+                        "is_choch": False
+                    })
+
+                    ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates)
+                    if ob:
+                        ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
+                        if not ob['is_mitigated']:
+                            zones.append(ob)
+
+                    ref_extreme_val = float(highs[i])
+                    ref_extreme_idx = i
+                    state = "IMPULSE"
+
+    in_pullback = (state == "PULLBACK")
+
+    # ── STEP 4: CHoCH DETECTION ───────────────────────────────────────────────
+    choch = detect_choch(df, raw_highs, raw_lows, cycle)
+    if choch['detected']:
+        choch_lines.append({
+            "level": choch['level'],
             "start_time": int(dates[anchor_idx]),
-            "end_time": int(dates[-1]),
-            "type": pattern_name,
-            "color": "rgba(255, 215, 0, 1)" # Solid Gold Peak
-        }]
+            "end_time": choch['time'],
+            "type": "CHoCH ⚠️",
+            "color": "rgba(255, 165, 0, 1)",
+            "is_choch": True
+        })
 
-        # 2. VISUAL BOS & OB MAPPING
-        current_level = 0
-        state = "IMPULSE" 
-        
-        if cycle == "BEARISH":
-            swing_low_val = anchor_price
-            swing_low_idx = anchor_idx
-            pullback_high_val = -1
-            pullback_high_idx = -1
+    # ── STEP 5: FVGs ──────────────────────────────────────────────────────────
+    fvgs = detect_fair_value_gaps(df, atr)
 
-            for i in range(anchor_idx + 1, len(closes)):
-                if state == "IMPULSE":
-                    if lows[i] < swing_low_val:
-                        swing_low_val = lows[i] 
-                        swing_low_idx = i
-                    elif highs[i] > swing_low_val + (atr * 0.8): # Pullback begins
-                        state = "PULLBACK"
-                        pullback_high_val = highs[i]
-                        pullback_high_idx = i
-                
-                elif state == "PULLBACK":
-                    if highs[i] > pullback_high_val:
-                        pullback_high_val = highs[i] 
-                        pullback_high_idx = i
-                    elif closes[i] < swing_low_val: # BOS: Price breaks below the lowest point
-                        current_level += 1
-                        
-                        lines.append({
-                            "level": float(swing_low_val),
-                            "start_time": int(dates[swing_low_idx]),
-                            "end_time": int(dates[i]),
-                            "type": f"BOS {current_level}",
-                            "color": "rgba(33, 150, 243, 0.8)" 
-                        })
+    # ── STEP 6: ANCHOR LINE ───────────────────────────────────────────────────
+    all_lines = [{
+        "level": anchor_price,
+        "start_time": int(dates[anchor_idx]),
+        "end_time": int(dates[-1]),
+        "type": pattern_name,
+        "color": anchor_color
+    }] + bos_lines + choch_lines
 
-                        # Find Trap Candle for OB
-                        ob_idx = pullback_high_idx
-                        for k in range(pullback_high_idx, max(swing_low_idx, pullback_high_idx - 4), -1):
-                            if closes[k] > opens[k]: # Last bullish candle
-                                ob_idx = k
-                                break
-                        
-                        ob_top = highs[ob_idx]
-                        ob_bottom = lows[ob_idx]
+    # Only send the 3 most recent UNMITIGATED OBs to keep the chart clean
+    clean_zones = [z for z in zones if not z['is_mitigated']][-3:]
 
-                        # 🛑 THE FIX: Cap the OB height so it doesn't become a massive rectangle
-                        if (ob_top - ob_bottom) > (atr * 1.5):
-                            ob_bottom = ob_top - (atr * 1.5)
+    return {
+        "cycle": cycle,
+        "level": current_level + 1,
+        "in_pullback": in_pullback,
+        "zones": clean_zones,
+        "fvgs": fvgs,
+        "lines": all_lines,
+        "anchor": anchor_price,
+        "atr": atr,
+        "sweeps": recent_sweeps,
+        "choch": choch,
+        "raw_swing_highs": [int(x) for x in raw_highs[-5:]],
+        "raw_swing_lows":  [int(x) for x in raw_lows[-5:]]
+    }
 
-                        zones.append({
-                            "type": "OB_BEAR", 
-                            "top": float(ob_top),
-                            "bottom": float(ob_bottom),
-                            "price": float(ob_bottom),
-                            "time": int(dates[ob_idx]),
-                            "is_mitigated": False,
-                            "fvg_size_pips": float(abs(ob_top - ob_bottom)),
-                            "momentum_ratio": 2.0 
-                        })
 
-                        swing_low_val = lows[i]
-                        swing_low_idx = i
-                        state = "IMPULSE"
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL DECISION ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
 
-        elif cycle == "BULLISH":
-            swing_high_val = anchor_price
-            swing_high_idx = anchor_idx
-            pullback_low_val = float('inf')
-            pullback_low_idx = -1
+def score_ob_quality(ob: Dict, current_price: float, atr: float,
+                     rsi: float, cycle: str, sweep_nearby: bool) -> int:
+    """
+    Score an OB from 0-100 based on multiple confluence factors.
+    Human traders mentally do this checklist — we automate it.
+    """
+    score = 50  # Base
 
-            for i in range(anchor_idx + 1, len(closes)):
-                if state == "IMPULSE":
-                    if highs[i] > swing_high_val:
-                        swing_high_val = highs[i] 
-                        swing_high_idx = i
-                    elif lows[i] < swing_high_val - (atr * 0.8): # Pullback begins
-                        state = "PULLBACK"
-                        pullback_low_val = lows[i]
-                        pullback_low_idx = i
-                
-                elif state == "PULLBACK":
-                    if lows[i] < pullback_low_val:
-                        pullback_low_val = lows[i] 
-                        pullback_low_idx = i
-                    elif closes[i] > swing_high_val: # BOS: Price breaks above the highest point
-                        current_level += 1
-                        
-                        lines.append({
-                            "level": float(swing_high_val),
-                            "start_time": int(dates[swing_high_idx]),
-                            "end_time": int(dates[i]),
-                            "type": f"BOS {current_level}",
-                            "color": "rgba(33, 150, 243, 0.8)" 
-                        })
+    # 1. Price is inside or touching the OB (most important!)
+    if ob['type'] == "OB_BULL":
+        if ob['bottom'] <= current_price <= ob['top']:
+            score += 25       # Inside OB
+        elif current_price <= ob['top'] + (atr * 0.3):
+            score += 10       # Approaching from above
 
-                        # Find Trap Candle for OB
-                        ob_idx = pullback_low_idx
-                        for k in range(pullback_low_idx, max(swing_high_idx, pullback_low_idx - 4), -1):
-                            if closes[k] < opens[k]: # Last bearish candle
-                                ob_idx = k
-                                break
-                        
-                        ob_top = highs[ob_idx]
-                        ob_bottom = lows[ob_idx]
+    elif ob['type'] == "OB_BEAR":
+        if ob['bottom'] <= current_price <= ob['top']:
+            score += 25
+        elif current_price >= ob['bottom'] - (atr * 0.3):
+            score += 10
 
-                        # 🛑 THE FIX: Cap the OB height so it doesn't become a massive rectangle
-                        if (ob_top - ob_bottom) > (atr * 1.5):
-                            ob_top = ob_bottom + (atr * 1.5)
+    # 2. Cycle alignment
+    if (cycle == "BULLISH" and ob['type'] == "OB_BULL") or \
+       (cycle == "BEARISH" and ob['type'] == "OB_BEAR"):
+        score += 15
 
-                        zones.append({
-                            "type": "OB_BULL", 
-                            "top": float(ob_top),
-                            "bottom": float(ob_bottom),
-                            "price": float(ob_top),
-                            "time": int(dates[ob_idx]),
-                            "is_mitigated": False,
-                            "fvg_size_pips": float(abs(ob_top - ob_bottom)),
-                            "momentum_ratio": 2.0 
-                        })
+    # 3. RSI confluence
+    if ob['type'] == "OB_BULL" and rsi < 40:
+        score += 10   # Oversold at bullish OB = great
+    elif ob['type'] == "OB_BEAR" and rsi > 60:
+        score += 10   # Overbought at bearish OB = great
 
-                        swing_high_val = highs[i]
-                        swing_high_idx = i
-                        state = "IMPULSE"
+    # 4. Liquidity sweep nearby (HUGE confluence — stop hunt + OB = sniper entry)
+    if sweep_nearby:
+        score += 15
 
-        in_pullback = (state == "PULLBACK")
+    # 5. Penalize if OB zone is too large (low precision)
+    if ob['fvg_size_pips'] > atr * 3:
+        score -= 10
 
-        return {
-            "cycle": cycle,
-            "level": current_level + 1,
-            "in_pullback": in_pullback,
-            "zones": zones[-2:], # Keep UI clean: only show the 2 most recent OBs
-            "lines": lines,
-            "anchor": float(anchor_price)
-        }
-    except Exception as e:
-        logger.error(f"MMM Logic Error: {e}")
-        return {"cycle": "NEUTRAL", "level": 0, "in_pullback": False, "zones": [], "lines": [], "anchor": 0}
+    return min(score, 95)  # Cap at 95 — never claim 100%
 
-def calculate_trade_levels(current_price, signal, support, resistance, atr_value, decimals):
+
+def calculate_trade_levels(current_price: float, signal: str,
+                            support: float, resistance: float,
+                            atr: float, decimals: int,
+                            ob: Optional[Dict] = None) -> Optional[Dict]:
     try:
         entry = current_price
-        atr_buffer = atr_value * 1.5 if atr_value else entry * 0.002
-        
+
         if signal == "BUY":
-            stop_loss = support if (support > 0 and support < entry) else entry - atr_buffer
-            take_profit = resistance if (resistance > entry) else entry + (abs(entry - stop_loss) * 2)
+            # SL goes below the OB low, not just a generic ATR buffer
+            if ob:
+                stop_loss = ob['bottom'] - (atr * 0.5)
+            else:
+                stop_loss = support - (atr * 0.5) if support > 0 else entry - (atr * 1.5)
+            # TP1 at 1:1.5, TP2 at 1:3 (next OB/resistance)
+            risk = abs(entry - stop_loss)
+            take_profit = resistance if (resistance > entry + risk) else entry + (risk * 2.5)
+
         elif signal == "SELL":
-            stop_loss = resistance if (resistance > 0 and resistance > entry) else entry + atr_buffer
-            take_profit = support if (support < entry and support > 0) else entry - (abs(entry - stop_loss) * 2)
+            if ob:
+                stop_loss = ob['top'] + (atr * 0.5)
+            else:
+                stop_loss = resistance + (atr * 0.5) if resistance > 0 else entry + (atr * 1.5)
+            risk = abs(entry - stop_loss)
+            take_profit = support if (support > 0 and support < entry - risk) else entry - (risk * 2.5)
         else:
             return None
-        
+
+        risk = abs(entry - stop_loss)
+        if risk == 0:
+            return None
+        rr = round(abs(take_profit - entry) / risk, 2)
+
         return {
-            "entry": round(entry, decimals),
-            "stop_loss": round(stop_loss, decimals),
+            "entry":       round(entry, decimals),
+            "stop_loss":   round(stop_loss, decimals),
             "take_profit": round(take_profit, decimals),
-            "risk_reward": round(abs(take_profit - entry) / max(0.00001, abs(entry - stop_loss)), 2)
+            "risk_reward": rr
         }
-    except:
+    except Exception as e:
+        logger.error(f"Trade level calc error: {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API ENDPOINT
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
+    # ── DATA LOADING ──────────────────────────────────────────────────────────
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
         data_source = "LIVE_NODE_DATA"
@@ -321,145 +704,265 @@ async def analyze(req: AnalysisRequest):
         data_source = "CSV_FALLBACK"
 
     if df is None or df.empty:
-        return {"signal": "HOLD", "confidence": 0, "reasoning": ["Waiting for data..."]}
+        return {"signal": "HOLD", "confidence": 0, "reasoning": ["⏳ Waiting for data..."]}
 
     try:
-        csv_last_price = safe_float(df['Close'].iloc[-1])
-        current_price = req.current_price if req.current_price > 0 else csv_last_price
-        
-        decimals = 5 
-        if current_price > 500: decimals = 2 
-        elif current_price > 10: decimals = 3 
-        
-        ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
-        rsi = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
-        atr = safe_float((df['High'] - df['Low']).tail(14).mean(), current_price * 0.01)
-        
-        # --- EXECUTE MMM LOGIC ---
-        mmm_data = detect_mmm_cycle(df)
-        master_bias = f"{mmm_data.get('cycle', 'NEUTRAL')} CYCLE"
-        current_level = mmm_data.get('level', 0)
-        in_pullback = mmm_data.get('in_pullback', False)
-        
-        smc_zones = mmm_data.get("zones", [])
-        bos_lines = mmm_data.get("lines", [])
-        
-        nearest_supp = next((z for z in reversed(smc_zones) if z['type'] == 'OB_BULL'), None)
-        nearest_res = next((z for z in reversed(smc_zones) if z['type'] == 'OB_BEAR'), None)
-        
-        sup_level = nearest_supp['top'] if nearest_supp else current_price - (atr * 2)
-        res_level = nearest_res['bottom'] if nearest_res else current_price + (atr * 2)
+        csv_last_price  = safe_float(df['Close'].iloc[-1])
+        current_price   = req.current_price if req.current_price > 0 else csv_last_price
 
-        news_bias = "NEUTRAL"
-        news_val = 0
-        news_string = "No recent impactful news data."
-        
+        decimals = 5
+        if current_price > 500:  decimals = 2
+        elif current_price > 10: decimals = 3
+
+        # ── INDICATORS ────────────────────────────────────────────────────────
+        ema_200 = safe_float(
+            EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1],
+            current_price
+        )
+        ema_50 = safe_float(
+            EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1],
+            current_price
+        )
+        rsi = safe_float(
+            RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1],
+            50.0
+        )
+        atr = calculate_atr(df, 14)
+
+        # ── MARKET STRUCTURE ──────────────────────────────────────────────────
+        ms = analyze_market_structure(df)
+        cycle         = ms['cycle']
+        current_level = ms['level']
+        in_pullback   = ms['in_pullback']
+        smc_zones     = ms['zones']
+        bos_lines     = ms['lines']
+        fvgs          = ms['fvgs']
+        sweeps        = ms['sweeps']
+        choch         = ms['choch']
+
+        master_bias = f"{cycle} CYCLE"
+
+        # Closest OBs
+        bull_obs = [z for z in smc_zones if z['type'] == 'OB_BULL']
+        bear_obs = [z for z in smc_zones if z['type'] == 'OB_BEAR']
+
+        nearest_bull_ob = bull_obs[-1] if bull_obs else None
+        nearest_bear_ob = bear_obs[-1] if bear_obs else None
+
+        sup_level = nearest_bull_ob['bottom'] if nearest_bull_ob else current_price - (atr * 2)
+        res_level = nearest_bear_ob['top']    if nearest_bear_ob else current_price + (atr * 2)
+
+        # ── NEWS BIAS ─────────────────────────────────────────────────────────
+        news_val    = 0
+        news_string = "No recent impactful news."
         if req.news_data:
-            actual = safe_float(req.news_data.get('actual', 0))
+            actual   = safe_float(req.news_data.get('actual', 0))
             forecast = safe_float(req.news_data.get('forecast', 0))
-            event_name = req.news_data.get('event', 'News Event')
+            event    = req.news_data.get('event', 'News Event')
             if actual > forecast:
-                news_val = -1
-                news_string = f"📰 {event_name}: Actual ({actual}) beat Forecast ({forecast})."
+                news_val    = -1   # USD positive → XAU negative
+                news_string = f"📰 {event}: Beat forecast ({actual} vs {forecast}). USD bullish."
             elif actual < forecast:
-                news_val = 1
-                news_string = f"📰 {event_name}: Actual ({actual}) missed Forecast ({forecast})."
+                news_val    = 1
+                news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
-        signal = "NEUTRAL"
+        # ── EMA TREND FILTER ──────────────────────────────────────────────────
+        ema_bias = "ABOVE 200 EMA" if current_price > ema_200 else "BELOW 200 EMA"
+        ema_trend_ok_bull = current_price > ema_200
+        ema_trend_ok_bear = current_price < ema_200
+
+        # ── CHoCH WARNING ─────────────────────────────────────────────────────
+        choch_warning = ""
+        if choch['detected']:
+            if cycle == "BEARISH":
+                choch_warning = "⚠️ CHoCH Detected: Bearish structure may be reversing UP."
+            else:
+                choch_warning = "⚠️ CHoCH Detected: Bullish structure may be reversing DOWN."
+
+        # ── STOP HUNT / SWEEP AWARENESS ───────────────────────────────────────
+        # Check if the most recent sweep aligns with our trade direction
+        sweep_nearby = False
+        sweep_str    = ""
+        if sweeps:
+            last_sweep = sweeps[-1]
+            recent_enough = True  # Could add time filter here
+            if recent_enough:
+                if last_sweep['type'] == "BEAR_SWEEP" and cycle == "BULLISH":
+                    sweep_nearby = True
+                    sweep_str    = f"🎯 Buy-side liquidity swept at {last_sweep['level']:.{decimals}f} — potential reversal zone."
+                elif last_sweep['type'] == "BULL_SWEEP" and cycle == "BEARISH":
+                    sweep_nearby = True
+                    sweep_str    = f"🎯 Sell-side liquidity swept at {last_sweep['level']:.{decimals}f} — potential reversal zone."
+
+        # ── SIGNAL LOGIC ──────────────────────────────────────────────────────
+        signal     = "NEUTRAL"
         confidence = 0
-        base_conf = 0
-        target_zone = None
-        
+        target_ob  = None
+
         display_level = min(3, current_level)
-        phase_string = f"LEVEL {display_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
-        
-        strategy_logic = [
-            f"🧭 Master Bias: {master_bias}", 
+        phase_string  = f"LEVEL {display_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
+
+        reasoning = [
+            f"🧭 Master Bias: {master_bias}",
             f"📊 Phase: {phase_string}",
-            news_string
+            f"📈 Price vs EMA: {ema_bias}",
+            news_string,
         ]
 
-        # 🛑 TRUE MMM EXECUTION LOGIC
-        if current_level > 3 and not in_pullback:
-            strategy_logic.append("⏳ Exhaustion Reached: Do not trade. Waiting for new Anchor.")
-        elif not in_pullback:
-            strategy_logic.append(f"⏳ Market is pushing. Waiting for pullback to 1H-OB to enter.")
-        else:
-            if mmm_data['cycle'] == 'BULLISH' and nearest_supp:
-                distance_to_ob = current_price - nearest_supp['top']
-                if current_price <= nearest_supp['top'] and current_price >= (nearest_supp['bottom'] - (atr*0.5)): 
-                    signal = "BUY"
-                    target_zone = nearest_supp
-                    base_conf = 78
-                    strategy_logic.append(f"🔥 KILLZONE: Price tapped 1H-OB.")
-                elif distance_to_ob <= atr:
-                    strategy_logic.append(f"Approaching 1H-OB. Waiting for tap.")
-                else:
-                    strategy_logic.append(f"Pulling back. Waiting for price to reach 1H-OB.")
-                    
-            elif mmm_data['cycle'] == 'BEARISH' and nearest_res:
-                distance_to_ob = nearest_res['bottom'] - current_price
-                if current_price >= nearest_res['bottom'] and current_price <= (nearest_res['top'] + (atr*0.5)): 
-                    signal = "SELL"
-                    target_zone = nearest_res
-                    base_conf = 78
-                    strategy_logic.append(f"🔥 KILLZONE: Price tapped 1H-OB.")
-                elif distance_to_ob <= atr:
-                    strategy_logic.append(f"Approaching 1H-OB. Waiting for tap.")
-                else:
-                    strategy_logic.append(f"Rallying. Waiting for price to reach 1H-OB.")
+        if choch_warning:
+            reasoning.append(choch_warning)
+        if sweep_str:
+            reasoning.append(sweep_str)
 
-        if signal != "NEUTRAL" and target_zone and ML_MODEL:
+        # Exhaustion check (too many levels deep = likely reversal incoming)
+        if current_level > 4 and not in_pullback:
+            reasoning.append("⏳ Structure Exhausted (Level 4+). Waiting for new anchor formation.")
+
+        elif not in_pullback:
+            reasoning.append("🔄 Expansion phase active. Waiting for pullback to OB before entering.")
+
+        else:
+            # ── BULLISH ENTRY ─────────────────────────────────────────────────
+            if cycle == "BULLISH" and nearest_bull_ob:
+                ob = nearest_bull_ob
+                score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
+
+                # Price is AT or INSIDE the bullish OB
+                at_ob = ob['bottom'] - (atr * 0.3) <= current_price <= ob['top'] + (atr * 0.1)
+
+                if at_ob:
+                    if ema_trend_ok_bull:
+                        signal    = "BUY"
+                        target_ob = ob
+                        confidence = score
+                        reasoning.append(f"🔥 KILLZONE: Price tapped Bullish OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
+                        reasoning.append(f"✅ Trend confirmed: Above 200 EMA ({ema_200:.{decimals}f})")
+                        if rsi < 45:
+                            reasoning.append(f"✅ RSI oversold confluence ({rsi:.1f})")
+                    else:
+                        reasoning.append(f"🔥 OB tapped but below 200 EMA — reduced conviction BUY")
+                        signal    = "BUY"
+                        target_ob = ob
+                        confidence = max(50, score - 15)  # Lower confidence
+
+                elif current_price <= ob['top'] + atr:
+                    reasoning.append(f"📍 Approaching Bullish OB. Waiting for tap ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}).")
+                else:
+                    reasoning.append(f"📍 Pulling back toward Bullish OB at {ob['bottom']:.{decimals}f}.")
+
+            # ── BEARISH ENTRY ─────────────────────────────────────────────────
+            elif cycle == "BEARISH" and nearest_bear_ob:
+                ob = nearest_bear_ob
+                score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
+
+                at_ob = ob['bottom'] - (atr * 0.1) <= current_price <= ob['top'] + (atr * 0.3)
+
+                if at_ob:
+                    if ema_trend_ok_bear:
+                        signal    = "SELL"
+                        target_ob = ob
+                        confidence = score
+                        reasoning.append(f"🔥 KILLZONE: Price tapped Bearish OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
+                        reasoning.append(f"✅ Trend confirmed: Below 200 EMA ({ema_200:.{decimals}f})")
+                        if rsi > 55:
+                            reasoning.append(f"✅ RSI overbought confluence ({rsi:.1f})")
+                    else:
+                        reasoning.append(f"🔥 OB tapped but above 200 EMA — reduced conviction SELL")
+                        signal    = "SELL"
+                        target_ob = ob
+                        confidence = max(50, score - 15)
+
+                elif current_price >= ob['bottom'] - atr:
+                    reasoning.append(f"📍 Approaching Bearish OB. Waiting for tap ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}).")
+                else:
+                    reasoning.append(f"📍 Rallying toward Bearish OB at {ob['top']:.{decimals}f}.")
+
+            else:
+                reasoning.append("⚠️ No valid OB found in pullback zone. Standing aside.")
+
+        # ── ML OVERRIDE ───────────────────────────────────────────────────────
+        if signal != "NEUTRAL" and target_ob and ML_MODEL:
             try:
                 features = pd.DataFrame([{
-                    'type': 1 if signal == "BUY" else 0,
-                    'fvg_size_pips': target_zone.get('fvg_size_pips', 0.0),
-                    'rsi_at_entry': rsi,
-                    'atr_at_entry': atr,
-                    'momentum_ratio': target_zone.get('momentum_ratio', 1.0),
-                    'news_bias': news_val
+                    'type':           1 if signal == "BUY" else 0,
+                    'fvg_size_pips':  target_ob.get('fvg_size_pips', 0.0),
+                    'rsi_at_entry':   rsi,
+                    'atr_at_entry':   atr,
+                    'momentum_ratio': target_ob.get('momentum_ratio', 1.0),
+                    'news_bias':      news_val
                 }])
-                prob = ML_MODEL.predict_proba(features)[0][1] 
-                confidence = int(max(base_conf, prob * 100)) 
-                strategy_logic.append(f"🧠 ML Neural Prediction: {confidence}% Win Prob.")
-            except Exception:
-                pass
+                prob = ML_MODEL.predict_proba(features)[0][1]
+                ml_conf = int(prob * 100)
+                confidence = int((confidence + ml_conf) / 2)  # Blend rule + ML
+                reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
+            except Exception as ml_e:
+                logger.warning(f"ML inference failed: {ml_e}")
 
         if confidence == 0 and signal != "NEUTRAL":
-            confidence = base_conf
+            confidence = 60  # Minimum floor
 
-        trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr, decimals)
+        # ── TRADE SETUP ───────────────────────────────────────────────────────
+        trade_setup = None
+        if signal in ("BUY", "SELL") and confidence >= 65:
+            trade_setup = calculate_trade_levels(
+                current_price, signal, sup_level, res_level,
+                atr, decimals, ob=target_ob
+            )
+            if trade_setup:
+                reasoning.append(
+                    f"📐 Setup: Entry {trade_setup['entry']} | "
+                    f"SL {trade_setup['stop_loss']} | "
+                    f"TP {trade_setup['take_profit']} | "
+                    f"RR 1:{trade_setup['risk_reward']}"
+                )
 
+        # ── RESPONSE ──────────────────────────────────────────────────────────
         return {
-            "signal": signal,
+            "signal":     signal,
             "confidence": int(confidence),
-            "trend": master_bias, 
-            "pattern": f"MMM Pullback", 
-            "reasoning": strategy_logic,
-            "keyLevels": {"resistance": round(res_level, decimals), "support": round(sup_level, decimals), "ema": round(ema_200, decimals)},
-            "visuals": {
-                "smc_zones": smc_zones, 
-                "bos_lines": bos_lines 
+            "trend":      master_bias,
+            "pattern":    "MMM Pullback + OB",
+            "reasoning":  reasoning,
+            "keyLevels": {
+                "resistance": round(res_level, decimals),
+                "support":    round(sup_level, decimals),
+                "ema200":     round(ema_200, decimals),
+                "ema50":      round(ema_50, decimals),
             },
-            "tradeSetup": trade_setup if confidence >= 70 else None
+            "visuals": {
+                "smc_zones":  smc_zones,
+                "bos_lines":  bos_lines,
+                "fvgs":       fvgs,
+                "sweeps":     recent_sweeps,
+            },
+            "tradeSetup":  trade_setup,
+            "dataSource":  data_source,
         }
 
     except Exception as e:
         logger.error(f"Analysis Crash: {e}", exc_info=True)
-        return {"signal": "ERROR", "confidence": 0, "reasoning": [str(e)]}
+        return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
     try:
         url = f"{NODE_URL}/{path}"
-        if request.url.query: url += f"?{request.url.query}"
+        if request.url.query:
+            url += f"?{request.url.query}"
         body = await request.body() if request.method in ["POST", "PUT"] else None
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.request(
-                method=request.method, url=url,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
+                method=request.method,
+                url=url,
+                headers={k: v for k, v in request.headers.items()
+                         if k.lower() not in ['host', 'content-length']},
                 content=body
             )
-            return Response(content=response.content, status_code=response.status_code, headers=dict(response.headers))
-    except:
-        raise HTTPException(status_code=503)
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
+    except Exception:
+        raise HTTPException(status_code=503, detail="Node proxy unavailable")
