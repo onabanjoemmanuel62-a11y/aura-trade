@@ -275,71 +275,97 @@ def find_displacement_candle(df: pd.DataFrame, start_idx: int, direction: str,
     return -1
 
 
-def build_order_block(df: pd.DataFrame, anchor_idx: int, direction: str,
-                      atr: float, dates, ob_atr_cap: float = 1.0) -> Optional[Dict]:
+def build_order_block(df: pd.DataFrame, pb_extreme_idx: int, direction: str,
+                      atr: float, dates, ob_atr_cap: float = 1.0,
+                      bos_candle_idx: int = -1) -> Optional[Dict]:
     """
-    TRUE Order Block definition:
-    - BEARISH OB: The LAST BULLISH candle before a strong bearish move
-    - BULLISH OB: The LAST BEARISH candle before a strong bullish move
+    TRUE Order Block — matches what a human SMC trader draws on the chart.
 
-    ob_atr_cap: max OB height expressed as ATR multiplier (pair-specific).
-    Lower = tighter, more precise zones (better for Gold/Indices).
-    Higher = allows wider zones (needed for some forex pairs).
+    For a BULLISH OB (like the USDJPY "AFTER" image):
+      The OB is the LAST BEARISH candle in the pullback zone,
+      specifically the one closest to where the impulse UP began.
+      We scan FORWARD from the pullback extreme toward the BOS candle
+      and find the last bearish candle before a sequence of bullish closes.
+
+    For a BEARISH OB:
+      The OB is the LAST BULLISH candle before the impulse DOWN.
+      We scan forward from the pullback high toward the BOS candle.
+
+    The zone = body of that candle only (no wick padding).
+    Capped at ob_atr_cap × ATR to prevent massive rectangles.
     """
     closes = df['Close'].values
     opens  = df['Open'].values
     highs  = df['High'].values
     lows   = df['Low'].values
+    n      = len(closes)
 
-    scan_start = max(0, anchor_idx - 10)  # Look back max 10 candles
+    # Search window: from pullback extreme toward BOS candle (max 15 candles)
+    end_idx = bos_candle_idx if (bos_candle_idx > pb_extreme_idx) else min(pb_extreme_idx + 15, n - 1)
+    scan_range = range(pb_extreme_idx, min(end_idx + 1, n))
 
-    if direction == "BEAR":  # Find last bullish candle before bearish move
-        for k in range(anchor_idx, scan_start, -1):
-            if closes[k] > opens[k]:  # Bullish candle
-                body_top    = max(closes[k], opens[k])
-                body_bottom = min(closes[k], opens[k])
-                # Use BODY only — no wick extension (wicks = stop hunt territory)
-                ob_top    = float(body_top)
-                ob_bottom = float(body_bottom)
-                # Cap OB height using pair-specific multiplier
-                if (ob_top - ob_bottom) > atr * ob_atr_cap:
-                    ob_bottom = ob_top - (atr * ob_atr_cap)
-                return {
-                    "type": "OB_BEAR",
-                    "top": round(ob_top, 8),
-                    "bottom": round(ob_bottom, 8),
-                    "price": round(ob_top, 8),
-                    "time": int(dates[k]),
-                    "candle_idx": int(k),
-                    "is_mitigated": False,
-                    "fvg_size_pips": float(ob_top - ob_bottom),
-                    "momentum_ratio": 2.0,
-                    "label": "Bearish OB"
-                }
+    ob_candle_idx = -1
 
-    elif direction == "BULL":  # Find last bearish candle before bullish move
-        for k in range(anchor_idx, scan_start, -1):
+    if direction == "BULL":
+        # Find the LAST bearish candle in the window (last red before the green impulse)
+        for k in scan_range:
             if closes[k] < opens[k]:  # Bearish candle
-                body_top    = max(closes[k], opens[k])
-                body_bottom = min(closes[k], opens[k])
-                ob_top    = float(body_top)
-                ob_bottom = float(body_bottom)
-                if (ob_top - ob_bottom) > atr * ob_atr_cap:
-                    ob_top = ob_bottom + (atr * ob_atr_cap)
-                return {
-                    "type": "OB_BULL",
-                    "top": round(ob_top, 8),
-                    "bottom": round(ob_bottom, 8),
-                    "price": round(ob_bottom, 8),
-                    "time": int(dates[k]),
-                    "candle_idx": int(k),
-                    "is_mitigated": False,
-                    "fvg_size_pips": float(ob_top - ob_bottom),
-                    "momentum_ratio": 2.0,
-                    "label": "Bullish OB"
-                }
+                ob_candle_idx = k
 
-    return None
+    elif direction == "BEAR":
+        # Find the LAST bullish candle in the window (last green before the red impulse)
+        for k in scan_range:
+            if closes[k] > opens[k]:  # Bullish candle
+                ob_candle_idx = k
+
+    # Fallback: if no opposing candle found, use the extreme candle itself
+    if ob_candle_idx == -1:
+        ob_candle_idx = pb_extreme_idx
+
+    body_top    = float(max(closes[ob_candle_idx], opens[ob_candle_idx]))
+    body_bottom = float(min(closes[ob_candle_idx], opens[ob_candle_idx]))
+
+    # Minimum zone size: at least 0.1× ATR so it's visible on chart
+    min_size = atr * 0.1
+    if (body_top - body_bottom) < min_size:
+        mid = (body_top + body_bottom) / 2.0
+        body_top    = mid + min_size / 2.0
+        body_bottom = mid - min_size / 2.0
+
+    # Cap maximum zone size
+    if direction == "BULL" and (body_top - body_bottom) > atr * ob_atr_cap:
+        body_top = body_bottom + (atr * ob_atr_cap)
+    elif direction == "BEAR" and (body_top - body_bottom) > atr * ob_atr_cap:
+        body_bottom = body_top - (atr * ob_atr_cap)
+
+    if direction == "BULL":
+        return {
+            "type":          "OB_BULL",
+            "top":           round(body_top, 8),
+            "bottom":        round(body_bottom, 8),
+            "price":         round(body_bottom, 8),  # Entry at bottom of bullish OB
+            "time":          int(dates[ob_candle_idx]),
+            "candle_idx":    int(ob_candle_idx),
+            "is_mitigated":  False,
+            "fvg_size_pips": float(body_top - body_bottom),
+            "momentum_ratio": 2.0,
+            "label":         "1H-OB (Bullish)",
+            "entry_label":   "ONLY BUYS"
+        }
+    else:
+        return {
+            "type":          "OB_BEAR",
+            "top":           round(body_top, 8),
+            "bottom":        round(body_bottom, 8),
+            "price":         round(body_top, 8),   # Entry at top of bearish OB
+            "time":          int(dates[ob_candle_idx]),
+            "candle_idx":    int(ob_candle_idx),
+            "is_mitigated":  False,
+            "fvg_size_pips": float(body_top - body_bottom),
+            "momentum_ratio": 2.0,
+            "label":         "1H-OB (Bearish)",
+            "entry_label":   "ONLY SELLS"
+        }
 
 
 def check_ob_mitigation(df: pd.DataFrame, ob: Dict, from_idx: int) -> bool:
@@ -613,7 +639,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
                 })
 
                 # OB = last bullish candle in the pullback zone
-                ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap)
+                ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap, bos_candle_idx)
                 if ob:
                     ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
                     if not ob['is_mitigated']:
@@ -666,7 +692,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
                     "is_choch": False
                 })
 
-                ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap)
+                ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap, bos_candle_idx)
                 if ob:
                     ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
                     if not ob['is_mitigated']:
@@ -956,58 +982,57 @@ async def analyze(req: AnalysisRequest):
         else:
             # ── BULLISH ENTRY ─────────────────────────────────────────────────
             if cycle == "BULLISH" and nearest_bull_ob:
-                ob = nearest_bull_ob
+                ob    = nearest_bull_ob
                 score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
+                entry_label = ob.get("entry_label", "ONLY BUYS")
 
-                # Price is AT or INSIDE the bullish OB
-                at_ob = ob['bottom'] - (atr * 0.3) <= current_price <= ob['top'] + (atr * 0.1)
+                # Inside OB: price is between bottom - 0.5ATR and top + 0.1ATR
+                inside_ob    = ob['bottom'] - (atr * 0.5) <= current_price <= ob['top'] + (atr * 0.1)
+                # Approaching: within 2 ATR above the OB
+                approaching  = ob['top'] < current_price <= ob['top'] + (atr * 2.0)
 
-                if at_ob:
-                    if ema_trend_ok_bull:
-                        signal    = "BUY"
-                        target_ob = ob
-                        confidence = score
-                        reasoning.append(f"🔥 KILLZONE: Price tapped Bullish OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
-                        reasoning.append(f"✅ Trend confirmed: Above 200 EMA ({ema_200:.{decimals}f})")
-                        if rsi < 45:
-                            reasoning.append(f"✅ RSI oversold confluence ({rsi:.1f})")
-                    else:
-                        reasoning.append(f"🔥 OB tapped but below 200 EMA — reduced conviction BUY")
-                        signal    = "BUY"
-                        target_ob = ob
-                        confidence = max(50, score - 15)  # Lower confidence
-
-                elif current_price <= ob['top'] + atr:
-                    reasoning.append(f"📍 Approaching Bullish OB. Waiting for tap ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}).")
+                if inside_ob:
+                    signal     = "BUY"
+                    target_ob  = ob
+                    confidence = score if ema_trend_ok_bull else max(50, score - 15)
+                    ema_str    = f"✅ Above 200 EMA ({ema_200:.{decimals}f})" if ema_trend_ok_bull else f"⚠️ Below 200 EMA — reduced conviction"
+                    reasoning.append(f"🔥 KILLZONE: {entry_label} — Price inside 1H-OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
+                    reasoning.append(ema_str)
+                    if rsi < 45:
+                        reasoning.append(f"✅ RSI oversold confluence ({rsi:.1f})")
+                    if sweep_nearby:
+                        reasoning.append("🎯 Stop hunt sweep adds confluence")
+                elif approaching:
+                    reasoning.append(f"📍 {entry_label} — Approaching 1H-OB at {ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}. Waiting for tap.")
                 else:
-                    reasoning.append(f"📍 Pulling back toward Bullish OB at {ob['bottom']:.{decimals}f}.")
+                    dist = abs(current_price - ob['top'])
+                    reasoning.append(f"📍 {entry_label} — Pulling back toward 1H-OB at {ob['bottom']:.{decimals}f} ({dist:.{decimals}f} away).")
 
             # ── BEARISH ENTRY ─────────────────────────────────────────────────
             elif cycle == "BEARISH" and nearest_bear_ob:
-                ob = nearest_bear_ob
+                ob    = nearest_bear_ob
                 score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
+                entry_label = ob.get("entry_label", "ONLY SELLS")
 
-                at_ob = ob['bottom'] - (atr * 0.1) <= current_price <= ob['top'] + (atr * 0.3)
+                inside_ob   = ob['bottom'] - (atr * 0.1) <= current_price <= ob['top'] + (atr * 0.5)
+                approaching = ob['bottom'] - (atr * 2.0) <= current_price < ob['bottom']
 
-                if at_ob:
-                    if ema_trend_ok_bear:
-                        signal    = "SELL"
-                        target_ob = ob
-                        confidence = score
-                        reasoning.append(f"🔥 KILLZONE: Price tapped Bearish OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
-                        reasoning.append(f"✅ Trend confirmed: Below 200 EMA ({ema_200:.{decimals}f})")
-                        if rsi > 55:
-                            reasoning.append(f"✅ RSI overbought confluence ({rsi:.1f})")
-                    else:
-                        reasoning.append(f"🔥 OB tapped but above 200 EMA — reduced conviction SELL")
-                        signal    = "SELL"
-                        target_ob = ob
-                        confidence = max(50, score - 15)
-
-                elif current_price >= ob['bottom'] - atr:
-                    reasoning.append(f"📍 Approaching Bearish OB. Waiting for tap ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}).")
+                if inside_ob:
+                    signal     = "SELL"
+                    target_ob  = ob
+                    confidence = score if ema_trend_ok_bear else max(50, score - 15)
+                    ema_str    = f"✅ Below 200 EMA ({ema_200:.{decimals}f})" if ema_trend_ok_bear else f"⚠️ Above 200 EMA — reduced conviction"
+                    reasoning.append(f"🔥 KILLZONE: {entry_label} — Price inside 1H-OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
+                    reasoning.append(ema_str)
+                    if rsi > 55:
+                        reasoning.append(f"✅ RSI overbought confluence ({rsi:.1f})")
+                    if sweep_nearby:
+                        reasoning.append("🎯 Stop hunt sweep adds confluence")
+                elif approaching:
+                    reasoning.append(f"📍 {entry_label} — Approaching 1H-OB at {ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}. Waiting for tap.")
                 else:
-                    reasoning.append(f"📍 Rallying toward Bearish OB at {ob['top']:.{decimals}f}.")
+                    dist = abs(current_price - ob['bottom'])
+                    reasoning.append(f"📍 {entry_label} — Rallying toward 1H-OB at {ob['top']:.{decimals}f} ({dist:.{decimals}f} away).")
 
             else:
                 reasoning.append("⚠️ No valid OB found in pullback zone. Standing aside.")
