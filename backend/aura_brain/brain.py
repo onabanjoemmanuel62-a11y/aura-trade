@@ -532,14 +532,24 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             best_low_score = rally
             best_low_idx   = int(sl)
 
-    # Composite score: 60% price significance + 40% recency
-    high_recency = best_high_idx / len(closes)
-    low_recency  = best_low_idx  / len(closes)
-    denom = best_high_score + best_low_score + 1e-9
-    high_composite = (best_high_score / denom * 0.6) + (high_recency * 0.4)
-    low_composite  = (best_low_score  / denom * 0.6) + (low_recency  * 0.4)
+    # ── ANCHOR DECISION ──────────────────────────────────────────────────────
+    # Pure consequence scoring — NO recency bias.
+    # The anchor is whichever extreme caused the BIGGEST absolute price move
+    # afterward. This is exactly how a human analyst identifies a macro anchor:
+    # "what peak/trough started this whole trend?"
+    #
+    # Tiebreaker: if scores are within 10% of each other, prefer the more recent one
+    # (it's the fresher structure).
+    score_diff_pct = abs(best_high_score - best_low_score) / (max(best_high_score, best_low_score) + 1e-9)
 
-    if high_composite > low_composite:
+    if score_diff_pct > 0.10:
+        # Clear winner — use pure consequence score
+        use_bearish = best_high_score > best_low_score
+    else:
+        # Too close — prefer the more recent anchor (tiebreaker)
+        use_bearish = best_high_idx > best_low_idx
+
+    if use_bearish:
         cycle        = "BEARISH"
         anchor_idx   = best_high_idx
         anchor_price = float(highs[anchor_idx])
@@ -553,7 +563,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     logger.info(f"Anchor: {cycle} @ {anchor_price:.2f} idx={anchor_idx} "
-                f"(H-score={best_high_score:.1f} L-score={best_low_score:.1f})")
+                f"H-score={best_high_score:.1f} L-score={best_low_score:.1f} "
+                f"diff={score_diff_pct:.1%}")
 
     # ── STEP 2: LIQUIDITY SWEEP DETECTION ────────────────────────────────────
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
@@ -741,18 +752,23 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     clean_zones = [z for z in zones if not z['is_mitigated']][-3:]
 
     return {
-        "cycle": cycle,
-        "level": current_level + 1,
-        "in_pullback": in_pullback,
-        "zones": clean_zones,
-        "fvgs": fvgs,
-        "lines": all_lines,
-        "anchor": anchor_price,
-        "atr": atr,
-        "sweeps": recent_sweeps,
-        "choch": choch,
-        "raw_swing_highs": [int(x) for x in raw_highs[-5:]],
-        "raw_swing_lows":  [int(x) for x in raw_lows[-5:]]
+        "cycle":           cycle,
+        "level":           current_level + 1,
+        "in_pullback":     in_pullback,
+        "zones":           clean_zones,
+        "fvgs":            fvgs,
+        "lines":           all_lines,
+        "anchor":          anchor_price,
+        "anchor_idx":      int(anchor_idx),
+        "anchor_high_idx": int(best_high_idx),
+        "anchor_low_idx":  int(best_low_idx),
+        "anchor_high_score": round(best_high_score, 4),
+        "anchor_low_score":  round(best_low_score, 4),
+        "atr":             atr,
+        "sweeps":          recent_sweeps,
+        "choch":           choch,
+        "raw_swing_highs": [int(x) for x in raw_highs[-8:]],
+        "raw_swing_lows":  [int(x) for x in raw_lows[-8:]]
     }
 
 
@@ -1099,6 +1115,142 @@ async def analyze(req: AnalysisRequest):
     except Exception as e:
         logger.error(f"Analysis Crash: {e}", exc_info=True)
         return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
+
+
+@app.post("/api/debug")
+async def debug_analysis(req: AnalysisRequest):
+    """
+    🔬 DIAGNOSTIC ENDPOINT — verifies the engine is working correctly.
+    Returns a full human-readable breakdown of every decision the engine made:
+    - Which candle was chosen as anchor and WHY (score)
+    - Every swing pivot found (so you can verify against the chart)
+    - Every BOS level and which candles triggered it
+    - Every OB: which candle it came from, top/bottom, mitigated?
+    - Current phase and what the engine is waiting for
+    - ATR, swing_order, profile used
+    Call: POST /api/debug  (same body as /api/analyze)
+    """
+    if req.candles and len(req.candles) > 50:
+        df = process_live_candles(req.candles)
+    else:
+        df = MARKET_MEMORY["df"]
+
+    if df is None or df.empty:
+        return {"error": "No data available"}
+
+    try:
+        csv_last_price = safe_float(df['Close'].iloc[-1])
+        current_price  = req.current_price if req.current_price > 0 else csv_last_price
+        profile        = get_instrument_profile(req.currency, current_price)
+        decimals       = profile['decimals']
+        atr            = calculate_atr(df, 14)
+        swing_order    = adaptive_swing_order(df, atr)
+
+        highs  = df['High'].values
+        lows   = df['Low'].values
+        closes = df['Close'].values
+        dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+
+        raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
+        raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
+
+        ANCHOR_LOOKBACK = min(len(closes), 600)
+        search_highs = raw_highs[raw_highs >= len(closes) - ANCHOR_LOOKBACK]
+        search_lows  = raw_lows[raw_lows   >= len(closes) - ANCHOR_LOOKBACK]
+
+        # Score all swing highs
+        high_scores = []
+        for sh in search_highs:
+            subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
+            drop = float(highs[sh]) - subsequent_low
+            high_scores.append({
+                "candle_idx":    int(sh),
+                "price":         round(float(highs[sh]), decimals),
+                "date":          str(dates[sh]),
+                "drop_after":    round(drop, decimals),
+                "is_chosen":     False
+            })
+        high_scores.sort(key=lambda x: x["drop_after"], reverse=True)
+
+        # Score all swing lows
+        low_scores = []
+        for sl in search_lows:
+            subsequent_high = float(np.max(highs[sl:])) if sl < len(highs) - 1 else float(lows[sl])
+            rally = subsequent_high - float(lows[sl])
+            low_scores.append({
+                "candle_idx":   int(sl),
+                "price":        round(float(lows[sl]), decimals),
+                "date":         str(dates[sl]),
+                "rally_after":  round(rally, decimals),
+                "is_chosen":    False
+            })
+        low_scores.sort(key=lambda x: x["rally_after"], reverse=True)
+
+        # Run full analysis to get results
+        ms = analyze_market_structure(df, profile)
+
+        # Mark chosen anchor
+        for h in high_scores:
+            if h["candle_idx"] == ms.get("anchor_high_idx", -1):
+                h["is_chosen"] = True
+        for l in low_scores:
+            if l["candle_idx"] == ms.get("anchor_low_idx", -1):
+                l["is_chosen"] = True
+
+        # Build BOS summary
+        bos_summary = []
+        for b in ms['lines']:
+            if "BOS" in b.get("type", ""):
+                bos_summary.append({
+                    "label":       b["type"],
+                    "level":       round(b["level"], decimals),
+                    "start_time":  b["start_time"],
+                    "end_time":    b["end_time"],
+                })
+
+        # Build OB summary
+        ob_summary = []
+        for z in ms['zones']:
+            ob_summary.append({
+                "type":        z["type"],
+                "label":       z.get("label", ""),
+                "entry_label": z.get("entry_label", ""),
+                "top":         round(z["top"], decimals),
+                "bottom":      round(z["bottom"], decimals),
+                "height_atr":  round((z["top"] - z["bottom"]) / atr, 2),
+                "candle_idx":  z.get("candle_idx", -1),
+                "mitigated":   z.get("is_mitigated", False),
+            })
+
+        return {
+            "✅ ENGINE VERSION":    "AuraBrain SMC v11",
+            "📊 INSTRUMENT":       req.currency,
+            "💰 CURRENT PRICE":    round(current_price, decimals),
+            "📐 PROFILE":          profile,
+            "📏 ATR (14)":         round(atr, decimals),
+            "🔍 SWING ORDER":      swing_order,
+            "📈 TOTAL CANDLES":    len(df),
+            "─── ANCHOR ───": "─────────────────────────────────────────",
+            "🎯 CYCLE":            ms['cycle'],
+            "🎯 ANCHOR PRICE":     round(ms['anchor'], decimals),
+            "🎯 ANCHOR CANDLE":    int(anchor_idx := ms.get('anchor_idx', 0)),
+            "─── SWING HIGHS (ranked by drop) ───": "────────────────",
+            "swing_highs_scored":  high_scores[:6],
+            "─── SWING LOWS (ranked by rally) ───": "────────────────",
+            "swing_lows_scored":   low_scores[:6],
+            "─── STRUCTURE ───": "──────────────────────────────────────",
+            "📊 PHASE":            f"Level {ms['level']} ({'PULLBACK' if ms['in_pullback'] else 'EXPANSION'})",
+            "🔵 BOS LINES":        bos_summary,
+            "🟥 ORDER BLOCKS":     ob_summary,
+            "⚠️  CHoCH":           ms['choch'],
+            "🎯 SWEEPS":           ms['sweeps'],
+            "─── VERDICT ───": "──────────────────────────────────────",
+            "🧭 BIAS":             f"{ms['cycle']} CYCLE",
+            "📍 WAITING FOR":      f"Price to tap {'Bullish OB' if ms['cycle'] == 'BULLISH' else 'Bearish OB'}" if ms['in_pullback'] else "Expansion to complete before pullback",
+        }
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
