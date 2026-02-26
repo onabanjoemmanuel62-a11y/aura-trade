@@ -596,48 +596,83 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     post_anchor_sh = raw_highs[raw_highs > anchor_idx]
     post_anchor_sl = raw_lows[raw_lows   > anchor_idx]
 
+    # ── TRUE BOS LOGIC ────────────────────────────────────────────────────────
+    # The correct MMM / SMC sequence is:
+    #
+    #  BEARISH CYCLE:
+    #    Anchor (PFH) → IMPULSE down to swing low L1 → PULLBACK up to swing high H1
+    #    → price breaks BELOW L1 → THIS is BOS 1. The level broken is L1, NOT the anchor.
+    #    Then: new impulse to L2 → pullback to H2 → break below L2 → BOS 2. Etc.
+    #
+    #  BULLISH CYCLE:
+    #    Anchor (PFL) → IMPULSE up to swing high H1 → PULLBACK down to swing low L1
+    #    → price breaks ABOVE H1 → THIS is BOS 1.
+    #
+    # So the algorithm is:
+    #   Phase 0 — INITIAL IMPULSE: find the FIRST swing extreme after the anchor.
+    #             This becomes our first "reference level" to be broken.
+    #             (We do NOT draw a BOS for the initial impulse — it is just the setup.)
+    #   Phase 1+ — For each subsequent swing extreme that EXCEEDS the prior:
+    #             Find the pullback between them, build the OB, draw the BOS.
+
     if cycle == "BEARISH":
-        # Reference levels = validated swing lows (each must be broken for a BOS)
-        # We track: the last confirmed swing low, and the pullback high before the break
-        last_confirmed_low_idx = anchor_idx
-        last_confirmed_low_val = float(highs[anchor_idx])  # Anchor is a high; first ref is it
+        if len(post_anchor_sl) == 0:
+            pass  # No structure yet
+        else:
+            # Phase 0: First swing low after anchor = initial impulse reference
+            # This is NOT a BOS — it's just where the market first showed weakness
+            first_sl_idx   = int(post_anchor_sl[0])
+            first_sl_price = float(lows[first_sl_idx])
 
-        # Walk through post-anchor swing lows in chronological order
-        for sl_idx in post_anchor_sl:
-            if current_level >= MAX_BOS:
-                break
-            sl_price = float(lows[sl_idx])
+            last_confirmed_low_idx = first_sl_idx
+            last_confirmed_low_val = first_sl_price
 
-            # Find the pullback high BETWEEN last_confirmed_low_idx and sl_idx
-            # (the highest swing high in that window)
-            pb_highs_in_window = post_anchor_sh[
-                (post_anchor_sh > last_confirmed_low_idx) &
-                (post_anchor_sh < sl_idx)
-            ]
-            if len(pb_highs_in_window) == 0:
-                # No swing high in window — use the raw highest candle
-                window_slice = highs[last_confirmed_low_idx:sl_idx]
-                if len(window_slice) == 0:
+            # Phase 1+: Walk remaining swing lows looking for each successive break
+            for sl_idx in post_anchor_sl[1:]:  # Skip the first one (initial impulse)
+                if current_level >= MAX_BOS:
+                    break
+                sl_price = float(lows[sl_idx])
+
+                # Must break BELOW the last confirmed swing low (not just touch it)
+                if sl_price >= last_confirmed_low_val:
+                    # This swing low is HIGHER — could be a pullback low, not a new BOS
+                    # Update the reference if this is a more recent higher low (no action)
                     continue
-                pb_extreme_idx = int(last_confirmed_low_idx + np.argmax(window_slice))
-            else:
-                pb_extreme_idx = int(pb_highs_in_window[np.argmax(highs[pb_highs_in_window])])
 
-            pb_extreme_val = float(highs[pb_extreme_idx])
+                # Find the pullback HIGH between last_confirmed_low and this new low
+                # This is the swing high that formed AFTER the last low and BEFORE this new low
+                pb_highs_in_window = post_anchor_sh[
+                    (post_anchor_sh > last_confirmed_low_idx) &
+                    (post_anchor_sh < sl_idx)
+                ]
+                if len(pb_highs_in_window) == 0:
+                    # No swing high found — look at raw highest candle in window
+                    window_slice = highs[last_confirmed_low_idx:sl_idx]
+                    if len(window_slice) < 3:
+                        # Window too small — skip, not a real BOS
+                        last_confirmed_low_val = sl_price
+                        last_confirmed_low_idx = sl_idx
+                        continue
+                    pb_extreme_idx = int(last_confirmed_low_idx + np.argmax(window_slice))
+                else:
+                    pb_extreme_idx = int(pb_highs_in_window[np.argmax(highs[pb_highs_in_window])])
 
-            # Only count as BOS if this swing low is LOWER than the previous reference
-            # AND the break closes with enough displacement (not a 1-pip scrape)
-            if sl_price < last_confirmed_low_val:
-                # Find the first candle AFTER sl_idx that closes below sl_price with displacement
-                bos_candle_idx = -1
+                pb_extreme_val = float(highs[pb_extreme_idx])
+
+                # Require a REAL pullback: the swing high must be meaningfully above the low
+                # (at least pullback_atr × ATR above last_confirmed_low_val)
+                if pb_extreme_val < last_confirmed_low_val + (atr * pullback_atr):
+                    # Too shallow — not a real pullback, just noise. Skip BOS, update ref.
+                    last_confirmed_low_val = sl_price
+                    last_confirmed_low_idx = sl_idx
+                    continue
+
+                # Valid BOS: find the break candle
+                bos_candle_idx = sl_idx
                 for j in range(sl_idx, min(sl_idx + 5, len(closes))):
-                    if closes[j] < (sl_price - min_disp):
+                    if closes[j] < (last_confirmed_low_val - min_disp):
                         bos_candle_idx = j
                         break
-
-                if bos_candle_idx == -1:
-                    # Swing low exists but no displacement close yet — still valid structure
-                    bos_candle_idx = sl_idx
 
                 current_level += 1
                 bos_lines.append({
@@ -649,7 +684,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
                     "is_choch": False
                 })
 
-                # OB = last bullish candle in the pullback zone
                 ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap, bos_candle_idx)
                 if ob:
                     ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
@@ -660,38 +694,53 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
                 last_confirmed_low_idx = sl_idx
 
     elif cycle == "BULLISH":
-        last_confirmed_high_idx = anchor_idx
-        last_confirmed_high_val = float(lows[anchor_idx])  # Anchor is a low
+        if len(post_anchor_sh) == 0:
+            pass
+        else:
+            # Phase 0: First swing high after anchor = initial impulse reference (NOT a BOS)
+            first_sh_idx   = int(post_anchor_sh[0])
+            first_sh_price = float(highs[first_sh_idx])
 
-        for sh_idx in post_anchor_sh:
-            if current_level >= MAX_BOS:
-                break
-            sh_price = float(highs[sh_idx])
+            last_confirmed_high_idx = first_sh_idx
+            last_confirmed_high_val = first_sh_price
 
-            # Find pullback low between last confirmed high and this swing high
-            pb_lows_in_window = post_anchor_sl[
-                (post_anchor_sl > last_confirmed_high_idx) &
-                (post_anchor_sl < sh_idx)
-            ]
-            if len(pb_lows_in_window) == 0:
-                window_slice = lows[last_confirmed_high_idx:sh_idx]
-                if len(window_slice) == 0:
+            # Phase 1+: Walk remaining swing highs
+            for sh_idx in post_anchor_sh[1:]:
+                if current_level >= MAX_BOS:
+                    break
+                sh_price = float(highs[sh_idx])
+
+                if sh_price <= last_confirmed_high_val:
+                    continue  # Lower high — not a BOS candidate
+
+                # Find the pullback LOW between last confirmed high and this new high
+                pb_lows_in_window = post_anchor_sl[
+                    (post_anchor_sl > last_confirmed_high_idx) &
+                    (post_anchor_sl < sh_idx)
+                ]
+                if len(pb_lows_in_window) == 0:
+                    window_slice = lows[last_confirmed_high_idx:sh_idx]
+                    if len(window_slice) < 3:
+                        last_confirmed_high_val = sh_price
+                        last_confirmed_high_idx = sh_idx
+                        continue
+                    pb_extreme_idx = int(last_confirmed_high_idx + np.argmin(window_slice))
+                else:
+                    pb_extreme_idx = int(pb_lows_in_window[np.argmin(lows[pb_lows_in_window])])
+
+                pb_extreme_val = float(lows[pb_extreme_idx])
+
+                # Require a real pullback
+                if pb_extreme_val > last_confirmed_high_val - (atr * pullback_atr):
+                    last_confirmed_high_val = sh_price
+                    last_confirmed_high_idx = sh_idx
                     continue
-                pb_extreme_idx = int(last_confirmed_high_idx + np.argmin(window_slice))
-            else:
-                pb_extreme_idx = int(pb_lows_in_window[np.argmin(lows[pb_lows_in_window])])
 
-            pb_extreme_val = float(lows[pb_extreme_idx])
-
-            if sh_price > last_confirmed_high_val:
-                bos_candle_idx = -1
+                bos_candle_idx = sh_idx
                 for j in range(sh_idx, min(sh_idx + 5, len(closes))):
-                    if closes[j] > (sh_price + min_disp):
+                    if closes[j] > (last_confirmed_high_val + min_disp):
                         bos_candle_idx = j
                         break
-
-                if bos_candle_idx == -1:
-                    bos_candle_idx = sh_idx
 
                 current_level += 1
                 bos_lines.append({
@@ -713,16 +762,22 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
                 last_confirmed_high_idx = sh_idx
 
     in_pullback = False
-    # Determine if price is currently in a pullback (between last BOS and next OB tap)
-    if cycle == "BEARISH" and len(post_anchor_sh) > 0:
-        # If the most recent swing high is AFTER the last confirmed swing low → pullback
-        last_sh_after_anchor = int(post_anchor_sh[-1])
-        last_sl_after_anchor = int(post_anchor_sl[-1]) if len(post_anchor_sl) > 0 else anchor_idx
-        in_pullback = last_sh_after_anchor > last_sl_after_anchor
-    elif cycle == "BULLISH" and len(post_anchor_sl) > 0:
-        last_sl_after_anchor = int(post_anchor_sl[-1])
-        last_sh_after_anchor = int(post_anchor_sh[-1]) if len(post_anchor_sh) > 0 else anchor_idx
-        in_pullback = last_sl_after_anchor > last_sh_after_anchor
+    # Determine current phase:
+    # - If we have BOS lines: in_pullback = most recent swing is AGAINST the trend
+    # - If NO BOS yet (still in phase 0 initial impulse): in_pullback = False (still expanding)
+    if current_level == 0:
+        # No BOS drawn yet — still in initial impulse. Not in pullback.
+        in_pullback = False
+    elif cycle == "BEARISH" and len(post_anchor_sh) > 0 and len(post_anchor_sl) > 0:
+        # In pullback if the most recent swing HIGH came after the most recent swing LOW
+        last_sh = int(post_anchor_sh[-1])
+        last_sl = int(post_anchor_sl[-1])
+        in_pullback = last_sh > last_sl
+    elif cycle == "BULLISH" and len(post_anchor_sl) > 0 and len(post_anchor_sh) > 0:
+        # In pullback if the most recent swing LOW came after the most recent swing HIGH
+        last_sl = int(post_anchor_sl[-1])
+        last_sh = int(post_anchor_sh[-1])
+        in_pullback = last_sl > last_sh
 
     # ── STEP 4: CHoCH DETECTION ───────────────────────────────────────────────
     choch = detect_choch(df, raw_highs, raw_lows, cycle)
