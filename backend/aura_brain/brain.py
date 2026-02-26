@@ -370,15 +370,24 @@ def build_order_block(df: pd.DataFrame, pb_extreme_idx: int, direction: str,
 
 def check_ob_mitigation(df: pd.DataFrame, ob: Dict, from_idx: int) -> bool:
     """
-    An OB is mitigated (invalidated) when price CLOSES through its 50% level
-    (the 'consequent encroachment' — the midpoint of the OB body).
+    OB mitigation levels (ICT / SMC standard):
+    - Consequent Encroachment (CE) = 50% of the OB body. Price touching here = weakening.
+    - Full Mitigation = price CLOSES beyond 75% of the OB (into the far quarter).
+      A bearish OB is fully mitigated when a close exceeds ob_top - 25% of height.
+      A bullish OB is fully mitigated when a close falls below ob_bottom + 25% of height.
+    We use 75% threshold so that shallow taps don't erase the zone prematurely.
     """
     closes = df['Close'].values
-    midpoint = (ob['top'] + ob['bottom']) / 2.0
+    height = ob['top'] - ob['bottom']
+    if height <= 0:
+        return False
+    # 75% into the OB from the entry side
+    bear_invalidation = ob['bottom'] + (height * 0.75)  # close above this = mitigated
+    bull_invalidation = ob['top']    - (height * 0.75)  # close below this = mitigated
     for i in range(from_idx, len(closes)):
-        if ob['type'] == "OB_BEAR" and closes[i] > midpoint:
+        if ob['type'] == "OB_BEAR" and closes[i] > bear_invalidation:
             return True
-        if ob['type'] == "OB_BULL" and closes[i] < midpoint:
+        if ob['type'] == "OB_BULL" and closes[i] < bull_invalidation:
             return True
     return False
 
@@ -620,9 +629,25 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             pass  # No structure yet
         else:
             # Phase 0: First swing low after anchor = initial impulse reference
-            # This is NOT a BOS — it's just where the market first showed weakness
+            # This is NOT a BOS — it's just where the market first showed weakness.
+            # BUT we DO build an OB here: the last bullish candle between the anchor
+            # and this first swing low. This is the PRIMARY supply zone — the most
+            # important OB on the chart. It sits right at the origin of the move.
             first_sl_idx   = int(post_anchor_sl[0])
             first_sl_price = float(lows[first_sl_idx])
+
+            # Build the initial impulse OB (anchor → first swing low)
+            # The pullback "high" for this is the anchor itself
+            initial_ob = build_order_block(
+                df, anchor_idx, "BEAR", atr, dates, ob_atr_cap, first_sl_idx
+            )
+            if initial_ob:
+                initial_ob['label']       = "1H-OB (Origin)"
+                initial_ob['entry_label'] = "ONLY SELLS"
+                initial_ob['is_mitigated'] = check_ob_mitigation(
+                    df, initial_ob, initial_ob['candle_idx'] + 1
+                )
+                zones.append(initial_ob)
 
             last_confirmed_low_idx = first_sl_idx
             last_confirmed_low_val = first_sl_price
@@ -698,8 +723,20 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             pass
         else:
             # Phase 0: First swing high after anchor = initial impulse reference (NOT a BOS)
+            # BUT we DO build an OB: the last bearish candle between anchor and first swing high.
             first_sh_idx   = int(post_anchor_sh[0])
             first_sh_price = float(highs[first_sh_idx])
+
+            initial_ob = build_order_block(
+                df, anchor_idx, "BULL", atr, dates, ob_atr_cap, first_sh_idx
+            )
+            if initial_ob:
+                initial_ob['label']       = "1H-OB (Origin)"
+                initial_ob['entry_label'] = "ONLY BUYS"
+                initial_ob['is_mitigated'] = check_ob_mitigation(
+                    df, initial_ob, initial_ob['candle_idx'] + 1
+                )
+                zones.append(initial_ob)
 
             last_confirmed_high_idx = first_sh_idx
             last_confirmed_high_val = first_sh_price
@@ -803,8 +840,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "color": anchor_color
     }] + bos_lines + choch_lines
 
-    # Only send the 3 most recent UNMITIGATED OBs to keep the chart clean
-    clean_zones = [z for z in zones if not z['is_mitigated']][-3:]
+    # Send the 3 most recent OBs regardless of mitigation status.
+    # The frontend renders active OBs as solid and mitigated OBs as faded/dashed.
+    # This way the chart always shows something meaningful — faded OBs are still
+    # important context (price memory zones) even after being tapped.
+    clean_zones = zones[-3:]
 
     return {
         "cycle":           cycle,
@@ -970,12 +1010,23 @@ async def analyze(req: AnalysisRequest):
 
         master_bias = f"{cycle} CYCLE"
 
-        # Closest OBs
-        bull_obs = [z for z in smc_zones if z['type'] == 'OB_BULL']
-        bear_obs = [z for z in smc_zones if z['type'] == 'OB_BEAR']
+        # Closest OBs — prefer unmitigated, fall back to mitigated (still key zones)
+        bull_obs        = [z for z in smc_zones if z['type'] == 'OB_BULL']
+        bear_obs        = [z for z in smc_zones if z['type'] == 'OB_BEAR']
+        bull_obs_active = [z for z in bull_obs if not z.get('is_mitigated')]
+        bear_obs_active = [z for z in bear_obs if not z.get('is_mitigated')]
 
-        nearest_bull_ob = bull_obs[-1] if bull_obs else None
-        nearest_bear_ob = bear_obs[-1] if bear_obs else None
+        # Use the most recent active OB; fall back to any OB if none active
+        nearest_bull_ob = bull_obs_active[-1] if bull_obs_active else (bull_obs[-1] if bull_obs else None)
+        nearest_bear_ob = bear_obs_active[-1] if bear_obs_active else (bear_obs[-1] if bear_obs else None)
+
+        # For trade levels: use the zone closest to current price
+        def closest_ob(obs, price):
+            if not obs: return None
+            return min(obs, key=lambda z: min(abs(z['top'] - price), abs(z['bottom'] - price)))
+
+        nearest_bull_ob = closest_ob(bull_obs, current_price) if bull_obs else None
+        nearest_bear_ob = closest_ob(bear_obs, current_price) if bear_obs else None
 
         sup_level = nearest_bull_ob['bottom'] if nearest_bull_ob else current_price - (atr * 2)
         res_level = nearest_bear_ob['top']    if nearest_bear_ob else current_price + (atr * 2)
