@@ -104,7 +104,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # =================================================================
-# 🧠 V9 TRUE VISUAL ENGINE: THE FINAL ANCHOR FIX
+# 🧠 V9 TRUE VISUAL ENGINE: MACRO ANCHORS & TIGHT OBs
 # =================================================================
 def detect_mmm_cycle(df):
     try:
@@ -117,28 +117,29 @@ def detect_mmm_cycle(df):
         atr = pd.Series(highs - lows).rolling(14).mean().bfill().values[-1]
         if atr == 0: atr = 0.001
 
-        # 1. FIND THE VISIBLE MACRO EXTREMES (Expanded to 300 candles for true weekly peaks)
-        lookback = 300 
-        start_idx = max(0, len(closes) - lookback)
-        
-        highest_idx = start_idx + np.argmax(highs[start_idx:])
-        lowest_idx = start_idx + np.argmin(lows[start_idx:])
+        # 1. FIND THE TRUE MACRO ANCHOR (No more blind slicing)
+        swing_order = 40 # Scans ~2 days left and right to guarantee a true weekly peak
+        p_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
+        p_lows = argrelextrema(lows, np.less, order=swing_order)[0]
 
-        # 2. THE CORRECTED ORIGIN TRACE LOGIC
-        # If the LOWEST point happened AFTER the HIGHEST point...
-        if lowest_idx > highest_idx:
-            # The Low is the most recent extreme. Market bottomed out and is now RISING.
-            cycle = "BULLISH"
-            anchor_idx = lowest_idx
-            anchor_price = lows[anchor_idx]
-            pattern_name = "PFL ↑ (Anchor)"
-        # If the HIGHEST point happened AFTER the LOWEST point...
-        else:
-            # The High is the most recent extreme. Market topped out and is now DROPPING.
+        # Failsafe if the chart is a straight line
+        if len(p_highs) == 0: p_highs = [np.argmax(highs)]
+        if len(p_lows) == 0: p_lows = [np.argmin(lows)]
+
+        last_high_idx = p_highs[-1]
+        last_low_idx = p_lows[-1]
+
+        # The extreme that happened MOST RECENTLY dictates the current cycle
+        if last_high_idx > last_low_idx:
             cycle = "BEARISH"
-            anchor_idx = highest_idx
+            anchor_idx = last_high_idx
             anchor_price = highs[anchor_idx]
             pattern_name = "PFH ↓ (Anchor)"
+        else:
+            cycle = "BULLISH"
+            anchor_idx = last_low_idx
+            anchor_price = lows[anchor_idx]
+            pattern_name = "PFL ↑ (Anchor)"
 
         zones = []
         lines = [{
@@ -149,22 +150,22 @@ def detect_mmm_cycle(df):
             "color": "rgba(255, 215, 0, 1)" # Solid Gold Peak
         }]
 
-        # 3. VISUAL BOS & OB MAPPING (Preserved from V8 because it worked perfectly)
+        # 2. VISUAL BOS & OB MAPPING
         current_level = 0
-        state = "PUSHING" 
+        state = "IMPULSE" 
         
         if cycle == "BEARISH":
-            current_low_val = anchor_price
-            current_low_idx = anchor_idx
-            pullback_high_val = None
-            pullback_high_idx = None
+            swing_low_val = anchor_price
+            swing_low_idx = anchor_idx
+            pullback_high_val = -1
+            pullback_high_idx = -1
 
             for i in range(anchor_idx + 1, len(closes)):
-                if state == "PUSHING":
-                    if lows[i] < current_low_val:
-                        current_low_val = lows[i] 
-                        current_low_idx = i
-                    elif highs[i] > current_low_val + atr: 
+                if state == "IMPULSE":
+                    if lows[i] < swing_low_val:
+                        swing_low_val = lows[i] 
+                        swing_low_idx = i
+                    elif highs[i] > swing_low_val + (atr * 0.8): # Pullback begins
                         state = "PULLBACK"
                         pullback_high_val = highs[i]
                         pullback_high_idx = i
@@ -173,12 +174,12 @@ def detect_mmm_cycle(df):
                     if highs[i] > pullback_high_val:
                         pullback_high_val = highs[i] 
                         pullback_high_idx = i
-                    elif closes[i] < current_low_val: 
+                    elif closes[i] < swing_low_val: # BOS: Price breaks below the lowest point
                         current_level += 1
                         
                         lines.append({
-                            "level": float(current_low_val),
-                            "start_time": int(dates[current_low_idx]),
+                            "level": float(swing_low_val),
+                            "start_time": int(dates[swing_low_idx]),
                             "end_time": int(dates[i]),
                             "type": f"BOS {current_level}",
                             "color": "rgba(33, 150, 243, 0.8)" 
@@ -186,39 +187,45 @@ def detect_mmm_cycle(df):
 
                         # Find Trap Candle for OB
                         ob_idx = pullback_high_idx
-                        for k in range(pullback_high_idx, max(anchor_idx, pullback_high_idx - 5), -1):
-                            if closes[k] > opens[k]: # Last bullish candle before drop
+                        for k in range(pullback_high_idx, max(swing_low_idx, pullback_high_idx - 4), -1):
+                            if closes[k] > opens[k]: # Last bullish candle
                                 ob_idx = k
                                 break
+                        
+                        ob_top = highs[ob_idx]
+                        ob_bottom = lows[ob_idx]
 
-                        # Draw tightly wrapped OB box
+                        # 🛑 THE FIX: Cap the OB height so it doesn't become a massive rectangle
+                        if (ob_top - ob_bottom) > (atr * 1.5):
+                            ob_bottom = ob_top - (atr * 1.5)
+
                         zones.append({
                             "type": "OB_BEAR", 
-                            "top": float(highs[ob_idx]),
-                            "bottom": float(lows[ob_idx]),
-                            "price": float(lows[ob_idx]),
+                            "top": float(ob_top),
+                            "bottom": float(ob_bottom),
+                            "price": float(ob_bottom),
                             "time": int(dates[ob_idx]),
                             "is_mitigated": False,
-                            "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                            "fvg_size_pips": float(abs(ob_top - ob_bottom)),
                             "momentum_ratio": 2.0 
                         })
 
-                        current_low_val = lows[i]
-                        current_low_idx = i
-                        state = "PUSHING"
+                        swing_low_val = lows[i]
+                        swing_low_idx = i
+                        state = "IMPULSE"
 
         elif cycle == "BULLISH":
-            current_high_val = anchor_price
-            current_high_idx = anchor_idx
-            pullback_low_val = None
-            pullback_low_idx = None
+            swing_high_val = anchor_price
+            swing_high_idx = anchor_idx
+            pullback_low_val = float('inf')
+            pullback_low_idx = -1
 
             for i in range(anchor_idx + 1, len(closes)):
-                if state == "PUSHING":
-                    if highs[i] > current_high_val:
-                        current_high_val = highs[i] 
-                        current_high_idx = i
-                    elif lows[i] < current_high_val - atr: 
+                if state == "IMPULSE":
+                    if highs[i] > swing_high_val:
+                        swing_high_val = highs[i] 
+                        swing_high_idx = i
+                    elif lows[i] < swing_high_val - (atr * 0.8): # Pullback begins
                         state = "PULLBACK"
                         pullback_low_val = lows[i]
                         pullback_low_idx = i
@@ -227,12 +234,12 @@ def detect_mmm_cycle(df):
                     if lows[i] < pullback_low_val:
                         pullback_low_val = lows[i] 
                         pullback_low_idx = i
-                    elif closes[i] > current_high_val: 
+                    elif closes[i] > swing_high_val: # BOS: Price breaks above the highest point
                         current_level += 1
                         
                         lines.append({
-                            "level": float(current_high_val),
-                            "start_time": int(dates[current_high_idx]),
+                            "level": float(swing_high_val),
+                            "start_time": int(dates[swing_high_idx]),
                             "end_time": int(dates[i]),
                             "type": f"BOS {current_level}",
                             "color": "rgba(33, 150, 243, 0.8)" 
@@ -240,33 +247,38 @@ def detect_mmm_cycle(df):
 
                         # Find Trap Candle for OB
                         ob_idx = pullback_low_idx
-                        for k in range(pullback_low_idx, max(anchor_idx, pullback_low_idx - 5), -1):
-                            if closes[k] < opens[k]: # Last bearish candle before rally
+                        for k in range(pullback_low_idx, max(swing_high_idx, pullback_low_idx - 4), -1):
+                            if closes[k] < opens[k]: # Last bearish candle
                                 ob_idx = k
                                 break
+                        
+                        ob_top = highs[ob_idx]
+                        ob_bottom = lows[ob_idx]
 
-                        # Draw tightly wrapped OB box
+                        # 🛑 THE FIX: Cap the OB height so it doesn't become a massive rectangle
+                        if (ob_top - ob_bottom) > (atr * 1.5):
+                            ob_top = ob_bottom + (atr * 1.5)
+
                         zones.append({
                             "type": "OB_BULL", 
-                            "top": float(highs[ob_idx]),
-                            "bottom": float(lows[ob_idx]),
-                            "price": float(highs[ob_idx]),
+                            "top": float(ob_top),
+                            "bottom": float(ob_bottom),
+                            "price": float(ob_top),
                             "time": int(dates[ob_idx]),
                             "is_mitigated": False,
-                            "fvg_size_pips": float(abs(highs[ob_idx] - lows[ob_idx])),
+                            "fvg_size_pips": float(abs(ob_top - ob_bottom)),
                             "momentum_ratio": 2.0 
                         })
 
-                        current_high_val = highs[i]
-                        current_high_idx = i
-                        state = "PUSHING"
+                        swing_high_val = highs[i]
+                        swing_high_idx = i
+                        state = "IMPULSE"
 
-        display_level = min(3, current_level + 1)
         in_pullback = (state == "PULLBACK")
 
         return {
             "cycle": cycle,
-            "level": display_level,
+            "level": current_level + 1,
             "in_pullback": in_pullback,
             "zones": zones[-2:], # Keep UI clean: only show the 2 most recent OBs
             "lines": lines,
@@ -358,7 +370,8 @@ async def analyze(req: AnalysisRequest):
         base_conf = 0
         target_zone = None
         
-        phase_string = f"LEVEL {current_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
+        display_level = min(3, current_level)
+        phase_string = f"LEVEL {display_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
         
         strategy_logic = [
             f"🧭 Master Bias: {master_bias}", 
@@ -367,7 +380,7 @@ async def analyze(req: AnalysisRequest):
         ]
 
         # 🛑 TRUE MMM EXECUTION LOGIC
-        if current_level >= 4 and not in_pullback:
+        if current_level > 3 and not in_pullback:
             strategy_logic.append("⏳ Exhaustion Reached: Do not trade. Waiting for new Anchor.")
         elif not in_pullback:
             strategy_logic.append(f"⏳ Market is pushing. Waiting for pullback to 1H-OB to enter.")
