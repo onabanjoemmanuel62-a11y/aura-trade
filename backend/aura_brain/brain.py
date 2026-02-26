@@ -933,7 +933,7 @@ async def analyze(req: AnalysisRequest):
                 "smc_zones":  smc_zones,
                 "bos_lines":  bos_lines,
                 "fvgs":       fvgs,
-                "sweeps":     recent_sweeps,
+                "sweeps":     sweeps,
             },
             "tradeSetup":  trade_setup,
             "dataSource":  data_source,
