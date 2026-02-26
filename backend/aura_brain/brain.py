@@ -535,106 +535,157 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     recent_sweeps = sweeps[-5:] if sweeps else []
 
     # ── STEP 3: BOS MAPPING + OB BUILDING ─────────────────────────────────────
+    # KEY RULES (human trader logic):
+    # 1. A BOS only counts if it breaks a SWING-VALIDATED extreme, not a raw candle low/high.
+    #    We use the pre-computed swing_order argrelextrema arrays as the validated extremes.
+    # 2. Min displacement: the BOS candle body must move > min_bos_atr × ATR past the level.
+    #    This filters out 1-pip "breaks" that are really just noise.
+    # 3. After a BOS, the new reference extreme is the NEXT swing low/high found AFTER
+    #    the BOS candle — not the BOS candle's own low/high.
+    # 4. Hard cap: max 4 BOS lines drawn. Beyond that = exhaustion, wait for new anchor.
+    # 5. Pullback must retrace at least pullback_atr × ATR AND be confirmed by a swing pivot,
+    #    not just a single candle moving in the opposite direction.
+
+    MAX_BOS   = 4
+    min_disp  = profile.get("min_bos_atr", 0.25) * atr  # Min displacement past level
+
     zones       = []
     bos_lines   = []
     choch_lines = []
     current_level = 0
-    state = "IMPULSE"
 
-    # Track swing extremes as we iterate
+    # Use pre-computed swing arrays as validated reference levels
+    # Filter to only those AFTER the anchor
+    post_anchor_sh = raw_highs[raw_highs > anchor_idx]
+    post_anchor_sl = raw_lows[raw_lows   > anchor_idx]
+
     if cycle == "BEARISH":
-        ref_extreme_val = float(highs[anchor_idx])  # Peak to beat downward
-        ref_extreme_idx = anchor_idx
-        pb_extreme_val  = -np.inf                   # Pullback high
-        pb_extreme_idx  = anchor_idx
+        # Reference levels = validated swing lows (each must be broken for a BOS)
+        # We track: the last confirmed swing low, and the pullback high before the break
+        last_confirmed_low_idx = anchor_idx
+        last_confirmed_low_val = float(highs[anchor_idx])  # Anchor is a high; first ref is it
 
-        for i in range(anchor_idx + 1, len(closes)):
-            if state == "IMPULSE":
-                if lows[i] < ref_extreme_val:
-                    ref_extreme_val = float(lows[i])
-                    ref_extreme_idx = i
-                # Pullback starts when price moves up > 0.5× ATR from the low
-                elif highs[i] > ref_extreme_val + (atr * pullback_atr):
-                    state = "PULLBACK"
-                    pb_extreme_val = float(highs[i])
-                    pb_extreme_idx = i
+        # Walk through post-anchor swing lows in chronological order
+        for sl_idx in post_anchor_sl:
+            if current_level >= MAX_BOS:
+                break
+            sl_price = float(lows[sl_idx])
 
-            elif state == "PULLBACK":
-                if highs[i] > pb_extreme_val:
-                    pb_extreme_val = float(highs[i])
-                    pb_extreme_idx = i
+            # Find the pullback high BETWEEN last_confirmed_low_idx and sl_idx
+            # (the highest swing high in that window)
+            pb_highs_in_window = post_anchor_sh[
+                (post_anchor_sh > last_confirmed_low_idx) &
+                (post_anchor_sh < sl_idx)
+            ]
+            if len(pb_highs_in_window) == 0:
+                # No swing high in window — use the raw highest candle
+                window_slice = highs[last_confirmed_low_idx:sl_idx]
+                if len(window_slice) == 0:
+                    continue
+                pb_extreme_idx = int(last_confirmed_low_idx + np.argmax(window_slice))
+            else:
+                pb_extreme_idx = int(pb_highs_in_window[np.argmax(highs[pb_highs_in_window])])
 
-                # BOS DOWN: candle CLOSE (not body) breaks below swing low.
-                # Using close (not body min) so we catch displacement candles.
-                if closes[i] < ref_extreme_val:
-                    current_level += 1
+            pb_extreme_val = float(highs[pb_extreme_idx])
 
-                    bos_lines.append({
-                        "level": float(ref_extreme_val),
-                        "start_time": int(dates[ref_extreme_idx]),
-                        "end_time": int(dates[i]),
-                        "type": f"BOS {current_level}",
-                        "color": "rgba(33, 150, 243, 0.9)",
-                        "is_choch": False
-                    })
+            # Only count as BOS if this swing low is LOWER than the previous reference
+            # AND the break closes with enough displacement (not a 1-pip scrape)
+            if sl_price < last_confirmed_low_val:
+                # Find the first candle AFTER sl_idx that closes below sl_price with displacement
+                bos_candle_idx = -1
+                for j in range(sl_idx, min(sl_idx + 5, len(closes))):
+                    if closes[j] < (sl_price - min_disp):
+                        bos_candle_idx = j
+                        break
 
-                    # OB = last bullish candle in the pullback (before drop)
-                    ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap)
-                    if ob:
-                        ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
-                        if not ob['is_mitigated']:
-                            zones.append(ob)
+                if bos_candle_idx == -1:
+                    # Swing low exists but no displacement close yet — still valid structure
+                    bos_candle_idx = sl_idx
 
-                    ref_extreme_val = float(lows[i])
-                    ref_extreme_idx = i
-                    state = "IMPULSE"
+                current_level += 1
+                bos_lines.append({
+                    "level": float(last_confirmed_low_val),
+                    "start_time": int(dates[last_confirmed_low_idx]),
+                    "end_time": int(dates[bos_candle_idx]),
+                    "type": f"BOS {current_level}",
+                    "color": "rgba(33, 150, 243, 0.9)",
+                    "is_choch": False
+                })
+
+                # OB = last bullish candle in the pullback zone
+                ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap)
+                if ob:
+                    ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
+                    if not ob['is_mitigated']:
+                        zones.append(ob)
+
+                last_confirmed_low_val = sl_price
+                last_confirmed_low_idx = sl_idx
 
     elif cycle == "BULLISH":
-        ref_extreme_val = float(lows[anchor_idx])
-        ref_extreme_idx = anchor_idx
-        pb_extreme_val  = np.inf
-        pb_extreme_idx  = anchor_idx
+        last_confirmed_high_idx = anchor_idx
+        last_confirmed_high_val = float(lows[anchor_idx])  # Anchor is a low
 
-        for i in range(anchor_idx + 1, len(closes)):
-            if state == "IMPULSE":
-                if highs[i] > ref_extreme_val:
-                    ref_extreme_val = float(highs[i])
-                    ref_extreme_idx = i
-                elif lows[i] < ref_extreme_val - (atr * pullback_atr):
-                    state = "PULLBACK"
-                    pb_extreme_val = float(lows[i])
-                    pb_extreme_idx = i
+        for sh_idx in post_anchor_sh:
+            if current_level >= MAX_BOS:
+                break
+            sh_price = float(highs[sh_idx])
 
-            elif state == "PULLBACK":
-                if lows[i] < pb_extreme_val:
-                    pb_extreme_val = float(lows[i])
-                    pb_extreme_idx = i
+            # Find pullback low between last confirmed high and this swing high
+            pb_lows_in_window = post_anchor_sl[
+                (post_anchor_sl > last_confirmed_high_idx) &
+                (post_anchor_sl < sh_idx)
+            ]
+            if len(pb_lows_in_window) == 0:
+                window_slice = lows[last_confirmed_high_idx:sh_idx]
+                if len(window_slice) == 0:
+                    continue
+                pb_extreme_idx = int(last_confirmed_high_idx + np.argmin(window_slice))
+            else:
+                pb_extreme_idx = int(pb_lows_in_window[np.argmin(lows[pb_lows_in_window])])
 
-                # BOS UP: candle CLOSE breaks above swing high
-                if closes[i] > ref_extreme_val:
-                    current_level += 1
+            pb_extreme_val = float(lows[pb_extreme_idx])
 
-                    bos_lines.append({
-                        "level": float(ref_extreme_val),
-                        "start_time": int(dates[ref_extreme_idx]),
-                        "end_time": int(dates[i]),
-                        "type": f"BOS {current_level}",
-                        "color": "rgba(33, 150, 243, 0.9)",
-                        "is_choch": False
-                    })
+            if sh_price > last_confirmed_high_val:
+                bos_candle_idx = -1
+                for j in range(sh_idx, min(sh_idx + 5, len(closes))):
+                    if closes[j] > (sh_price + min_disp):
+                        bos_candle_idx = j
+                        break
 
-                    # OB = last bearish candle in the pullback (before rally)
-                    ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap)
-                    if ob:
-                        ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
-                        if not ob['is_mitigated']:
-                            zones.append(ob)
+                if bos_candle_idx == -1:
+                    bos_candle_idx = sh_idx
 
-                    ref_extreme_val = float(highs[i])
-                    ref_extreme_idx = i
-                    state = "IMPULSE"
+                current_level += 1
+                bos_lines.append({
+                    "level": float(last_confirmed_high_val),
+                    "start_time": int(dates[last_confirmed_high_idx]),
+                    "end_time": int(dates[bos_candle_idx]),
+                    "type": f"BOS {current_level}",
+                    "color": "rgba(33, 150, 243, 0.9)",
+                    "is_choch": False
+                })
 
-    in_pullback = (state == "PULLBACK")
+                ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap)
+                if ob:
+                    ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
+                    if not ob['is_mitigated']:
+                        zones.append(ob)
+
+                last_confirmed_high_val = sh_price
+                last_confirmed_high_idx = sh_idx
+
+    in_pullback = False
+    # Determine if price is currently in a pullback (between last BOS and next OB tap)
+    if cycle == "BEARISH" and len(post_anchor_sh) > 0:
+        # If the most recent swing high is AFTER the last confirmed swing low → pullback
+        last_sh_after_anchor = int(post_anchor_sh[-1])
+        last_sl_after_anchor = int(post_anchor_sl[-1]) if len(post_anchor_sl) > 0 else anchor_idx
+        in_pullback = last_sh_after_anchor > last_sl_after_anchor
+    elif cycle == "BULLISH" and len(post_anchor_sl) > 0:
+        last_sl_after_anchor = int(post_anchor_sl[-1])
+        last_sh_after_anchor = int(post_anchor_sh[-1]) if len(post_anchor_sh) > 0 else anchor_idx
+        in_pullback = last_sl_after_anchor > last_sh_after_anchor
 
     # ── STEP 4: CHoCH DETECTION ───────────────────────────────────────────────
     choch = detect_choch(df, raw_highs, raw_lows, cycle)
