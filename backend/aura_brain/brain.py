@@ -125,13 +125,54 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # CORE ENGINE  — "AURA SMC v10"
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_instrument_profile(currency: str, current_price: float) -> Dict:
+    """
+    Returns pair-specific parameters so the engine works for ALL instruments.
+    Every pair has different pip sizes, decimal precision, and OB size expectations.
+    All thresholds are expressed as ATR multipliers — so they self-scale to any pair.
+    """
+    cu = currency.upper().replace("/","").replace("-","").replace("_","")
+
+    # GOLD / SILVER — high price, large absolute moves
+    if cu in ("XAUUSD", "GOLD"):
+        return {"decimals": 2, "pip_size": 0.01, "ob_atr_cap": 1.0,
+                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": "XAU/USD"}
+    if cu in ("XAGUSD", "SILVER"):
+        return {"decimals": 3, "pip_size": 0.001, "ob_atr_cap": 1.0,
+                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": "XAG/USD"}
+
+    # JPY pairs — price ~100-160, pip = 0.01
+    if "JPY" in cu:
+        return {"decimals": 3, "pip_size": 0.01, "ob_atr_cap": 1.2,
+                "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
+
+    # Major forex (EUR, GBP, AUD, NZD, CAD, CHF, USD) — price 0.6-2.0, pip=0.0001
+    if any(cu.startswith(p) or cu.endswith(p) for p in
+           ("EUR","GBP","AUD","NZD","CAD","CHF","USD")):
+        return {"decimals": 5, "pip_size": 0.0001, "ob_atr_cap": 1.2,
+                "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
+
+    # High-price indices/crypto
+    if current_price > 5000:
+        return {"decimals": 1, "pip_size": 0.1, "ob_atr_cap": 1.0,
+                "pullback_atr": 0.6, "min_bos_atr": 0.3, "label": currency}
+    if current_price > 100:
+        return {"decimals": 2, "pip_size": 0.01, "ob_atr_cap": 1.0,
+                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": currency}
+
+    # Fallback
+    return {"decimals": 5, "pip_size": 0.0001, "ob_atr_cap": 1.2,
+            "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
+
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     """True ATR using high-low-prevclose, not just H-L."""
-    high = df['High'].values
-    low  = df['Low'].values
+    high  = df['High'].values
+    low   = df['Low'].values
     close = df['Close'].values
     tr_list = []
     for i in range(1, len(close)):
@@ -145,17 +186,14 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
 
 def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     """
-    Choose swing detection order based on average candle range vs ATR.
-    Quieter markets → smaller order (detect smaller swings).
-    Volatile markets → larger order (avoid noise peaks).
+    Swing detection order normalised by ATR — works identically on all pairs
+    because it measures candle size relative to the pair's own volatility.
     """
     avg_range = float((df['High'] - df['Low']).tail(50).mean())
     ratio = avg_range / atr if atr > 0 else 1.0
-    # ratio < 0.5 → very quiet → use order 5
-    # ratio ≈ 1.0 → normal     → use order 10
-    # ratio > 2.0 → very noisy → use order 20
-    order = int(np.clip(ratio * 10, 5, 25))
+    order = int(np.clip(ratio * 10, 5, 20))
     return order
+
 
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
@@ -238,14 +276,15 @@ def find_displacement_candle(df: pd.DataFrame, start_idx: int, direction: str,
 
 
 def build_order_block(df: pd.DataFrame, anchor_idx: int, direction: str,
-                      atr: float, dates) -> Optional[Dict]:
+                      atr: float, dates, ob_atr_cap: float = 1.0) -> Optional[Dict]:
     """
     TRUE Order Block definition:
     - BEARISH OB: The LAST BULLISH candle before a strong bearish move
     - BULLISH OB: The LAST BEARISH candle before a strong bullish move
 
-    We scan BACKWARDS from the anchor (sweep/BOS point) to find it.
-    The OB body is used, NOT the full wick — wicks are stop hunt territory.
+    ob_atr_cap: max OB height expressed as ATR multiplier (pair-specific).
+    Lower = tighter, more precise zones (better for Gold/Indices).
+    Higher = allows wider zones (needed for some forex pairs).
     """
     closes = df['Close'].values
     opens  = df['Open'].values
@@ -259,16 +298,17 @@ def build_order_block(df: pd.DataFrame, anchor_idx: int, direction: str,
             if closes[k] > opens[k]:  # Bullish candle
                 body_top    = max(closes[k], opens[k])
                 body_bottom = min(closes[k], opens[k])
-                ob_top    = body_top    + (atr * 0.1)   # Tiny wick allowance
-                ob_bottom = body_bottom - (atr * 0.1)
-                # Cap OB height to 2× ATR to avoid massive zones
-                if (ob_top - ob_bottom) > atr * 2.0:
-                    ob_bottom = ob_top - atr * 2.0
+                # Use BODY only — no wick extension (wicks = stop hunt territory)
+                ob_top    = float(body_top)
+                ob_bottom = float(body_bottom)
+                # Cap OB height using pair-specific multiplier
+                if (ob_top - ob_bottom) > atr * ob_atr_cap:
+                    ob_bottom = ob_top - (atr * ob_atr_cap)
                 return {
                     "type": "OB_BEAR",
-                    "top": float(ob_top),
-                    "bottom": float(ob_bottom),
-                    "price": float(ob_top),       # Entry: top of bearish OB
+                    "top": round(ob_top, 8),
+                    "bottom": round(ob_bottom, 8),
+                    "price": round(ob_top, 8),
                     "time": int(dates[k]),
                     "candle_idx": int(k),
                     "is_mitigated": False,
@@ -282,15 +322,15 @@ def build_order_block(df: pd.DataFrame, anchor_idx: int, direction: str,
             if closes[k] < opens[k]:  # Bearish candle
                 body_top    = max(closes[k], opens[k])
                 body_bottom = min(closes[k], opens[k])
-                ob_top    = body_top    + (atr * 0.1)
-                ob_bottom = body_bottom - (atr * 0.1)
-                if (ob_top - ob_bottom) > atr * 2.0:
-                    ob_top = ob_bottom + atr * 2.0
+                ob_top    = float(body_top)
+                ob_bottom = float(body_bottom)
+                if (ob_top - ob_bottom) > atr * ob_atr_cap:
+                    ob_top = ob_bottom + (atr * ob_atr_cap)
                 return {
                     "type": "OB_BULL",
-                    "top": float(ob_top),
-                    "bottom": float(ob_bottom),
-                    "price": float(ob_bottom),    # Entry: bottom of bullish OB
+                    "top": round(ob_top, 8),
+                    "bottom": round(ob_bottom, 8),
+                    "price": round(ob_bottom, 8),
                     "time": int(dates[k]),
                     "candle_idx": int(k),
                     "is_mitigated": False,
@@ -400,7 +440,7 @@ def detect_fair_value_gaps(df: pd.DataFrame, atr: float) -> List[Dict]:
     return fvgs[-3:] if fvgs else []
 
 
-def analyze_market_structure(df: pd.DataFrame) -> Dict:
+def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     """
     MASTER STRUCTURE ANALYSIS
     ──────────────────────────
@@ -421,6 +461,8 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
     atr = calculate_atr(df, 14)
     if atr == 0:
         atr = float(df['Close'].mean()) * 0.001
+    ob_atr_cap   = profile.get("ob_atr_cap", 1.0)
+    pullback_atr = profile.get("pullback_atr", 0.5)
 
     swing_order = adaptive_swing_order(df, atr)
     logger.info(f"Swing detection order: {swing_order} (ATR={atr:.4f})")
@@ -512,7 +554,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                     ref_extreme_val = float(lows[i])
                     ref_extreme_idx = i
                 # Pullback starts when price moves up > 0.5× ATR from the low
-                elif highs[i] > ref_extreme_val + (atr * 0.5):
+                elif highs[i] > ref_extreme_val + (atr * pullback_atr):
                     state = "PULLBACK"
                     pb_extreme_val = float(highs[i])
                     pb_extreme_idx = i
@@ -537,7 +579,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                     })
 
                     # OB = last bullish candle in the pullback (before drop)
-                    ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates)
+                    ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap)
                     if ob:
                         ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
                         if not ob['is_mitigated']:
@@ -558,7 +600,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                 if highs[i] > ref_extreme_val:
                     ref_extreme_val = float(highs[i])
                     ref_extreme_idx = i
-                elif lows[i] < ref_extreme_val - (atr * 0.5):
+                elif lows[i] < ref_extreme_val - (atr * pullback_atr):
                     state = "PULLBACK"
                     pb_extreme_val = float(lows[i])
                     pb_extreme_idx = i
@@ -582,7 +624,7 @@ def analyze_market_structure(df: pd.DataFrame) -> Dict:
                     })
 
                     # OB = last bearish candle in the pullback (before rally)
-                    ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates)
+                    ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap)
                     if ob:
                         ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
                         if not ob['is_mitigated']:
@@ -748,9 +790,9 @@ async def analyze(req: AnalysisRequest):
         csv_last_price  = safe_float(df['Close'].iloc[-1])
         current_price   = req.current_price if req.current_price > 0 else csv_last_price
 
-        decimals = 5
-        if current_price > 500:  decimals = 2
-        elif current_price > 10: decimals = 3
+        # ── INSTRUMENT PROFILE (pair-aware settings) ─────────────────────────
+        profile  = get_instrument_profile(req.currency, current_price)
+        decimals = profile['decimals']
 
         # ── INDICATORS ────────────────────────────────────────────────────────
         ema_200 = safe_float(
@@ -768,7 +810,7 @@ async def analyze(req: AnalysisRequest):
         atr = calculate_atr(df, 14)
 
         # ── MARKET STRUCTURE ──────────────────────────────────────────────────
-        ms = analyze_market_structure(df)
+        ms = analyze_market_structure(df, profile)
         cycle         = ms['cycle']
         current_level = ms['level']
         in_pullback   = ms['in_pullback']
