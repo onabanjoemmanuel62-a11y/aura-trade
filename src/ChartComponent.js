@@ -6,10 +6,9 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟥 PLUGIN 1: ORDER BLOCK BOXES
-// - Active OBs extend to the RIGHT EDGE of visible chart (not full chart width)
-// - Mitigated OBs end at their mitigation candle
-// - Draws "1H-OB" and "ONLY BUYS / ONLY SELLS" labels inside the box
+// 🟥 PLUGIN 1: MMM LEVEL CONSOLIDATION BOXES (Replaced SMC Order Blocks)
+// - Draws background shading for Level 1, Level 2, or Level 3 Consolidations
+// - Colors change based on bullish (green) or bearish (red) cycle
 // ─────────────────────────────────────────────────────────────────────────────
 class BoxRenderer {
   constructor(data) { this._data = data; }
@@ -26,10 +25,7 @@ class BoxRenderer {
         if (zone.x === null || isNaN(zone.x)) return;
 
         const x1 = zone.x * hPR;
-        // Active OBs → right edge; Mitigated OBs → their end candle
-        const x2 = (zone.isMitigated && zone.x2 !== null && !isNaN(zone.x2))
-          ? Math.min(zone.x2 * hPR, rightEdge)
-          : rightEdge;
+        const x2 = (zone.x2 !== null && !isNaN(zone.x2)) ? Math.min(zone.x2 * hPR, rightEdge) : rightEdge;
 
         if (x1 >= rightEdge) return;
         const width = x2 - x1;
@@ -40,30 +36,24 @@ class BoxRenderer {
         const height  = yBottom - yTop;
         if (height <= 0) return;
 
-        // Fill
+        // Fill Consolidation Box
         ctx.fillStyle   = zone.fillColor;
         ctx.fillRect(x1, yTop, width, height);
 
         // Border
         ctx.strokeStyle  = zone.borderColor;
-        ctx.lineWidth    = 2 * hPR;
-        ctx.globalAlpha  = zone.isMitigated ? 0.4 : 1.0;
-        ctx.setLineDash(zone.isMitigated ? [5 * hPR, 5 * hPR] : []);
+        ctx.lineWidth    = 1.5 * hPR;
+        ctx.setLineDash([5 * hPR, 5 * hPR]); // Dashed borders for MMM levels
         ctx.strokeRect(x1, yTop, width, height);
         ctx.setLineDash([]);
-        ctx.globalAlpha = 1.0;
 
-        // Labels — only on active boxes with enough height
-        if (!zone.isMitigated && zone.label) {
-          const fontSize   = Math.max(10, Math.min(13, height / vPR * 0.30)) * hPR;
+        // Level Labels
+        if (zone.label) {
+          const fontSize   = Math.max(11, Math.min(14, height / vPR * 0.30)) * hPR;
           const pad        = 6 * hPR;
           ctx.font         = `bold ${fontSize}px monospace`;
           ctx.fillStyle    = zone.borderColor;
           ctx.fillText(zone.label, x1 + pad, yTop + fontSize * 1.2);
-          if (zone.entryLabel && height > fontSize * 2.8) {
-            ctx.font      = `${fontSize * 0.85}px monospace`;
-            ctx.fillText(zone.entryLabel, x1 + pad, yTop + fontSize * 2.6);
-          }
         }
       });
     });
@@ -88,25 +78,23 @@ class BoxPrimitive {
       let x1 = null, x2 = null;
       try {
         x1 = timeScale.timeToCoordinate(zone.time);
-        if (zone.mitigated_time) x2 = timeScale.timeToCoordinate(zone.mitigated_time);
+        if (zone.end_time) x2 = timeScale.timeToCoordinate(zone.end_time);
       } catch { return null; }
+      
       const yTop    = series.priceToCoordinate(zone.top);
       const yBottom = series.priceToCoordinate(zone.bottom);
       if (x1 === null || yTop === null || yBottom === null) return null;
-      const isMitigated = zone.is_mitigated || false;
-      const isBear      = zone.type === 'OB_BEAR';
+      
+      const isBear      = zone.type?.includes('BEAR');
+      
       return {
         x:          x1,
         x2:         x2,
         yTop,
         yBottom,
-        isMitigated,
-        fillColor:   isMitigated
-          ? (isBear ? 'rgba(239,83,80,0.06)' : 'rgba(38,166,154,0.06)')
-          : (isBear ? 'rgba(239,83,80,0.18)' : 'rgba(38,166,154,0.18)'),
-        borderColor: isBear ? 'rgba(239,83,80,1)' : 'rgba(38,166,154,1)',
-        label:       zone.label       || (isBear ? '1H-OB (Bearish)' : '1H-OB (Bullish)'),
-        entryLabel:  zone.entry_label || (isBear ? 'ONLY SELLS'       : 'ONLY BUYS'),
+        fillColor:   isBear ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)',
+        borderColor: isBear ? 'rgba(239,83,80,0.8)'  : 'rgba(38,166,154,0.8)',
+        label:       zone.label || 'CONSOLIDATION',
       };
     }).filter(Boolean);
   }
@@ -116,12 +104,11 @@ class BoxPrimitive {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🔵 PLUGIN 2: BOS / CHoCH / ANCHOR LINES
-// - Draws dashed line from start→BOS candle
-// - Faded continuation to right edge
-// - Anchor line is solid gold, CHoCH is orange, BOS is blue
+// 🔵 PLUGIN 2: PEAK ANCHORS & STOP HUNT PINS (Replaced BOS lines)
+// - Anchor line is solid gold/blue based on W/M
+// - Draws sharp dashed lines for Stop Hunt Pins
 // ─────────────────────────────────────────────────────────────────────────────
-class BOSRenderer {
+class LineRenderer {
   constructor(data) { this._data = data; }
 
   draw(target) {
@@ -139,29 +126,18 @@ class BOSRenderer {
         const y  = line.y  * vPR;
         if (x1 >= rightEdge) return;
 
-        // Main segment: start → BOS candle
+        // Main line
         ctx.beginPath();
         ctx.moveTo(x1, y);
         ctx.lineTo(x2, y);
         ctx.strokeStyle = line.color;
-        ctx.lineWidth   = line.isAnchor ? 1.5 * hPR : 2 * hPR;
-        ctx.setLineDash(line.isAnchor ? [] : [7 * hPR, 5 * hPR]);
+        ctx.lineWidth   = line.isAnchor ? 2 * hPR : 1.5 * hPR;
+        ctx.setLineDash(line.isAnchor ? [] : [6 * hPR, 4 * hPR]);
         ctx.stroke();
-
-        // Faded continuation: BOS candle → right edge
-        if (!line.isAnchor && x2 < rightEdge) {
-          ctx.beginPath();
-          ctx.moveTo(x2, y);
-          ctx.lineTo(rightEdge, y);
-          ctx.strokeStyle = line.color.replace(/[\d.]+\)$/, '0.25)');
-          ctx.lineWidth   = 1 * hPR;
-          ctx.setLineDash([3 * hPR, 8 * hPR]);
-          ctx.stroke();
-        }
         ctx.setLineDash([]);
 
         // Label
-        const labelX = Math.min(x2 + 8 * hPR, rightEdge - 60 * hPR);
+        const labelX = Math.min(x2 + 8 * hPR, rightEdge - 80 * hPR);
         ctx.font      = `bold ${12 * hPR}px monospace`;
         ctx.fillStyle = line.color;
         ctx.fillText(line.label, labelX, y - 4 * vPR);
@@ -170,15 +146,15 @@ class BOSRenderer {
   }
 }
 
-class BOSPaneView {
+class LinePaneView {
   constructor(source) { this._source = source; }
-  renderer() { return new BOSRenderer(this._source._rendererData); }
+  renderer() { return new LineRenderer(this._source._rendererData); }
 }
 
-class BOSPrimitive {
+class LinePrimitive {
   constructor() {
     this._rendererData = [];
-    this._paneViews    = [new BOSPaneView(this)];
+    this._paneViews    = [new LinePaneView(this)];
   }
 
   setData(lines, series, timeScale) {
@@ -190,12 +166,11 @@ class BOSPrimitive {
         const x2 = timeScale.timeToCoordinate(line.end_time);
         const y  = series.priceToCoordinate(line.level);
         if (x1 === null || x2 === null || y === null) return null;
-        const isAnchor = line.type?.includes('Anchor') || line.type?.includes('PF');
-        const isChoch  = line.is_choch || line.type?.includes('CHoCH');
-        const color    = isAnchor ? 'rgba(255,215,0,0.9)'
-                       : isChoch  ? 'rgba(255,165,0,0.9)'
-                       : 'rgba(33,150,243,0.9)';
-        return { x1, x2, y, color, label: line.type || 'BOS', isAnchor };
+        
+        const isAnchor = line.type?.includes('Anchor') || line.type?.includes('Peak');
+        const color    = line.color || (isAnchor ? 'rgba(255,215,0,0.9)' : 'rgba(239,83,80,0.8)');
+        
+        return { x1, x2, y, color, label: line.type || 'LEVEL', isAnchor };
       } catch { return null; }
     }).filter(Boolean);
   }
@@ -212,7 +187,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartRef           = useRef(null);
   const candleSeriesRef    = useRef(null);
   const boxPrimitiveRef    = useRef(null);
-  const bosPrimitiveRef    = useRef(null);
+  const linePrimitiveRef   = useRef(null);
   const activeLinesRef     = useRef([]);
   const isChartReady       = useRef(false);
   const currentBarRef      = useRef(null);
@@ -261,23 +236,30 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       timeScale: { timeVisible: true, secondsVisible: false, rightOffset: 20, barSpacing: 12 },
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
     });
+    
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645',
     });
+    
     const boxP = new BoxPrimitive();
     series.attachPrimitive(boxP);
     boxPrimitiveRef.current = boxP;
-    const bosP = new BOSPrimitive();
-    series.attachPrimitive(bosP);
-    bosPrimitiveRef.current = bosP;
+    
+    const lineP = new LinePrimitive();
+    series.attachPrimitive(lineP);
+    linePrimitiveRef.current = lineP;
+    
     chartRef.current = chart;
     candleSeriesRef.current = series;
     isChartReady.current = true;
+    
     const onResize = () => { if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth }); };
     window.addEventListener('resize', onResize);
+    
     chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
       if (range && range.from < 5 && !isLoadingRef.current) fetchOlderHistory();
     });
+    
     return () => {
       isChartReady.current = false;
       window.removeEventListener('resize', onResize);
@@ -326,7 +308,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     load();
   }, [timeframe, symbol, processCandles]);
 
-  // Render loop
+  // Render loop for Primitives (Boxes & Lines)
   useEffect(() => {
     let rafId;
     const loop = () => {
@@ -338,10 +320,16 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       }
       if (chartRef.current && candleSeriesRef.current) {
         const ts = chartRef.current.timeScale();
-        if (visuals?.smc_zones && boxPrimitiveRef.current)
+        
+        // Render MMM Consolidation Zones (mapped to old smc_zones payload safely)
+        if (visuals?.smc_zones && boxPrimitiveRef.current) {
           boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, ts);
-        if (visuals?.bos_lines && bosPrimitiveRef.current)
-          bosPrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
+        }
+        
+        // Render Peak Anchor and Stop Hunt Lines (mapped to old bos_lines payload safely)
+        if (visuals?.bos_lines && linePrimitiveRef.current) {
+           linePrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
+        }
       }
       rafId = requestAnimationFrame(loop);
     };
@@ -373,24 +361,28 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     } catch { /* silent */ }
   }, [newsData]);
 
-  // Price lines
+  // Price lines (EMAs & Trade Setups)
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     activeLinesRef.current.forEach(l => { try { candleSeriesRef.current.removePriceLine(l); } catch { /* silent */ } });
     activeLinesRef.current = [];
+    
     const addLine = (price, color, title, style = 0, width = 2) => {
       if (price == null || isNaN(parseFloat(price))) return;
       const l = candleSeriesRef.current.createPriceLine({ price: parseFloat(price), color, lineWidth: width, lineStyle: style, axisLabelVisible: true, title });
       activeLinesRef.current.push(l);
     };
+    
     if (tradeSetup) {
       addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯',    0, 2);
       addLine(tradeSetup.stop_loss,   '#FF1744', 'SL 🛑',    0, 2);
       addLine(tradeSetup.entry,       '#2962FF', 'ENTRY 🔵', 3, 2);
     }
-    // ✅ Backend sends `ema200` — fall back to `ema` for safety
-    const emaPrice = levels?.ema200 ?? levels?.ema;
-    addLine(emaPrice, '#FFD700', '200 EMA', 2, 1);
+    
+    // ✅ ADDED: Draw both the 200 EMA (Mayo) and 50 EMA (Water)
+    if (levels?.ema200) addLine(levels.ema200, '#FFD700', '200 EMA', 2, 1);
+    if (levels?.ema50)  addLine(levels.ema50,  '#2962FF', '50 EMA',  2, 1);
+    
   }, [levels, tradeSetup]);
 
   // Socket
