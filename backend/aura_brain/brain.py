@@ -47,7 +47,6 @@ def safe_float(value, default=0.0):
     except:
         return default
 
-
 def load_csv_fallback():
     try:
         file_path = os.path.join(os.path.dirname(base_dir), CSV_FILENAME)
@@ -79,7 +78,6 @@ def load_csv_fallback():
         logger.error(f"CSV load failed: {e}")
         return None
 
-
 def process_live_candles(candles_data: List[Dict]):
     try:
         df = pd.DataFrame(candles_data)
@@ -97,13 +95,11 @@ def process_live_candles(candles_data: List[Dict]):
         logger.error(f"Live candle processing failed: {e}")
         return None
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     MARKET_MEMORY["df"] = load_csv_fallback()
     yield
     MARKET_MEMORY["df"] = None
-
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -114,7 +110,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
@@ -122,37 +117,27 @@ class AnalysisRequest(BaseModel):
     candles: Optional[List[Dict]] = None
     htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
-    strategy: str = "SMC"  # 🟢 ADDED: Safe toggle defaults to SMC so nothing breaks
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA SMC v10" (Kept Intact)
+# CORE ENGINE  — "AURA MMM v1.0"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
     cu = currency.upper().replace("/","").replace("-","").replace("_","")
     if cu in ("XAUUSD", "GOLD"):
-        return {"decimals": 2, "pip_size": 0.01, "ob_atr_cap": 1.0,
-                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": "XAU/USD"}
+        return {"decimals": 2, "pip_size": 0.01, "label": "XAU/USD"}
     if cu in ("XAGUSD", "SILVER"):
-        return {"decimals": 3, "pip_size": 0.001, "ob_atr_cap": 1.0,
-                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": "XAG/USD"}
+        return {"decimals": 3, "pip_size": 0.001, "label": "XAG/USD"}
     if "JPY" in cu:
-        return {"decimals": 3, "pip_size": 0.01, "ob_atr_cap": 1.2,
-                "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
-    if any(cu.startswith(p) or cu.endswith(p) for p in
-           ("EUR","GBP","AUD","NZD","CAD","CHF","USD")):
-        return {"decimals": 5, "pip_size": 0.0001, "ob_atr_cap": 1.2,
-                "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
+        return {"decimals": 3, "pip_size": 0.01, "label": currency}
+    if any(cu.startswith(p) or cu.endswith(p) for p in ("EUR","GBP","AUD","NZD","CAD","CHF","USD")):
+        return {"decimals": 5, "pip_size": 0.0001, "label": currency}
     if current_price > 5000:
-        return {"decimals": 1, "pip_size": 0.1, "ob_atr_cap": 1.0,
-                "pullback_atr": 0.6, "min_bos_atr": 0.3, "label": currency}
+        return {"decimals": 1, "pip_size": 0.1, "label": currency}
     if current_price > 100:
-        return {"decimals": 2, "pip_size": 0.01, "ob_atr_cap": 1.0,
-                "pullback_atr": 0.5, "min_bos_atr": 0.25, "label": currency}
-    return {"decimals": 5, "pip_size": 0.0001, "ob_atr_cap": 1.2,
-            "pullback_atr": 0.5, "min_bos_atr": 0.2, "label": currency}
+        return {"decimals": 2, "pip_size": 0.01, "label": currency}
+    return {"decimals": 5, "pip_size": 0.0001, "label": currency}
 
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     high  = df['High'].values
@@ -160,9 +145,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     close = df['Close'].values
     tr_list = []
     for i in range(1, len(close)):
-        tr = max(high[i] - low[i],
-                 abs(high[i] - close[i-1]),
-                 abs(low[i]  - close[i-1]))
+        tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i]  - close[i-1]))
         tr_list.append(tr)
     tr_series = pd.Series(tr_list)
     return float(tr_series.rolling(period).mean().iloc[-1]) if len(tr_list) >= period else float(tr_series.mean())
@@ -173,8 +156,8 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     order = int(np.clip(ratio * 10, 5, 20))
     return order
 
-def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
-                             swing_lows: np.ndarray, atr: float) -> List[Dict]:
+def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
+    """Detects Stop Hunts (Pins/Spikes) crucial to MMM reversals."""
     sweeps = []
     closes = df['Close'].values
     highs  = df['High'].values
@@ -193,7 +176,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
             wick_above = highs[i] - sh_price
             if wick_above >= min_wick and closes[i] < sh_price:
                 sweeps.append({
-                    "type":      "BULL_SWEEP",
+                    "type":      "BULL_SWEEP", # Kept identical for frontend compatibility
                     "level":     float(sh_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]),
@@ -207,7 +190,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
             wick_below = sl_price - lows[i]
             if wick_below >= min_wick and closes[i] > sl_price:
                 sweeps.append({
-                    "type":      "BEAR_SWEEP",
+                    "type":      "BEAR_SWEEP", # Kept identical for frontend compatibility
                     "level":     float(sl_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]),
@@ -217,185 +200,23 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray,
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-def find_displacement_candle(df: pd.DataFrame, start_idx: int, direction: str,
-                              atr: float, lookback: int = 5) -> int:
-    closes = df['Close'].values
-    opens  = df['Open'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    body_threshold = atr * 1.5
-
-    for i in range(start_idx, min(start_idx + lookback, len(closes))):
-        body = abs(closes[i] - opens[i])
-        if body >= body_threshold:
-            if direction == "DOWN" and closes[i] < opens[i]:
-                return i
-            elif direction == "UP" and closes[i] > opens[i]:
-                return i
-    return -1
-
-def build_order_block(df: pd.DataFrame, pb_extreme_idx: int, direction: str,
-                      atr: float, dates, ob_atr_cap: float = 1.0,
-                      bos_candle_idx: int = -1) -> Optional[Dict]:
-    closes = df['Close'].values
-    opens  = df['Open'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    n      = len(closes)
-
-    end_idx = bos_candle_idx if (bos_candle_idx > pb_extreme_idx) else min(pb_extreme_idx + 15, n - 1)
-    scan_range = range(pb_extreme_idx, min(end_idx + 1, n))
-    ob_candle_idx = -1
-
-    if direction == "BULL":
-        for k in scan_range:
-            if closes[k] < opens[k]: 
-                ob_candle_idx = k
-    elif direction == "BEAR":
-        for k in scan_range:
-            if closes[k] > opens[k]: 
-                ob_candle_idx = k
-
-    if ob_candle_idx == -1:
-        ob_candle_idx = pb_extreme_idx
-
-    body_top    = float(max(closes[ob_candle_idx], opens[ob_candle_idx]))
-    body_bottom = float(min(closes[ob_candle_idx], opens[ob_candle_idx]))
-
-    min_size = atr * 0.1
-    if (body_top - body_bottom) < min_size:
-        mid = (body_top + body_bottom) / 2.0
-        body_top    = mid + min_size / 2.0
-        body_bottom = mid - min_size / 2.0
-
-    if direction == "BULL" and (body_top - body_bottom) > atr * ob_atr_cap:
-        body_top = body_bottom + (atr * ob_atr_cap)
-    elif direction == "BEAR" and (body_top - body_bottom) > atr * ob_atr_cap:
-        body_bottom = body_top - (atr * ob_atr_cap)
-
-    if direction == "BULL":
-        return {
-            "type":          "OB_BULL",
-            "top":           round(body_top, 8),
-            "bottom":        round(body_bottom, 8),
-            "price":         round(body_bottom, 8), 
-            "time":          int(dates[ob_candle_idx]),
-            "candle_idx":    int(ob_candle_idx),
-            "is_mitigated":  False,
-            "fvg_size_pips": float(body_top - body_bottom),
-            "momentum_ratio": 2.0,
-            "label":         "1H-OB (Bullish)",
-            "entry_label":   "ONLY BUYS"
-        }
-    else:
-        return {
-            "type":          "OB_BEAR",
-            "top":           round(body_top, 8),
-            "bottom":        round(body_bottom, 8),
-            "price":         round(body_top, 8), 
-            "time":          int(dates[ob_candle_idx]),
-            "candle_idx":    int(ob_candle_idx),
-            "is_mitigated":  False,
-            "fvg_size_pips": float(body_top - body_bottom),
-            "momentum_ratio": 2.0,
-            "label":         "1H-OB (Bearish)",
-            "entry_label":   "ONLY SELLS"
-        }
-
-def check_ob_mitigation(df: pd.DataFrame, ob: Dict, from_idx: int) -> bool:
-    closes = df['Close'].values
-    height = ob['top'] - ob['bottom']
-    if height <= 0:
-        return False
-    bear_invalidation = ob['bottom'] + (height * 0.75)  
-    bull_invalidation = ob['top']    - (height * 0.75) 
-    for i in range(from_idx, len(closes)):
-        if ob['type'] == "OB_BEAR" and closes[i] > bear_invalidation:
-            return True
-        if ob['type'] == "OB_BULL" and closes[i] < bull_invalidation:
-            return True
-    return False
-
-def detect_choch(df: pd.DataFrame, swing_highs: np.ndarray,
-                 swing_lows: np.ndarray, current_cycle: str) -> Dict:
-    closes = df['Close'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    result = {"detected": False, "level": 0.0, "time": 0, "idx": -1}
-
-    if current_cycle == "BEARISH" and len(swing_highs) >= 2:
-        last_lower_high_price = highs[swing_highs[-1]]
-        last_lower_high_idx   = swing_highs[-1]
-        for i in range(last_lower_high_idx + 1, len(closes)):
-            if closes[i] > last_lower_high_price:
-                result = {
-                    "detected": True,
-                    "level": float(last_lower_high_price),
-                    "time": int(dates[i]),
-                    "idx": int(i)
-                }
-                break
-    elif current_cycle == "BULLISH" and len(swing_lows) >= 2:
-        last_higher_low_price = lows[swing_lows[-1]]
-        last_higher_low_idx   = swing_lows[-1]
-        for i in range(last_higher_low_idx + 1, len(closes)):
-            if closes[i] < last_higher_low_price:
-                result = {
-                    "detected": True,
-                    "level": float(last_higher_low_price),
-                    "time": int(dates[i]),
-                    "idx": int(i)
-                }
-                break
-    return result
-
-def detect_fair_value_gaps(df: pd.DataFrame, atr: float) -> List[Dict]:
-    fvgs = []
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-    min_gap = atr * 0.3
-
-    for i in range(2, len(highs)):
-        bull_gap = lows[i] - highs[i-2]
-        bear_gap = lows[i-2] - highs[i]
-
-        if bull_gap > min_gap:
-            fvgs.append({
-                "type": "FVG_BULL",
-                "top": float(lows[i]),
-                "bottom": float(highs[i-2]),
-                "time": int(dates[i-1]),
-                "gap_size": float(bull_gap)
-            })
-        elif bear_gap > min_gap:
-            fvgs.append({
-                "type": "FVG_BEAR",
-                "top": float(lows[i-2]),
-                "bottom": float(highs[i]),
-                "time": int(dates[i-1]),
-                "gap_size": float(bear_gap)
-            })
-    return fvgs[-3:] if fvgs else []
-
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
-    # 🟢 Original SMC Structure Analyzer - Kept completely intact
+    """
+    MARKET MAKER METHOD (MMM) CYCLE ANALYSIS
+    1. Find Macro Peak (M/W Anchor)
+    2. Divide trend into 3 Levels using ATR
+    3. Spot pullbacks to EMAs for entry
+    """
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
-    opens  = df['Open'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
 
     atr = calculate_atr(df, 14)
     if atr == 0:
         atr = float(df['Close'].mean()) * 0.001
-    ob_atr_cap   = profile.get("ob_atr_cap", 1.0)
-    pullback_atr = profile.get("pullback_atr", 0.5)
 
     swing_order = adaptive_swing_order(df, atr)
-    
     raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
     raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
 
@@ -409,299 +230,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     if len(search_highs) == 0: search_highs = raw_highs[-3:]
     if len(search_lows)  == 0: search_lows  = raw_lows[-3:]
 
-    best_high_score = -1.0
-    best_high_idx   = int(search_highs[-1])
-    for sh in search_highs:
-        subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
-        drop = float(highs[sh]) - subsequent_low
-        if drop > best_high_score:
-            best_high_score = drop
-            best_high_idx   = int(sh)
-
-    best_low_score = -1.0
-    best_low_idx   = int(search_lows[-1])
-    for sl in search_lows:
-        subsequent_high = float(np.max(highs[sl:])) if sl < len(highs) - 1 else float(lows[sl])
-        rally = subsequent_high - float(lows[sl])
-        if rally > best_low_score:
-            best_low_score = rally
-            best_low_idx   = int(sl)
-
-    score_diff_pct = abs(best_high_score - best_low_score) / (max(best_high_score, best_low_score) + 1e-9)
-
-    if score_diff_pct > 0.10:
-        use_bearish = best_high_score > best_low_score
-    else:
-        use_bearish = best_high_idx > best_low_idx
-
-    if use_bearish:
-        cycle        = "BEARISH"
-        anchor_idx   = best_high_idx
-        anchor_price = float(highs[anchor_idx])
-        pattern_name = "PFH ↓ (Anchor)"
-        anchor_color = "rgba(255, 59, 59, 1)"
-    else:
-        cycle        = "BULLISH"
-        anchor_idx   = best_low_idx
-        anchor_price = float(lows[anchor_idx])
-        pattern_name = "PFL ↑ (Anchor)"
-        anchor_color = "rgba(59, 255, 130, 1)"
-
-    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    recent_sweeps = sweeps[-5:] if sweeps else []
-
-    MAX_BOS   = 4
-    min_disp  = profile.get("min_bos_atr", 0.25) * atr 
-
-    zones       = []
-    bos_lines   = []
-    choch_lines = []
-    current_level = 0
-
-    post_anchor_sh = raw_highs[raw_highs > anchor_idx]
-    post_anchor_sl = raw_lows[raw_lows   > anchor_idx]
-
-    if cycle == "BEARISH":
-        if len(post_anchor_sl) == 0:
-            pass  
-        else:
-            first_sl_idx   = int(post_anchor_sl[0])
-            first_sl_price = float(lows[first_sl_idx])
-
-            initial_ob = build_order_block(
-                df, anchor_idx, "BEAR", atr, dates, ob_atr_cap, first_sl_idx
-            )
-            if initial_ob:
-                initial_ob['label']       = "1H-OB (Origin)"
-                initial_ob['entry_label'] = "ONLY SELLS"
-                initial_ob['is_mitigated'] = check_ob_mitigation(
-                    df, initial_ob, initial_ob['candle_idx'] + 1
-                )
-                zones.append(initial_ob)
-
-            last_confirmed_low_idx = first_sl_idx
-            last_confirmed_low_val = first_sl_price
-
-            for sl_idx in post_anchor_sl[1:]:  
-                if current_level >= MAX_BOS:
-                    break
-                sl_price = float(lows[sl_idx])
-
-                if sl_price >= last_confirmed_low_val:
-                    continue
-
-                pb_highs_in_window = post_anchor_sh[
-                    (post_anchor_sh > last_confirmed_low_idx) &
-                    (post_anchor_sh < sl_idx)
-                ]
-                if len(pb_highs_in_window) == 0:
-                    window_slice = highs[last_confirmed_low_idx:sl_idx]
-                    if len(window_slice) < 3:
-                        last_confirmed_low_val = sl_price
-                        last_confirmed_low_idx = sl_idx
-                        continue
-                    pb_extreme_idx = int(last_confirmed_low_idx + np.argmax(window_slice))
-                else:
-                    pb_extreme_idx = int(pb_highs_in_window[np.argmax(highs[pb_highs_in_window])])
-
-                pb_extreme_val = float(highs[pb_extreme_idx])
-
-                if pb_extreme_val < last_confirmed_low_val + (atr * pullback_atr):
-                    last_confirmed_low_val = sl_price
-                    last_confirmed_low_idx = sl_idx
-                    continue
-
-                bos_candle_idx = sl_idx
-                for j in range(sl_idx, min(sl_idx + 5, len(closes))):
-                    if closes[j] < (last_confirmed_low_val - min_disp):
-                        bos_candle_idx = j
-                        break
-
-                current_level += 1
-                bos_lines.append({
-                    "level": float(last_confirmed_low_val),
-                    "start_time": int(dates[last_confirmed_low_idx]),
-                    "end_time": int(dates[bos_candle_idx]),
-                    "type": f"BOS {current_level}",
-                    "color": "rgba(33, 150, 243, 0.9)",
-                    "is_choch": False
-                })
-
-                ob = build_order_block(df, pb_extreme_idx, "BEAR", atr, dates, ob_atr_cap, bos_candle_idx)
-                if ob:
-                    ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
-                    if not ob['is_mitigated']:
-                        zones.append(ob)
-
-                last_confirmed_low_val = sl_price
-                last_confirmed_low_idx = sl_idx
-
-    elif cycle == "BULLISH":
-        if len(post_anchor_sh) == 0:
-            pass
-        else:
-            first_sh_idx   = int(post_anchor_sh[0])
-            first_sh_price = float(highs[first_sh_idx])
-
-            initial_ob = build_order_block(
-                df, anchor_idx, "BULL", atr, dates, ob_atr_cap, first_sh_idx
-            )
-            if initial_ob:
-                initial_ob['label']       = "1H-OB (Origin)"
-                initial_ob['entry_label'] = "ONLY BUYS"
-                initial_ob['is_mitigated'] = check_ob_mitigation(
-                    df, initial_ob, initial_ob['candle_idx'] + 1
-                )
-                zones.append(initial_ob)
-
-            last_confirmed_high_idx = first_sh_idx
-            last_confirmed_high_val = first_sh_price
-
-            for sh_idx in post_anchor_sh[1:]:
-                if current_level >= MAX_BOS:
-                    break
-                sh_price = float(highs[sh_idx])
-
-                if sh_price <= last_confirmed_high_val:
-                    continue  
-
-                pb_lows_in_window = post_anchor_sl[
-                    (post_anchor_sl > last_confirmed_high_idx) &
-                    (post_anchor_sl < sh_idx)
-                ]
-                if len(pb_lows_in_window) == 0:
-                    window_slice = lows[last_confirmed_high_idx:sh_idx]
-                    if len(window_slice) < 3:
-                        last_confirmed_high_val = sh_price
-                        last_confirmed_high_idx = sh_idx
-                        continue
-                    pb_extreme_idx = int(last_confirmed_high_idx + np.argmin(window_slice))
-                else:
-                    pb_extreme_idx = int(pb_lows_in_window[np.argmin(lows[pb_lows_in_window])])
-
-                pb_extreme_val = float(lows[pb_extreme_idx])
-
-                if pb_extreme_val > last_confirmed_high_val - (atr * pullback_atr):
-                    last_confirmed_high_val = sh_price
-                    last_confirmed_high_idx = sh_idx
-                    continue
-
-                bos_candle_idx = sh_idx
-                for j in range(sh_idx, min(sh_idx + 5, len(closes))):
-                    if closes[j] > (last_confirmed_high_val + min_disp):
-                        bos_candle_idx = j
-                        break
-
-                current_level += 1
-                bos_lines.append({
-                    "level": float(last_confirmed_high_val),
-                    "start_time": int(dates[last_confirmed_high_idx]),
-                    "end_time": int(dates[bos_candle_idx]),
-                    "type": f"BOS {current_level}",
-                    "color": "rgba(33, 150, 243, 0.9)",
-                    "is_choch": False
-                })
-
-                ob = build_order_block(df, pb_extreme_idx, "BULL", atr, dates, ob_atr_cap, bos_candle_idx)
-                if ob:
-                    ob['is_mitigated'] = check_ob_mitigation(df, ob, ob['candle_idx'] + 1)
-                    if not ob['is_mitigated']:
-                        zones.append(ob)
-
-                last_confirmed_high_val = sh_price
-                last_confirmed_high_idx = sh_idx
-
-    in_pullback = False
-    if current_level == 0:
-        in_pullback = False
-    elif cycle == "BEARISH" and len(post_anchor_sh) > 0 and len(post_anchor_sl) > 0:
-        last_sh = int(post_anchor_sh[-1])
-        last_sl = int(post_anchor_sl[-1])
-        in_pullback = last_sh > last_sl
-    elif cycle == "BULLISH" and len(post_anchor_sl) > 0 and len(post_anchor_sh) > 0:
-        last_sl = int(post_anchor_sl[-1])
-        last_sh = int(post_anchor_sh[-1])
-        in_pullback = last_sl > last_sh
-
-    choch = detect_choch(df, raw_highs, raw_lows, cycle)
-    if choch['detected']:
-        choch_lines.append({
-            "level": choch['level'],
-            "start_time": int(dates[anchor_idx]),
-            "end_time": choch['time'],
-            "type": "CHoCH ⚠️",
-            "color": "rgba(255, 165, 0, 1)",
-            "is_choch": True
-        })
-
-    fvgs = detect_fair_value_gaps(df, atr)
-
-    all_lines = [{
-        "level": anchor_price,
-        "start_time": int(dates[anchor_idx]),
-        "end_time": int(dates[-1]),
-        "type": pattern_name,
-        "color": anchor_color
-    }] + bos_lines + choch_lines
-
-    clean_zones = zones[-3:]
-
-    return {
-        "cycle":           cycle,
-        "level":           current_level + 1,
-        "in_pullback":     in_pullback,
-        "zones":           clean_zones,
-        "fvgs":            fvgs,
-        "lines":           all_lines,
-        "anchor":          anchor_price,
-        "anchor_idx":      int(anchor_idx),
-        "anchor_high_idx": int(best_high_idx),
-        "anchor_low_idx":  int(best_low_idx),
-        "anchor_high_score": round(best_high_score, 4),
-        "anchor_low_score":  round(best_low_score, 4),
-        "atr":             atr,
-        "sweeps":          recent_sweeps,
-        "choch":           choch,
-        "raw_swing_highs": [int(x) for x in raw_highs[-8:]],
-        "raw_swing_lows":  [int(x) for x in raw_lows[-8:]]
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🟢 NEW PARALLEL ENGINE: MARKET MAKER METHOD (MMM)
-# ─────────────────────────────────────────────────────────────────────────────
-def analyze_mmm_structure(df: pd.DataFrame, profile: Dict) -> Dict:
-    """
-    MASTER MMM STRUCTURE ANALYSIS
-    ──────────────────────────
-    1. Identify the Peak Formation High (M) or Low (W) Anchor.
-    2. Measure the "Levels" of drop/rise away from the anchor using ATR.
-    3. Identify Pullbacks to the EMAs for trade entries.
-    """
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    closes = df['Close'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    atr = calculate_atr(df, 14)
-    if atr == 0:
-        atr = float(df['Close'].mean()) * 0.001
-
-    swing_order = adaptive_swing_order(df, atr)
-    raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
-    raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
-
-    if len(raw_highs) == 0: raw_highs = np.array([int(np.argmax(highs))])
-    if len(raw_lows)  == 0: raw_lows  = np.array([int(np.argmin(lows))])
-
-    # ── STEP 1: FIND THE PEAK FORMATION (ANCHOR M/W) ─────────────────────────
-    ANCHOR_LOOKBACK = min(len(closes), 600)
-    search_highs = raw_highs[raw_highs >= len(closes) - ANCHOR_LOOKBACK]
-    search_lows  = raw_lows[raw_lows   >= len(closes) - ANCHOR_LOOKBACK]
-
-    if len(search_highs) == 0: search_highs = raw_highs[-3:]
-    if len(search_lows)  == 0: search_lows  = raw_lows[-3:]
-
+    # Consequence Scoring for Anchor Peak
     best_high_score, best_high_idx = -1.0, int(search_highs[-1])
     for sh in search_highs:
         subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
@@ -719,28 +248,31 @@ def analyze_mmm_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     use_bearish = best_high_score > best_low_score
 
     if use_bearish:
-        cycle        = "BEARISH (Drop from Peak M)"
+        cycle        = "BEARISH CYCLE (Peak M)"
         anchor_idx   = best_high_idx
         anchor_price = float(highs[anchor_idx])
+        pattern_name = "Peak Formation High (M)"
         anchor_color = "rgba(255, 59, 59, 1)"
         total_move   = anchor_price - float(closes[-1])
-        pattern_name = "Peak Formation High (M)"
     else:
-        cycle        = "BULLISH (Rise from Peak W)"
+        cycle        = "BULLISH CYCLE (Peak W)"
         anchor_idx   = best_low_idx
         anchor_price = float(lows[anchor_idx])
+        pattern_name = "Peak Formation Low (W)"
         anchor_color = "rgba(59, 255, 130, 1)"
         total_move   = float(closes[-1]) - anchor_price
-        pattern_name = "Peak Formation Low (W)"
 
-    # ── STEP 2: CALCULATE MMM LEVELS ─────────────────────────────────────────
+    # Stop Hunts / Pins
+    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+
+    # MMM Levels (1.5x ATR per level of displacement)
     level_size = atr * 1.5 
     current_level = int(total_move // level_size) if level_size > 0 else 0
     
     if current_level > 3: current_level = 3
     if current_level < 0: current_level = 0
 
-    # ── STEP 3: PULLBACK DETECTION (The Entry) ───────────────────────────────
+    # Determine Pullback vs Expansion Phase
     in_pullback = False
     if cycle.startswith("BEARISH"):
         last_swing_low = raw_lows[-1] if len(raw_lows) > 0 else 0
@@ -751,89 +283,80 @@ def analyze_mmm_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         last_swing_high = raw_highs[-1] if len(raw_highs) > 0 else 0
         in_pullback = last_swing_low > last_swing_high and last_swing_low > anchor_idx
 
+    # Package the Anchor line identical to how the frontend handled BOS/OBs
     all_lines = [{
         "level": anchor_price,
         "start_time": int(dates[anchor_idx]),
         "end_time": int(dates[-1]),
         "type": pattern_name,
-        "color": anchor_color
+        "color": anchor_color,
+        "is_choch": False
     }]
 
     return {
         "cycle":           cycle,
-        "level":           current_level,
+        "level":           current_level + 1,  # 1-indexed for display
         "in_pullback":     in_pullback,
         "lines":           all_lines,
         "anchor":          anchor_price,
         "anchor_idx":      int(anchor_idx),
-        "atr":             atr
+        "anchor_high_idx": int(best_high_idx),
+        "anchor_low_idx":  int(best_low_idx),
+        "atr":             atr,
+        "sweeps":          sweeps
     }
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DECISION ENGINE (Kept Intact)
+# SIGNAL DECISION ENGINE (MMM BASED)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def score_ob_quality(ob: Dict, current_price: float, atr: float,
-                     rsi: float, cycle: str, sweep_nearby: bool) -> int:
-    score = 50  
-    if ob['type'] == "OB_BULL":
-        if ob['bottom'] <= current_price <= ob['top']:
-            score += 25       
-        elif current_price <= ob['top'] + (atr * 0.3):
-            score += 10       
-    elif ob['type'] == "OB_BEAR":
-        if ob['bottom'] <= current_price <= ob['top']:
-            score += 25
-        elif current_price >= ob['bottom'] - (atr * 0.3):
-            score += 10
+def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
+                    level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float) -> int:
+    """Scores MMM entries: Focuses on Pullbacks to the 50 EMA during Level 1 and 2."""
+    score = 50 
+    dist_to_ema = abs(current_price - ema_50)
 
-    if (cycle == "BULLISH" and ob['type'] == "OB_BULL") or \
-       (cycle == "BEARISH" and ob['type'] == "OB_BEAR"):
+    # Reward Levels 1 and 2. Penalize Level 3 (Exhaustion/Reversal zone)
+    if level in [1, 2]:
         score += 15
+    elif level >= 3:
+        score -= 20
 
-    if ob['type'] == "OB_BULL" and rsi < 40:
-        score += 10   
-    elif ob['type'] == "OB_BEAR" and rsi > 60:
-        score += 10   
+    # Entry trigger: Pinning/Touching the 50 EMA (The "Water" in MMM terms)
+    if dist_to_ema <= atr * 0.5:
+        score += 20
+        
+    # Trend alignment (50 EMA crossing 200 EMA)
+    if cycle.startswith("BULLISH") and ema_50 > ema_200:
+        score += 10
+    elif cycle.startswith("BEARISH") and ema_50 < ema_200:
+        score += 10
 
+    # Stop Hunts (Pins to the high/low create strong confluence in MMM)
     if sweep_nearby:
-        score += 15
+        score += 10
 
-    if ob['fvg_size_pips'] > atr * 3:
-        score -= 10
-
-    return min(score, 95)  
-
+    return min(max(score, 0), 95)
 
 def calculate_trade_levels(current_price: float, signal: str,
-                            support: float, resistance: float,
-                            atr: float, decimals: int,
-                            ob: Optional[Dict] = None) -> Optional[Dict]:
+                            atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
     try:
         entry = current_price
-
+        
+        # Stop Loss goes behind the 50 EMA + buffer
         if signal == "BUY":
-            if ob:
-                stop_loss = ob['bottom'] - (atr * 0.5)
-            else:
-                stop_loss = support - (atr * 0.5) if support > 0 else entry - (atr * 1.5)
+            stop_loss = min(entry - (atr * 1.5), ema_50 - (atr * 0.5))
             risk = abs(entry - stop_loss)
-            take_profit = resistance if (resistance > entry + risk) else entry + (risk * 2.5)
-
+            take_profit = entry + (risk * 2.0)
         elif signal == "SELL":
-            if ob:
-                stop_loss = ob['top'] + (atr * 0.5)
-            else:
-                stop_loss = resistance + (atr * 0.5) if resistance > 0 else entry + (atr * 1.5)
+            stop_loss = max(entry + (atr * 1.5), ema_50 + (atr * 0.5))
             risk = abs(entry - stop_loss)
-            take_profit = support if (support > 0 and support < entry - risk) else entry - (risk * 2.5)
+            take_profit = entry - (risk * 2.0)
         else:
             return None
 
         risk = abs(entry - stop_loss)
-        if risk == 0:
-            return None
+        if risk == 0: return None
         rr = round(abs(take_profit - entry) / risk, 2)
 
         return {
@@ -853,7 +376,6 @@ def calculate_trade_levels(current_price: float, signal: str,
 
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    # ── DATA LOADING ──────────────────────────────────────────────────────────
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
         data_source = "LIVE_NODE_DATA"
@@ -868,31 +390,16 @@ async def analyze(req: AnalysisRequest):
         csv_last_price  = safe_float(df['Close'].iloc[-1])
         current_price   = req.current_price if req.current_price > 0 else csv_last_price
 
-        # ── INSTRUMENT PROFILE (pair-aware settings) ─────────────────────────
         profile  = get_instrument_profile(req.currency, current_price)
         decimals = profile['decimals']
 
-        # ── INDICATORS ────────────────────────────────────────────────────────
-        ema_200 = safe_float(
-            EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1],
-            current_price
-        )
-        ema_50 = safe_float(
-            EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1],
-            current_price
-        )
-        rsi = safe_float(
-            RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1],
-            50.0
-        )
-        atr = calculate_atr(df, 14)
+        ema_200 = safe_float(EMAIndicator(close=df['Close'], window=200).ema_indicator().iloc[-1], current_price)
+        ema_50  = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
+        rsi     = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
+        atr     = calculate_atr(df, 14)
         
-        # ── EMA TREND FILTER ──────────────────────────────────────────────────
         ema_bias = "ABOVE 200 EMA" if current_price > ema_200 else "BELOW 200 EMA"
-        ema_trend_ok_bull = current_price > ema_200
-        ema_trend_ok_bear = current_price < ema_200
-        
-        # ── NEWS BIAS ─────────────────────────────────────────────────────────
+
         news_val    = 0
         news_string = "No recent impactful news."
         if req.news_data:
@@ -900,296 +407,127 @@ async def analyze(req: AnalysisRequest):
             forecast = safe_float(req.news_data.get('forecast', 0))
             event    = req.news_data.get('event', 'News Event')
             if actual > forecast:
-                news_val    = -1   # USD positive → XAU negative
+                news_val    = -1   
                 news_string = f"📰 {event}: Beat forecast ({actual} vs {forecast}). USD bullish."
             elif actual < forecast:
                 news_val    = 1
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
-        # 🟢 THE TOGGLE: DYNAMICALLY ROUTE TRAFFIC TO THE CORRECT ENGINE
-        strategy_mode = getattr(req, "strategy", "SMC").upper()
+        # RUN MMM ANALYSIS
+        ms = analyze_market_structure(df, profile)
+        cycle         = ms['cycle']
+        current_level = ms['level']
+        in_pullback   = ms['in_pullback']
+        lines         = ms['lines']
+        sweeps        = ms['sweeps']
+        
+        sweep_nearby = False
+        sweep_str = ""
+        if sweeps:
+            last_sweep = sweeps[-1]
+            candle_age = len(df) - 1 - last_sweep['sweep_idx']
+            if candle_age <= 15:
+                sweep_nearby = True
+                sweep_str = f"🎯 Stop Hunt / Pin detected at {last_sweep['level']:.{decimals}f}."
 
-        if strategy_mode == "MMM":
-            # ──────────────────────────────────────────────────────────────────
-            # NEW MARKET MAKER METHOD LOGIC BLOCK
-            # ──────────────────────────────────────────────────────────────────
-            ms = analyze_mmm_structure(df, profile)
-            cycle         = ms['cycle']
-            current_level = ms['level']
-            in_pullback   = ms['in_pullback']
-            bos_lines     = ms['lines']
-            
-            master_bias = cycle
-            signal      = "NEUTRAL"
-            confidence  = 0
-            
-            display_level = min(3, current_level)
-            phase_string  = f"LEVEL {display_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
+        signal     = "NEUTRAL"
+        confidence = 0
+        
+        phase_string = f"LEVEL {current_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
 
-            reasoning = [
-                f"🧭 Master Bias: {master_bias}",
-                f"📊 Phase: {phase_string}",
-                f"📈 Price vs EMA: {ema_bias}",
-                news_string,
-            ]
+        reasoning = [
+            f"🧭 Market Maker Bias: {cycle}",
+            f"📊 Phase: {phase_string}",
+            f"📈 Price vs Macro Trend: {ema_bias}",
+            news_string,
+        ]
 
-            # Simplified MMM Entry off 50 EMA
-            if current_level >= 3 and not in_pullback:
-                reasoning.append("⏳ Level 3 Exhaustion. Anticipating macro reversal or reset.")
-            elif not in_pullback:
-                reasoning.append("🔄 Expansion phase active. Waiting for pullback to EMA before entering.")
-            else:
-                if cycle.startswith("BULLISH"):
-                    dist = abs(current_price - ema_50)
-                    if current_price >= ema_50 and dist <= (atr * 0.5):
-                        signal = "BUY"
-                        confidence = 75 if ema_trend_ok_bull else 60
-                        reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {display_level} continuation.")
-                    else:
-                        reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
-                else:
-                    dist = abs(current_price - ema_50)
-                    if current_price <= ema_50 and dist <= (atr * 0.5):
-                        signal = "SELL"
-                        confidence = 75 if ema_trend_ok_bear else 60
-                        reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {display_level} continuation.")
-                    else:
-                        reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
+        if sweep_str: reasoning.append(sweep_str)
 
-            sup_level = current_price - (atr * 2)
-            res_level = current_price + (atr * 2)
-            trade_setup = None
-            if signal in ("BUY", "SELL"):
-                trade_setup = calculate_trade_levels(current_price, signal, sup_level, res_level, atr, decimals)
-                if trade_setup:
-                    reasoning.append(
-                        f"📐 Setup: Entry {trade_setup['entry']} | "
-                        f"SL {trade_setup['stop_loss']} | "
-                        f"TP {trade_setup['take_profit']} | "
-                        f"RR 1:{trade_setup['risk_reward']}"
-                    )
-
-            # Return structure mimicking the frontend's expectations to prevent UI crashes
-            return {
-                "signal":     signal,
-                "confidence": int(confidence),
-                "trend":      master_bias,
-                "pattern":    "MMM Level Pullback",
-                "reasoning":  reasoning,
-                "keyLevels": {
-                    "resistance": round(res_level, decimals),
-                    "support":    round(sup_level, decimals),
-                    "ema200":     round(ema_200, decimals),
-                    "ema50":      round(ema_50, decimals),
-                },
-                "visuals": {
-                    "smc_zones":  [],
-                    "bos_lines":  bos_lines,
-                    "fvgs":       [],
-                    "sweeps":     [],
-                },
-                "tradeSetup":  trade_setup,
-                "dataSource":  data_source,
-            }
-
+        # MMM Trading Logic: Enter on pullbacks to the 50 EMA
+        dist = abs(current_price - ema_50)
+        
+        if current_level >= 3 and not in_pullback:
+            reasoning.append("⏳ Level 3 Exhaustion. Anticipating macro reversal or reset.")
+        elif not in_pullback:
+            reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
         else:
-            # ──────────────────────────────────────────────────────────────────
-            # ORIGINAL SMC LOGIC BLOCK (Default Fallback)
-            # ──────────────────────────────────────────────────────────────────
-            ms = analyze_market_structure(df, profile)
-            cycle         = ms['cycle']
-            current_level = ms['level']
-            in_pullback   = ms['in_pullback']
-            smc_zones     = ms['zones']
-            bos_lines     = ms['lines']
-            fvgs          = ms['fvgs']
-            sweeps        = ms['sweeps']
-            choch         = ms['choch']
-
-            master_bias = f"{cycle} CYCLE"
-
-            bull_obs        = [z for z in smc_zones if z['type'] == 'OB_BULL']
-            bear_obs        = [z for z in smc_zones if z['type'] == 'OB_BEAR']
-            bull_obs_active = [z for z in bull_obs if not z.get('is_mitigated')]
-            bear_obs_active = [z for z in bear_obs if not z.get('is_mitigated')]
-
-            nearest_bull_ob = bull_obs_active[-1] if bull_obs_active else (bull_obs[-1] if bull_obs else None)
-            nearest_bear_ob = bear_obs_active[-1] if bear_obs_active else (bear_obs[-1] if bear_obs else None)
-
-            def closest_ob(obs, price):
-                if not obs: return None
-                return min(obs, key=lambda z: min(abs(z['top'] - price), abs(z['bottom'] - price)))
-
-            nearest_bull_ob = closest_ob(bull_obs, current_price) if bull_obs else None
-            nearest_bear_ob = closest_ob(bear_obs, current_price) if bear_obs else None
-
-            sup_level = nearest_bull_ob['bottom'] if nearest_bull_ob else current_price - (atr * 2)
-            res_level = nearest_bear_ob['top']    if nearest_bear_ob else current_price + (atr * 2)
-
-            choch_warning = ""
-            if choch['detected']:
-                if cycle == "BEARISH":
-                    choch_warning = "⚠️ CHoCH Detected: Bearish structure may be reversing UP."
+            if cycle.startswith("BULLISH"):
+                if current_price >= ema_50 and dist <= (atr * 0.5):
+                    signal = "BUY"
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr)
+                    reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {current_level} continuation.")
                 else:
-                    choch_warning = "⚠️ CHoCH Detected: Bullish structure may be reversing DOWN."
-
-            sweep_nearby = False
-            sweep_str    = ""
-            if sweeps:
-                last_sweep = sweeps[-1]
-                candle_age = len(df) - 1 - last_sweep['sweep_idx']
-                if candle_age <= 20:
-                    if last_sweep['type'] == "BEAR_SWEEP" and cycle == "BULLISH":
-                        sweep_nearby = True
-                        sweep_str    = f"🎯 Buy-side liq. swept at {last_sweep['level']:.{decimals}f} — stop hunt reversal zone."
-                    elif last_sweep['type'] == "BULL_SWEEP" and cycle == "BEARISH":
-                        sweep_nearby = True
-                        sweep_str    = f"🎯 Sell-side liq. swept at {last_sweep['level']:.{decimals}f} — stop hunt reversal zone."
-
-            signal     = "NEUTRAL"
-            confidence = 0
-            target_ob  = None
-
-            display_level = min(3, current_level)
-            phase_string  = f"LEVEL {display_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
-
-            reasoning = [
-                f"🧭 Master Bias: {master_bias}",
-                f"📊 Phase: {phase_string}",
-                f"📈 Price vs EMA: {ema_bias}",
-                news_string,
-            ]
-
-            if choch_warning:
-                reasoning.append(choch_warning)
-            if sweep_str:
-                reasoning.append(sweep_str)
-
-            if current_level > 4 and not in_pullback:
-                reasoning.append("⏳ Structure Exhausted (Level 4+). Waiting for new anchor formation.")
-
-            elif not in_pullback:
-                reasoning.append("🔄 Expansion phase active. Waiting for pullback to OB before entering.")
-
+                    reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
-                if cycle == "BULLISH" and nearest_bull_ob:
-                    ob    = nearest_bull_ob
-                    score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
-                    entry_label = ob.get("entry_label", "ONLY BUYS")
-
-                    inside_ob    = ob['bottom'] - (atr * 0.5) <= current_price <= ob['top'] + (atr * 0.1)
-                    approaching  = ob['top'] < current_price <= ob['top'] + (atr * 2.0)
-
-                    if inside_ob:
-                        signal     = "BUY"
-                        target_ob  = ob
-                        confidence = score if ema_trend_ok_bull else max(50, score - 15)
-                        ema_str    = f"✅ Above 200 EMA ({ema_200:.{decimals}f})" if ema_trend_ok_bull else f"⚠️ Below 200 EMA — reduced conviction"
-                        reasoning.append(f"🔥 KILLZONE: {entry_label} — Price inside 1H-OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
-                        reasoning.append(ema_str)
-                        if rsi < 45:
-                            reasoning.append(f"✅ RSI oversold confluence ({rsi:.1f})")
-                        if sweep_nearby:
-                            reasoning.append("🎯 Stop hunt sweep adds confluence")
-                    elif approaching:
-                        reasoning.append(f"📍 {entry_label} — Approaching 1H-OB at {ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}. Waiting for tap.")
-                    else:
-                        dist = abs(current_price - ob['top'])
-                        reasoning.append(f"📍 {entry_label} — Pulling back toward 1H-OB at {ob['bottom']:.{decimals}f} ({dist:.{decimals}f} away).")
-
-                elif cycle == "BEARISH" and nearest_bear_ob:
-                    ob    = nearest_bear_ob
-                    score = score_ob_quality(ob, current_price, atr, rsi, cycle, sweep_nearby)
-                    entry_label = ob.get("entry_label", "ONLY SELLS")
-
-                    inside_ob   = ob['bottom'] - (atr * 0.1) <= current_price <= ob['top'] + (atr * 0.5)
-                    approaching = ob['bottom'] - (atr * 2.0) <= current_price < ob['bottom']
-
-                    if inside_ob:
-                        signal     = "SELL"
-                        target_ob  = ob
-                        confidence = score if ema_trend_ok_bear else max(50, score - 15)
-                        ema_str    = f"✅ Below 200 EMA ({ema_200:.{decimals}f})" if ema_trend_ok_bear else f"⚠️ Above 200 EMA — reduced conviction"
-                        reasoning.append(f"🔥 KILLZONE: {entry_label} — Price inside 1H-OB ({ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f})")
-                        reasoning.append(ema_str)
-                        if rsi > 55:
-                            reasoning.append(f"✅ RSI overbought confluence ({rsi:.1f})")
-                        if sweep_nearby:
-                            reasoning.append("🎯 Stop hunt sweep adds confluence")
-                    elif approaching:
-                        reasoning.append(f"📍 {entry_label} — Approaching 1H-OB at {ob['bottom']:.{decimals}f}–{ob['top']:.{decimals}f}. Waiting for tap.")
-                    else:
-                        dist = abs(current_price - ob['bottom'])
-                        reasoning.append(f"📍 {entry_label} — Rallying toward 1H-OB at {ob['top']:.{decimals}f} ({dist:.{decimals}f} away).")
-
+                if current_price <= ema_50 and dist <= (atr * 0.5):
+                    signal = "SELL"
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr)
+                    reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {current_level} continuation.")
                 else:
-                    reasoning.append("⚠️ No valid OB found in pullback zone. Standing aside.")
+                    reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
 
-            if signal != "NEUTRAL" and target_ob and ML_MODEL:
-                try:
-                    features = pd.DataFrame([{
-                        'type':           1 if signal == "BUY" else 0,
-                        'fvg_size_pips':  target_ob.get('fvg_size_pips', 0.0),
-                        'rsi_at_entry':   rsi,
-                        'atr_at_entry':   atr,
-                        'momentum_ratio': target_ob.get('momentum_ratio', 1.0),
-                        'news_bias':      news_val
-                    }])
-                    prob = ML_MODEL.predict_proba(features)[0][1]
-                    ml_conf = int(prob * 100)
-                    confidence = int((confidence + ml_conf) / 2)  
-                    reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
-                except Exception as ml_e:
-                    logger.warning(f"ML inference failed: {ml_e}")
+        # ML Override (feeding neutral SMC dummy data to not break the pickle file)
+        if signal != "NEUTRAL" and ML_MODEL:
+            try:
+                features = pd.DataFrame([{
+                    'type':           1 if signal == "BUY" else 0,
+                    'fvg_size_pips':  0.0,  # Neutralized
+                    'rsi_at_entry':   rsi,
+                    'atr_at_entry':   atr,
+                    'momentum_ratio': 1.0,  # Neutralized
+                    'news_bias':      news_val
+                }])
+                prob = ML_MODEL.predict_proba(features)[0][1]
+                ml_conf = int(prob * 100)
+                confidence = int((confidence + ml_conf) / 2)  
+                reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
+            except Exception as ml_e:
+                logger.warning(f"ML inference failed: {ml_e}")
 
-            if confidence == 0 and signal != "NEUTRAL":
-                confidence = 60  
+        if confidence == 0 and signal != "NEUTRAL":
+            confidence = 60  
 
-            trade_setup = None
-            if signal in ("BUY", "SELL") and confidence >= 65:
-                trade_setup = calculate_trade_levels(
-                    current_price, signal, sup_level, res_level,
-                    atr, decimals, ob=target_ob
+        trade_setup = None
+        if signal in ("BUY", "SELL") and confidence >= 65:
+            trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
+            if trade_setup:
+                reasoning.append(
+                    f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"
                 )
-                if trade_setup:
-                    reasoning.append(
-                        f"📐 Setup: Entry {trade_setup['entry']} | "
-                        f"SL {trade_setup['stop_loss']} | "
-                        f"TP {trade_setup['take_profit']} | "
-                        f"RR 1:{trade_setup['risk_reward']}"
-                    )
 
-            return {
-                "signal":     signal,
-                "confidence": int(confidence),
-                "trend":      master_bias,
-                "pattern":    "SMC Pullback + OB",
-                "reasoning":  reasoning,
-                "keyLevels": {
-                    "resistance": round(res_level, decimals),
-                    "support":    round(sup_level, decimals),
-                    "ema200":     round(ema_200, decimals),
-                    "ema50":      round(ema_50, decimals),
-                },
-                "visuals": {
-                    "smc_zones":  smc_zones,
-                    "bos_lines":  bos_lines,
-                    "fvgs":       fvgs,
-                    "sweeps":     sweeps,
-                },
-                "tradeSetup":  trade_setup,
-                "dataSource":  data_source,
-            }
+        # 🟢 Frontend Payload Integrity: 
+        # Sending empty arrays for smc_zones and fvgs so your React maps don't break.
+        return {
+            "signal":     signal,
+            "confidence": int(confidence),
+            "trend":      cycle,
+            "pattern":    "MMM Level Pullback to EMA",
+            "reasoning":  reasoning,
+            "keyLevels": {
+                "resistance": round(current_price + (atr * 2), decimals),
+                "support":    round(current_price - (atr * 2), decimals),
+                "ema200":     round(ema_200, decimals),
+                "ema50":      round(ema_50, decimals),
+            },
+            "visuals": {
+                "smc_zones":  [],     
+                "bos_lines":  lines,  
+                "fvgs":       [],     
+                "sweeps":     sweeps,     
+            },
+            "tradeSetup":  trade_setup,
+            "dataSource":  data_source,
+        }
 
     except Exception as e:
         logger.error(f"Analysis Crash: {e}", exc_info=True)
         return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
 
-
 @app.post("/api/debug")
 async def debug_analysis(req: AnalysisRequest):
     """
-    🔬 DIAGNOSTIC ENDPOINT — verifies the original SMC engine is working correctly.
+    🔬 DIAGNOSTIC ENDPOINT — Fully converted to MMM
     """
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
@@ -1254,31 +592,8 @@ async def debug_analysis(req: AnalysisRequest):
             if l["candle_idx"] == ms.get("anchor_low_idx", -1):
                 l["is_chosen"] = True
 
-        bos_summary = []
-        for b in ms['lines']:
-            if "BOS" in b.get("type", ""):
-                bos_summary.append({
-                    "label":       b["type"],
-                    "level":       round(b["level"], decimals),
-                    "start_time":  b["start_time"],
-                    "end_time":    b["end_time"],
-                })
-
-        ob_summary = []
-        for z in ms['zones']:
-            ob_summary.append({
-                "type":        z["type"],
-                "label":       z.get("label", ""),
-                "entry_label": z.get("entry_label", ""),
-                "top":         round(z["top"], decimals),
-                "bottom":      round(z["bottom"], decimals),
-                "height_atr":  round((z["top"] - z["bottom"]) / atr, 2),
-                "candle_idx":  z.get("candle_idx", -1),
-                "mitigated":   z.get("is_mitigated", False),
-            })
-
         return {
-            "✅ ENGINE VERSION":    "AuraBrain SMC v11 (Dual Engine)",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v1.0",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, decimals),
             "📐 PROFILE":          profile,
@@ -1295,18 +610,14 @@ async def debug_analysis(req: AnalysisRequest):
             "swing_lows_scored":   low_scores[:6],
             "─── STRUCTURE ───": "──────────────────────────────────────",
             "📊 PHASE":            f"Level {ms['level']} ({'PULLBACK' if ms['in_pullback'] else 'EXPANSION'})",
-            "🔵 BOS LINES":        bos_summary,
-            "🟥 ORDER BLOCKS":     ob_summary,
-            "⚠️  CHoCH":          ms['choch'],
-            "🎯 SWEEPS":           ms['sweeps'],
+            "🎯 SWEEPS (PINS)":    ms.get('sweeps', []),
             "─── VERDICT ───": "──────────────────────────────────────",
-            "🧭 BIAS":             f"{ms['cycle']} CYCLE",
-            "📍 WAITING FOR":      f"Price to tap {'Bullish OB' if ms['cycle'] == 'BULLISH' else 'Bearish OB'}" if ms['in_pullback'] else "Expansion to complete before pullback",
+            "🧭 BIAS":             ms['cycle'],
+            "📍 WAITING FOR":      f"Price to tap 50 EMA" if ms['in_pullback'] else "Expansion to complete before pullback",
         }
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
-
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
