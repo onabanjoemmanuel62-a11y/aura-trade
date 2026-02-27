@@ -204,7 +204,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     """
     MARKET MAKER METHOD (MMM) CYCLE ANALYSIS
     1. Find Macro Peak (M/W Anchor)
-    2. Reset cycle if 200 EMA invalidates it.
+    2. Reset cycle if 200 EMA & 50 EMA invalidates it.
     3. Divide trend into 3 Levels using ATR
     4. Spot pullbacks to EMAs for entry
     """
@@ -248,27 +248,31 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     use_bearish = best_high_score > best_low_score
 
-    # ── MMM PEAK RESET / INVALIDATION (The 200 EMA "Mayo" Rule) ──────────────
-    # A peak is dead if price strongly crosses the 200 EMA against the cycle.
+    # ── MMM PEAK RESET / INVALIDATION (The "Water & Mayo" Rule) ──────────────
+    # A peak is ONLY dead if BOTH Price and the 50 EMA cross the 200 EMA. 
+    # A price spike alone is just a trap or a deep Level 2 pullback.
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
-    current_price = float(closes[-1])
+    ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
+    
+    current_price   = float(closes[-1])
     current_ema_200 = float(ema_200_series.iloc[-1])
+    current_ema_50  = float(ema_50_series.iloc[-1])
 
     if use_bearish:
         # We think it's a Peak M (Bearish). 
-        # But if price is heavily ABOVE the 200 EMA, the bearish cycle is DEAD.
-        if current_price > current_ema_200 + (atr * 0.5):
+        # To invalidate, Price AND the 50 EMA must be strongly above the 200 EMA.
+        if current_price > current_ema_200 and current_ema_50 > current_ema_200:
             use_bearish = False
-            # Find the actual 'W' bottom that started this new reversal
+            # Find the actual 'W' bottom that started this confirmed reversal
             slice_lows = lows[best_high_idx:]
             if len(slice_lows) > 0:
                 best_low_idx = best_high_idx + int(np.argmin(slice_lows))
     else:
         # We think it's a Peak W (Bullish).
-        # But if price is heavily BELOW the 200 EMA, the bullish cycle is DEAD.
-        if current_price < current_ema_200 - (atr * 0.5):
+        # To invalidate, Price AND the 50 EMA must be strongly below the 200 EMA.
+        if current_price < current_ema_200 and current_ema_50 < current_ema_200:
             use_bearish = True
-            # Find the actual 'M' top that started this new reversal
+            # Find the actual 'M' top that started this confirmed reversal
             slice_highs = highs[best_low_idx:]
             if len(slice_highs) > 0:
                 best_high_idx = best_low_idx + int(np.argmax(slice_highs))
