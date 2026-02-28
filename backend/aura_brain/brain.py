@@ -120,7 +120,7 @@ class AnalysisRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v1.1" (VISUALS UPGRADE)
+# CORE ENGINE  — "AURA MMM v1.2" (STRICT STAIRCASE LOGIC)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -157,7 +157,6 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     return order
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
-    """Detects Stop Hunts (Pins/Spikes) crucial to MMM reversals."""
     sweeps = []
     closes = df['Close'].values
     highs  = df['High'].values
@@ -200,41 +199,49 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 UPDATED: MMM CONSOLIDATION BOX DETECTOR (Sequential Stepping)
+# 🟢 NEW STRICT STAIRCASE LOGIC: MMM CONSOLIDATION BOX DETECTOR
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw_highs: np.ndarray, raw_lows: np.ndarray, atr: float) -> List[Dict]:
-    """Finds the consolidation boxes (pullbacks) sequentially to prevent overlapping."""
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     boxes  = []
     
+    post_anchor_highs = raw_highs[raw_highs > anchor_idx]
+    post_anchor_lows  = raw_lows[raw_lows > anchor_idx]
+    
     level_count = 1
     search_start_idx = anchor_idx
     
+    last_valid_top = None
+    last_valid_bottom = None
+    
     if cycle.startswith("BEARISH"):
         while level_count <= 3:
-            # 1. Find the first major Low after the current search point (The initial drop)
-            valid_lows = raw_lows[raw_lows > search_start_idx]
+            valid_lows = post_anchor_lows[post_anchor_lows > search_start_idx]
             if len(valid_lows) == 0: break
-            sl_idx = valid_lows[0]
-            box_bottom = float(lows[sl_idx])
             
-            # 2. Track the pullback High until price breaks below the box bottom
-            breakout_idx = len(closes) - 1
-            box_top = float(highs[sl_idx]) # Initialize at the low
-
-            for j in range(sl_idx + 1, len(closes)):
-                # If price pulls back higher, stretch the top of the box
-                if highs[j] > box_top:
-                    box_top = float(highs[j])
-                # If price drops below the bottom, the consolidation is over
-                if closes[j] < box_bottom:
-                    breakout_idx = j
-                    break
-            
-            # Only draw if the box isn't pure micro-noise
-            if (box_top - box_bottom) >= (atr * 0.3):
+            found_level = False
+            for sl_idx in valid_lows:
+                valid_highs = post_anchor_highs[post_anchor_highs > sl_idx]
+                if len(valid_highs) == 0: continue
+                sh_idx = valid_highs[0]
+                
+                box_bottom = float(lows[sl_idx])
+                box_top = float(highs[sh_idx])
+                
+                # STRICT RULE: Must be a Lower Low and Lower High to count as the next level
+                if last_valid_bottom is not None and box_bottom > last_valid_bottom:
+                    continue # Trap/Invalid structure, keep searching
+                    
+                if (box_top - box_bottom) < (atr * 0.3): continue
+                    
+                breakout_idx = len(closes) - 1
+                for j in range(sh_idx + 1, len(closes)):
+                    if closes[j] < box_bottom:
+                        breakout_idx = j
+                        break
+                        
                 boxes.append({
                     "time": int(dates[sl_idx]),
                     "end_time": int(dates[breakout_idx]),
@@ -243,35 +250,44 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     "type": "BEAR_CONS",
                     "label": f"LEVEL {level_count}",
                 })
+                
+                last_valid_bottom = box_bottom
+                last_valid_top = box_top
+                search_start_idx = breakout_idx
                 level_count += 1
+                found_level = True
+                break
+                
+            if not found_level: break # Escapes if no valid lower-structure is found
             
-            # Move the search index forward to the breakout candle so boxes can't overlap
-            search_start_idx = breakout_idx 
-            if search_start_idx >= len(closes) - 1: break
-            
-    else:
+    else: # BULLISH
         while level_count <= 3:
-            # 1. Find the first major High after the current search point (The initial rise)
-            valid_highs = raw_highs[raw_highs > search_start_idx]
+            valid_highs = post_anchor_highs[post_anchor_highs > search_start_idx]
             if len(valid_highs) == 0: break
-            sh_idx = valid_highs[0]
-            box_top = float(highs[sh_idx])
             
-            # 2. Track the pullback Low until price breaks above the box top
-            breakout_idx = len(closes) - 1
-            box_bottom = float(lows[sh_idx]) # Initialize at the high
-
-            for j in range(sh_idx + 1, len(closes)):
-                # If price pulls back lower, stretch the bottom of the box
-                if lows[j] < box_bottom:
-                    box_bottom = float(lows[j])
-                # If price rallies above the top, the consolidation is over
-                if closes[j] > box_top:
-                    breakout_idx = j
-                    break
-            
-            # Only draw if the box isn't pure micro-noise
-            if (box_top - box_bottom) >= (atr * 0.3):
+            found_level = False
+            for sh_idx in valid_highs:
+                valid_lows = post_anchor_lows[post_anchor_lows > sh_idx]
+                if len(valid_lows) == 0: continue
+                sl_idx = valid_lows[0]
+                
+                box_top = float(highs[sh_idx])
+                box_bottom = float(lows[sl_idx])
+                
+                # STRICT RULE: Must be a Higher High and Higher Low to count as the next level
+                if last_valid_top is not None and box_top < last_valid_top:
+                    continue # Trap/Invalid structure, keep searching
+                if last_valid_bottom is not None and box_bottom < last_valid_bottom:
+                    continue 
+                    
+                if (box_top - box_bottom) < (atr * 0.3): continue
+                    
+                breakout_idx = len(closes) - 1
+                for j in range(sl_idx + 1, len(closes)):
+                    if closes[j] > box_top:
+                        breakout_idx = j
+                        break
+                        
                 boxes.append({
                     "time": int(dates[sh_idx]),
                     "end_time": int(dates[breakout_idx]),
@@ -280,22 +296,20 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     "type": "BULL_CONS",
                     "label": f"LEVEL {level_count}",
                 })
+                
+                last_valid_top = box_top
+                last_valid_bottom = box_bottom
+                search_start_idx = breakout_idx
                 level_count += 1
-            
-            # Move the search index forward to the breakout candle so boxes can't overlap
-            search_start_idx = breakout_idx 
-            if search_start_idx >= len(closes) - 1: break
+                found_level = True
+                break
+                
+            if not found_level: break
             
     return boxes
 
+
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
-    """
-    MARKET MAKER METHOD (MMM) CYCLE ANALYSIS
-    1. Find Macro Peak (M/W Anchor)
-    2. Reset cycle if 200 EMA & 50 EMA invalidates it.
-    3. Divide trend into 3 Levels using ATR
-    4. Spot pullbacks to EMAs for entry
-    """
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -364,38 +378,41 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_price = float(highs[anchor_idx])
         pattern_name = "Peak Formation High (M)"
         anchor_color = "rgba(255, 59, 59, 1)"
-        total_move   = anchor_price - float(closes[-1])
     else:
         cycle        = "BULLISH CYCLE (Peak W)"
         anchor_idx   = best_low_idx
         anchor_price = float(lows[anchor_idx])
         pattern_name = "Peak Formation Low (W)"
         anchor_color = "rgba(59, 255, 130, 1)"
-        total_move   = float(closes[-1]) - anchor_price
 
     # Stop Hunts / Pins
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     
-    # 🟢 MMM Consolidation Boxes
+    # 🟢 MMM Consolidation Boxes (Strict Staircase)
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, raw_highs, raw_lows, atr)
 
-    # MMM Levels (1.5x ATR per level of displacement)
-    level_size = atr * 1.5 
-    current_level = int(total_move // level_size) if level_size > 0 else 0
-    
-    if current_level > 3: current_level = 3
-    if current_level < 0: current_level = 0
-
-    # Determine Pullback vs Expansion Phase
+    # 🟢 DYNAMIC LEVEL & PULLBACK CALCULATION
+    total_boxes = len(consolidation_boxes)
     in_pullback = False
-    if cycle.startswith("BEARISH"):
-        last_swing_low = raw_lows[-1] if len(raw_lows) > 0 else 0
-        last_swing_high = raw_highs[-1] if len(raw_highs) > 0 else 0
-        in_pullback = last_swing_high > last_swing_low and last_swing_high > anchor_idx
+    
+    if total_boxes == 0:
+        display_level = 1
+        phase_str = "EXPANSION (Initial Push)"
     else:
-        last_swing_low = raw_lows[-1] if len(raw_lows) > 0 else 0
-        last_swing_high = raw_highs[-1] if len(raw_highs) > 0 else 0
-        in_pullback = last_swing_low > last_swing_high and last_swing_low > anchor_idx
+        last_box = consolidation_boxes[-1]
+        # If the box hasn't broken out yet (end_time is the very last candle), we are currently IN the pullback
+        if last_box['end_time'] == int(dates[-1]):
+            in_pullback = True
+            display_level = total_boxes
+            phase_str = "PULLBACK (Consolidating)"
+        else:
+            in_pullback = False
+            display_level = total_boxes + 1
+            phase_str = "EXPANSION"
+            
+    if display_level > 3:
+        display_level = 3
+        phase_str = "EXHAUSTION (Reversal Zone)"
 
     # Package the Anchor line identical to how the frontend handled BOS/OBs
     all_lines = [{
@@ -409,7 +426,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     return {
         "cycle":           cycle,
-        "level":           current_level + 1,  # 1-indexed for display
+        "level":           display_level,  
+        "phase_str":       phase_str,
         "in_pullback":     in_pullback,
         "lines":           all_lines,
         "anchor":          anchor_price,
@@ -427,29 +445,18 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
 def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
                     level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float) -> int:
-    """Scores MMM entries: Focuses on Pullbacks to the 50 EMA during Level 1 and 2."""
     score = 50 
     dist_to_ema = abs(current_price - ema_50)
 
-    # Reward Levels 1 and 2. Penalize Level 3 (Exhaustion/Reversal zone)
-    if level in [1, 2]:
-        score += 15
-    elif level >= 3:
-        score -= 20
+    if level in [1, 2]: score += 15
+    elif level >= 3: score -= 20
 
-    # Entry trigger: Pinning/Touching the 50 EMA (The "Water" in MMM terms)
-    if dist_to_ema <= atr * 0.5:
-        score += 20
+    if dist_to_ema <= atr * 0.5: score += 20
         
-    # Trend alignment (50 EMA crossing 200 EMA)
-    if cycle.startswith("BULLISH") and ema_50 > ema_200:
-        score += 10
-    elif cycle.startswith("BEARISH") and ema_50 < ema_200:
-        score += 10
+    if cycle.startswith("BULLISH") and ema_50 > ema_200: score += 10
+    elif cycle.startswith("BEARISH") and ema_50 < ema_200: score += 10
 
-    # Stop Hunts (Pins to the high/low create strong confluence in MMM)
-    if sweep_nearby:
-        score += 10
+    if sweep_nearby: score += 10
 
     return min(max(score, 0), 95)
 
@@ -483,7 +490,6 @@ def calculate_trade_levels(current_price: float, signal: str,
     except Exception as e:
         logger.error(f"Trade level calc error: {e}")
         return None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API ENDPOINT
@@ -528,10 +534,10 @@ async def analyze(req: AnalysisRequest):
                 news_val    = 1
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
-        # RUN MMM ANALYSIS
         ms = analyze_market_structure(df, profile)
         cycle         = ms['cycle']
         current_level = ms['level']
+        phase_str     = ms['phase_str']
         in_pullback   = ms['in_pullback']
         lines         = ms['lines']
         sweeps        = ms['sweeps']
@@ -549,18 +555,17 @@ async def analyze(req: AnalysisRequest):
         signal     = "NEUTRAL"
         confidence = 0
         
-        phase_string = f"LEVEL {current_level} {'(PULLBACK)' if in_pullback else '(EXPANSION)'}"
+        full_phase_string = f"LEVEL {current_level} {phase_str}"
 
         reasoning = [
             f"🧭 Market Maker Bias: {cycle}",
-            f"📊 Phase: {phase_string}",
+            f"📊 Phase: {full_phase_string}",
             f"📈 Price vs Macro Trend: {ema_bias}",
             news_string,
         ]
 
         if sweep_str: reasoning.append(sweep_str)
 
-        # MMM Trading Logic: Enter on pullbacks to the 50 EMA
         dist = abs(current_price - ema_50)
         
         if current_level >= 3 and not in_pullback:
@@ -583,15 +588,14 @@ async def analyze(req: AnalysisRequest):
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
 
-        # ML Override (feeding neutral SMC dummy data to not break the pickle file)
         if signal != "NEUTRAL" and ML_MODEL:
             try:
                 features = pd.DataFrame([{
                     'type':           1 if signal == "BUY" else 0,
-                    'fvg_size_pips':  0.0,  # Neutralized
+                    'fvg_size_pips':  0.0,
                     'rsi_at_entry':   rsi,
                     'atr_at_entry':   atr,
-                    'momentum_ratio': 1.0,  # Neutralized
+                    'momentum_ratio': 1.0, 
                     'news_bias':      news_val
                 }])
                 prob = ML_MODEL.predict_proba(features)[0][1]
@@ -612,8 +616,6 @@ async def analyze(req: AnalysisRequest):
                     f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"
                 )
 
-        # 🟢 Frontend Payload Integrity: 
-        # Passing our dynamically generated consolidation boxes into the visuals payload!
         return {
             "signal":     signal,
             "confidence": int(confidence),
@@ -627,7 +629,7 @@ async def analyze(req: AnalysisRequest):
                 "ema50":      round(ema_50, decimals),
             },
             "visuals": {
-                "smc_zones":  boxes,  # 🟢 Maps perfectly to the new ChartComponent's box renderer
+                "smc_zones":  boxes,
                 "bos_lines":  lines,  
                 "fvgs":       [],     
                 "sweeps":     sweeps,     
@@ -642,9 +644,6 @@ async def analyze(req: AnalysisRequest):
 
 @app.post("/api/debug")
 async def debug_analysis(req: AnalysisRequest):
-    """
-    🔬 DIAGNOSTIC ENDPOINT — Fully converted to MMM
-    """
     if req.candles and len(req.candles) > 50:
         df = process_live_candles(req.candles)
     else:
@@ -659,78 +658,17 @@ async def debug_analysis(req: AnalysisRequest):
         profile        = get_instrument_profile(req.currency, current_price)
         decimals       = profile['decimals']
         atr            = calculate_atr(df, 14)
-        swing_order    = adaptive_swing_order(df, atr)
-
-        highs  = df['High'].values
-        lows   = df['Low'].values
-        closes = df['Close'].values
-        dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-        raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
-        raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
-
-        ANCHOR_LOOKBACK = min(len(closes), 600)
-        search_highs = raw_highs[raw_highs >= len(closes) - ANCHOR_LOOKBACK]
-        search_lows  = raw_lows[raw_lows   >= len(closes) - ANCHOR_LOOKBACK]
-
-        high_scores = []
-        for sh in search_highs:
-            subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
-            drop = float(highs[sh]) - subsequent_low
-            high_scores.append({
-                "candle_idx":    int(sh),
-                "price":         round(float(highs[sh]), decimals),
-                "date":          str(dates[sh]),
-                "drop_after":    round(drop, decimals),
-                "is_chosen":     False
-            })
-        high_scores.sort(key=lambda x: x["drop_after"], reverse=True)
-
-        low_scores = []
-        for sl in search_lows:
-            subsequent_high = float(np.max(highs[sl:])) if sl < len(highs) - 1 else float(lows[sl])
-            rally = subsequent_high - float(lows[sl])
-            low_scores.append({
-                "candle_idx":   int(sl),
-                "price":        round(float(lows[sl]), decimals),
-                "date":         str(dates[sl]),
-                "rally_after":  round(rally, decimals),
-                "is_chosen":    False
-            })
-        low_scores.sort(key=lambda x: x["rally_after"], reverse=True)
 
         ms = analyze_market_structure(df, profile)
 
-        for h in high_scores:
-            if h["candle_idx"] == ms.get("anchor_high_idx", -1):
-                h["is_chosen"] = True
-        for l in low_scores:
-            if l["candle_idx"] == ms.get("anchor_low_idx", -1):
-                l["is_chosen"] = True
-
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v1.1",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v1.2",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, decimals),
-            "📐 PROFILE":          profile,
-            "📏 ATR (14)":         round(atr, decimals),
-            "🔍 SWING ORDER":      swing_order,
-            "📈 TOTAL CANDLES":    len(df),
-            "─── ANCHOR ───": "─────────────────────────────────────────",
-            "🎯 CYCLE":            ms['cycle'],
-            "🎯 ANCHOR PRICE":     round(ms['anchor'], decimals),
-            "🎯 ANCHOR CANDLE":    int(anchor_idx := ms.get('anchor_idx', 0)),
-            "─── SWING HIGHS (ranked by drop) ───": "────────────────",
-            "swing_highs_scored":  high_scores[:6],
-            "─── SWING LOWS (ranked by rally) ───": "────────────────",
-            "swing_lows_scored":   low_scores[:6],
             "─── STRUCTURE ───": "──────────────────────────────────────",
-            "📊 PHASE":            f"Level {ms['level']} ({'PULLBACK' if ms['in_pullback'] else 'EXPANSION'})",
+            "🎯 CYCLE":            ms['cycle'],
+            "📊 PHASE":            f"Level {ms['level']} {ms['phase_str']}",
             "📦 CONSOLIDATIONS":   ms.get('consolidation_boxes', []),
-            "🎯 SWEEPS (PINS)":    ms.get('sweeps', []),
-            "─── VERDICT ───": "──────────────────────────────────────",
-            "🧭 BIAS":             ms['cycle'],
-            "📍 WAITING FOR":      f"Price to tap 50 EMA" if ms['in_pullback'] else "Expansion to complete before pullback",
         }
     except Exception as e:
         import traceback
