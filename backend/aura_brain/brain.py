@@ -200,81 +200,91 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 NEW: MMM CONSOLIDATION BOX DETECTOR
+# 🟢 UPDATED: MMM CONSOLIDATION BOX DETECTOR (Sequential Stepping)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw_highs: np.ndarray, raw_lows: np.ndarray, atr: float) -> List[Dict]:
-    """Finds the consolidation boxes (pullbacks) between impulsive pushes."""
+    """Finds the consolidation boxes (pullbacks) sequentially to prevent overlapping."""
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     boxes  = []
     
-    post_anchor_highs = raw_highs[raw_highs > anchor_idx]
-    post_anchor_lows  = raw_lows[raw_lows > anchor_idx]
-    
     level_count = 1
+    search_start_idx = anchor_idx
     
     if cycle.startswith("BEARISH"):
-        # Drop cycle: Impulse creates a Low, Pullback creates a High
-        for sl_idx in post_anchor_lows:
-            if level_count > 3: break
-            
-            valid_highs = post_anchor_highs[post_anchor_highs > sl_idx]
-            if len(valid_highs) == 0: continue
-            sh_idx = valid_highs[0]
-            
+        while level_count <= 3:
+            # 1. Find the first major Low after the current search point (The initial drop)
+            valid_lows = raw_lows[raw_lows > search_start_idx]
+            if len(valid_lows) == 0: break
+            sl_idx = valid_lows[0]
             box_bottom = float(lows[sl_idx])
-            box_top = float(highs[sh_idx])
             
-            # Filter out tiny noise boxes
-            if (box_top - box_bottom) < (atr * 0.2): continue
-                
-            # Find when price breaks below the box to end the consolidation
-            end_idx = len(closes) - 1
-            for j in range(sh_idx + 1, len(closes)):
+            # 2. Track the pullback High until price breaks below the box bottom
+            breakout_idx = len(closes) - 1
+            box_top = float(highs[sl_idx]) # Initialize at the low
+
+            for j in range(sl_idx + 1, len(closes)):
+                # If price pulls back higher, stretch the top of the box
+                if highs[j] > box_top:
+                    box_top = float(highs[j])
+                # If price drops below the bottom, the consolidation is over
                 if closes[j] < box_bottom:
-                    end_idx = j
+                    breakout_idx = j
                     break
-                    
-            boxes.append({
-                "time": int(dates[sl_idx]),
-                "end_time": int(dates[end_idx]),
-                "top": box_top,
-                "bottom": box_bottom,
-                "type": "BEAR_CONS",
-                "label": f"LEVEL {level_count} BOX",
-            })
-            level_count += 1
+            
+            # Only draw if the box isn't pure micro-noise
+            if (box_top - box_bottom) >= (atr * 0.3):
+                boxes.append({
+                    "time": int(dates[sl_idx]),
+                    "end_time": int(dates[breakout_idx]),
+                    "top": box_top,
+                    "bottom": box_bottom,
+                    "type": "BEAR_CONS",
+                    "label": f"LEVEL {level_count}",
+                })
+                level_count += 1
+            
+            # Move the search index forward to the breakout candle so boxes can't overlap
+            search_start_idx = breakout_idx 
+            if search_start_idx >= len(closes) - 1: break
             
     else:
-        # Rise cycle: Impulse creates a High, Pullback creates a Low
-        for sh_idx in post_anchor_highs:
-            if level_count > 3: break
-            
-            valid_lows = post_anchor_lows[post_anchor_lows > sh_idx]
-            if len(valid_lows) == 0: continue
-            sl_idx = valid_lows[0]
-            
+        while level_count <= 3:
+            # 1. Find the first major High after the current search point (The initial rise)
+            valid_highs = raw_highs[raw_highs > search_start_idx]
+            if len(valid_highs) == 0: break
+            sh_idx = valid_highs[0]
             box_top = float(highs[sh_idx])
-            box_bottom = float(lows[sl_idx])
             
-            if (box_top - box_bottom) < (atr * 0.2): continue
-                
-            end_idx = len(closes) - 1
-            for j in range(sl_idx + 1, len(closes)):
+            # 2. Track the pullback Low until price breaks above the box top
+            breakout_idx = len(closes) - 1
+            box_bottom = float(lows[sh_idx]) # Initialize at the high
+
+            for j in range(sh_idx + 1, len(closes)):
+                # If price pulls back lower, stretch the bottom of the box
+                if lows[j] < box_bottom:
+                    box_bottom = float(lows[j])
+                # If price rallies above the top, the consolidation is over
                 if closes[j] > box_top:
-                    end_idx = j
+                    breakout_idx = j
                     break
-                    
-            boxes.append({
-                "time": int(dates[sh_idx]),
-                "end_time": int(dates[end_idx]),
-                "top": box_top,
-                "bottom": box_bottom,
-                "type": "BULL_CONS",
-                "label": f"LEVEL {level_count} BOX",
-            })
-            level_count += 1
+            
+            # Only draw if the box isn't pure micro-noise
+            if (box_top - box_bottom) >= (atr * 0.3):
+                boxes.append({
+                    "time": int(dates[sh_idx]),
+                    "end_time": int(dates[breakout_idx]),
+                    "top": box_top,
+                    "bottom": box_bottom,
+                    "type": "BULL_CONS",
+                    "label": f"LEVEL {level_count}",
+                })
+                level_count += 1
+            
+            # Move the search index forward to the breakout candle so boxes can't overlap
+            search_start_idx = breakout_idx 
+            if search_start_idx >= len(closes) - 1: break
             
     return boxes
 
