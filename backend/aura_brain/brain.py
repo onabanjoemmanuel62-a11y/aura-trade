@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 STRICT MMM MACRO STATE MACHINE (Only 2 Boxes, Ignores Micro Noise)
+# 🟢 TRUE MMM MACRO STATE MACHINE (Strict EMA Crossing Logic)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -210,17 +210,15 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     current_idx = anchor_idx
 
     # STRICT MACRO RULES
-    min_push = atr * 3.5           # Force it to ignore micro-wicks. Must be a true macro push.
-    ema_proximity = atr * 0.8      # Must pull back near the 50 EMA
+    min_push = atr * 2.0           # Must travel a fair distance to ignore micro-wicks
+    ema_proximity = atr * 0.5      # Must pull back closely to the 50 EMA
     min_box_length = 5             # Must chop sideways for a bit
-
     max_boxes = 2                  # MMM only has 2 consolidations (Before L2, and Before L3)
 
     if cycle.startswith("BULLISH"):
         for box_num in range(1, max_boxes + 1):
             if current_idx >= len(closes) - min_box_length: break
 
-            # --- STATE 1: FIND THE MACRO IMPULSE PUSH ---
             highest_val = highs[current_idx]
             highest_idx = current_idx
             pullback_idx = -1
@@ -230,16 +228,21 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     highest_val = highs[i]
                     highest_idx = i
 
-                # Only check for 50 EMA pullback IF the push travelled far enough
-                start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
-                if highest_val - start_price >= min_push:
-                    if lows[i] <= ema_50[i] + ema_proximity:
-                        pullback_idx = i
-                        break
+                # CRITICAL RULE: For a bullish cycle, the peak MUST successfully cross ABOVE the 50 EMA
+                # If it's below the 50 EMA, it's just bottom chop, NOT Level 1 Rise.
+                if highest_val > ema_50[highest_idx]:
+                    start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
+                    
+                    # Once above the 50 EMA, verify it pushed a decent distance
+                    if highest_val - start_price >= min_push:
+                        # Now wait for the pullback DOWN to touch the 50 EMA
+                        if lows[i] <= ema_50[i] + ema_proximity:
+                            pullback_idx = i
+                            break
 
             if pullback_idx == -1: break 
 
-            # --- STATE 2: LOCK IN CONSOLIDATION BOX ---
+            # Lock in the box top and bottom
             box_top = highest_val
             box_bottom = lows[pullback_idx]
             breakout_idx = len(closes) - 1
@@ -249,12 +252,12 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 if lows[i] < box_bottom:
                     box_bottom = lows[i]
 
-                # STATE 3: WAIT FOR MACRO BREAKOUT
+                # Wait for macro breakout
                 if closes[i] > box_top:
                     breakout_idx = i
                     breakout_dir = "up"
                     break
-                elif closes[i] < box_bottom - atr: 
+                elif closes[i] < box_bottom - (atr * 0.5): 
                     breakout_idx = i
                     breakout_dir = "down"
                     break
@@ -271,7 +274,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     "label": f"CONS {box_num} (Prep L{target_level})",
                     "breakout_dir": breakout_dir
                 })
-                
                 if breakout_dir != "up": break 
             else:
                 if breakout_dir == "up":
@@ -294,11 +296,15 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     lowest_val = lows[i]
                     lowest_idx = i
 
-                start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
-                if start_price - lowest_val >= min_push:
-                    if highs[i] >= ema_50[i] - ema_proximity:
-                        pullback_idx = i
-                        break
+                # CRITICAL RULE: For a bearish cycle, the trough MUST cross BELOW the 50 EMA
+                if lowest_val < ema_50[lowest_idx]:
+                    start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
+                    
+                    if start_price - lowest_val >= min_push:
+                        # Pull back UP to the 50 EMA
+                        if highs[i] >= ema_50[i] - ema_proximity:
+                            pullback_idx = i
+                            break
 
             if pullback_idx == -1: break
 
@@ -315,7 +321,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     breakout_idx = i
                     breakout_dir = "down"
                     break
-                elif closes[i] > box_top + atr:
+                elif closes[i] > box_top + (atr * 0.5):
                     breakout_idx = i
                     breakout_dir = "up"
                     break
