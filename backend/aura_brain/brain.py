@@ -120,7 +120,7 @@ class AnalysisRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v1.0"
+# CORE ENGINE  — "AURA MMM v1.1" (VISUALS UPGRADE)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -200,6 +200,84 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
+# 🟢 NEW: MMM CONSOLIDATION BOX DETECTOR
+def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw_highs: np.ndarray, raw_lows: np.ndarray, atr: float) -> List[Dict]:
+    """Finds the consolidation boxes (pullbacks) between impulsive pushes."""
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    boxes  = []
+    
+    post_anchor_highs = raw_highs[raw_highs > anchor_idx]
+    post_anchor_lows  = raw_lows[raw_lows > anchor_idx]
+    
+    level_count = 1
+    
+    if cycle.startswith("BEARISH"):
+        # Drop cycle: Impulse creates a Low, Pullback creates a High
+        for sl_idx in post_anchor_lows:
+            if level_count > 3: break
+            
+            valid_highs = post_anchor_highs[post_anchor_highs > sl_idx]
+            if len(valid_highs) == 0: continue
+            sh_idx = valid_highs[0]
+            
+            box_bottom = float(lows[sl_idx])
+            box_top = float(highs[sh_idx])
+            
+            # Filter out tiny noise boxes
+            if (box_top - box_bottom) < (atr * 0.2): continue
+                
+            # Find when price breaks below the box to end the consolidation
+            end_idx = len(closes) - 1
+            for j in range(sh_idx + 1, len(closes)):
+                if closes[j] < box_bottom:
+                    end_idx = j
+                    break
+                    
+            boxes.append({
+                "time": int(dates[sl_idx]),
+                "end_time": int(dates[end_idx]),
+                "top": box_top,
+                "bottom": box_bottom,
+                "type": "BEAR_CONS",
+                "label": f"LEVEL {level_count} BOX",
+            })
+            level_count += 1
+            
+    else:
+        # Rise cycle: Impulse creates a High, Pullback creates a Low
+        for sh_idx in post_anchor_highs:
+            if level_count > 3: break
+            
+            valid_lows = post_anchor_lows[post_anchor_lows > sh_idx]
+            if len(valid_lows) == 0: continue
+            sl_idx = valid_lows[0]
+            
+            box_top = float(highs[sh_idx])
+            box_bottom = float(lows[sl_idx])
+            
+            if (box_top - box_bottom) < (atr * 0.2): continue
+                
+            end_idx = len(closes) - 1
+            for j in range(sl_idx + 1, len(closes)):
+                if closes[j] > box_top:
+                    end_idx = j
+                    break
+                    
+            boxes.append({
+                "time": int(dates[sh_idx]),
+                "end_time": int(dates[end_idx]),
+                "top": box_top,
+                "bottom": box_bottom,
+                "type": "BULL_CONS",
+                "label": f"LEVEL {level_count} BOX",
+            })
+            level_count += 1
+            
+    return boxes
+
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     """
     MARKET MAKER METHOD (MMM) CYCLE ANALYSIS
@@ -249,8 +327,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     use_bearish = best_high_score > best_low_score
 
     # ── MMM PEAK RESET / INVALIDATION (The "Water & Mayo" Rule) ──────────────
-    # A peak is ONLY dead if BOTH Price and the 50 EMA cross the 200 EMA. 
-    # A price spike alone is just a trap or a deep Level 2 pullback.
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
     ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
     
@@ -259,20 +335,14 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     current_ema_50  = float(ema_50_series.iloc[-1])
 
     if use_bearish:
-        # We think it's a Peak M (Bearish). 
-        # To invalidate, Price AND the 50 EMA must be strongly above the 200 EMA.
         if current_price > current_ema_200 and current_ema_50 > current_ema_200:
             use_bearish = False
-            # Find the actual 'W' bottom that started this confirmed reversal
             slice_lows = lows[best_high_idx:]
             if len(slice_lows) > 0:
                 best_low_idx = best_high_idx + int(np.argmin(slice_lows))
     else:
-        # We think it's a Peak W (Bullish).
-        # To invalidate, Price AND the 50 EMA must be strongly below the 200 EMA.
         if current_price < current_ema_200 and current_ema_50 < current_ema_200:
             use_bearish = True
-            # Find the actual 'M' top that started this confirmed reversal
             slice_highs = highs[best_low_idx:]
             if len(slice_highs) > 0:
                 best_high_idx = best_low_idx + int(np.argmax(slice_highs))
@@ -295,6 +365,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     # Stop Hunts / Pins
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    
+    # 🟢 MMM Consolidation Boxes
+    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, raw_highs, raw_lows, atr)
 
     # MMM Levels (1.5x ATR per level of displacement)
     level_size = atr * 1.5 
@@ -334,7 +407,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "anchor_high_idx": int(best_high_idx),
         "anchor_low_idx":  int(best_low_idx),
         "atr":             atr,
-        "sweeps":          sweeps
+        "sweeps":          sweeps,
+        "consolidation_boxes": consolidation_boxes
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -451,6 +525,7 @@ async def analyze(req: AnalysisRequest):
         in_pullback   = ms['in_pullback']
         lines         = ms['lines']
         sweeps        = ms['sweeps']
+        boxes         = ms.get('consolidation_boxes', [])
         
         sweep_nearby = False
         sweep_str = ""
@@ -528,7 +603,7 @@ async def analyze(req: AnalysisRequest):
                 )
 
         # 🟢 Frontend Payload Integrity: 
-        # Sending empty arrays for smc_zones and fvgs so your React maps don't break.
+        # Passing our dynamically generated consolidation boxes into the visuals payload!
         return {
             "signal":     signal,
             "confidence": int(confidence),
@@ -542,7 +617,7 @@ async def analyze(req: AnalysisRequest):
                 "ema50":      round(ema_50, decimals),
             },
             "visuals": {
-                "smc_zones":  [],     
+                "smc_zones":  boxes,  # 🟢 Maps perfectly to the new ChartComponent's box renderer
                 "bos_lines":  lines,  
                 "fvgs":       [],     
                 "sweeps":     sweeps,     
@@ -624,7 +699,7 @@ async def debug_analysis(req: AnalysisRequest):
                 l["is_chosen"] = True
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v1.0",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v1.1",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, decimals),
             "📐 PROFILE":          profile,
@@ -641,6 +716,7 @@ async def debug_analysis(req: AnalysisRequest):
             "swing_lows_scored":   low_scores[:6],
             "─── STRUCTURE ───": "──────────────────────────────────────",
             "📊 PHASE":            f"Level {ms['level']} ({'PULLBACK' if ms['in_pullback'] else 'EXPANSION'})",
+            "📦 CONSOLIDATIONS":   ms.get('consolidation_boxes', []),
             "🎯 SWEEPS (PINS)":    ms.get('sweeps', []),
             "─── VERDICT ───": "──────────────────────────────────────",
             "🧭 BIAS":             ms['cycle'],
