@@ -120,7 +120,7 @@ class AnalysisRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v2.0" (TRUE VISUAL ALIGNMENT)
+# CORE ENGINE  — "AURA MMM v2.1" (PUSH & TIME CONSTRAINTS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 NEW: PUSH & PULLBACK TRACKER (Matches TV Chart Visually)
+# 🟢 NEW: PUSH & TIME TRACKER (Matches TradingView Visuals)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -210,14 +210,14 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     level_count = 1
     current_idx = anchor_idx
 
-    # A push must move at least 0.8 ATR to be considered a true MMM Level
-    min_push = atr * 0.8
-    # A pullback must retrace at least 0.5 ATR to trigger a consolidation box
-    pullback_thresh = atr * 0.5
+    # RULES FOR A VALID LEVEL
+    min_push = atr * 1.2         # Price must travel significantly to count as a "Level Rise/Drop"
+    pullback_thresh = atr * 0.6  # Price must pull back to start a consolidation box
+    min_box_length = 8           # Box must chop sideways for at least 8 candles (filters out vertical V-spikes)
 
     if cycle.startswith("BULLISH"):
-        while level_count <= 3 and current_idx < len(closes) - 1:
-            # 1. Track the Level Rise (Push)
+        while level_count <= 3 and current_idx < len(closes) - min_box_length:
+            # 1. Track the "Level Rise"
             highest_val = highs[current_idx]
             highest_idx = current_idx
             pullback_idx = -1
@@ -226,52 +226,65 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 if highs[i] > highest_val:
                     highest_val = highs[i]
                     highest_idx = i
-                # If price drops significantly from the peak, a consolidation box has started
+                # If price drops significantly from the local peak, we found the consolidation start
                 elif highest_val - lows[i] >= pullback_thresh:
                     pullback_idx = i
                     break
 
-            if pullback_idx == -1: 
-                break # Trend hasn't pulled back yet or reached current price
+            if pullback_idx == -1: break 
 
-            # Ensure the push was actually large enough to be a level
-            if highest_val - lows[current_idx] < min_push:
-                current_idx = pullback_idx
+            # Validate the Rise distance
+            start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
+            if highest_val - start_price < min_push:
+                # Move the index forward slightly and keep searching, ignoring this micro-noise
+                current_idx = pullback_idx 
                 continue
 
-            # 2. Map the Consolidation Box
-            lowest_val = lows[pullback_idx]
-            lowest_idx = pullback_idx
+            # 2. Map the "Consolidation/Manipulation" Box
+            box_top = highest_val
+            box_bottom = lows[pullback_idx]
             breakout_idx = len(closes) - 1
-            broken = False
+            breakout_dir = "none"
 
-            # Track the chop until a valid breakout above the box
             for i in range(pullback_idx, len(closes)):
-                if lows[i] < lowest_val:
-                    lowest_val = lows[i]
-                    lowest_idx = i
+                # Expand box bottom if it wicks lower
+                if lows[i] < box_bottom:
+                    box_bottom = lows[i]
 
-                if closes[i] > highest_val: # Price closes above the top of the box
+                # Check for Breakout ABOVE (Continuation)
+                if closes[i] > box_top:
                     breakout_idx = i
-                    broken = True
+                    breakout_dir = "up"
+                    break
+                # Check for Breakout BELOW (Reversal Trap)
+                elif closes[i] < box_bottom - (atr * 0.4): 
+                    breakout_idx = i
+                    breakout_dir = "down"
                     break
 
-            boxes.append({
-                "time": int(dates[highest_idx]), # Box starts at the peak of the Level Rise
-                "end_time": int(dates[breakout_idx]),
-                "top": float(highest_val),
-                "bottom": float(lowest_val),
-                "type": "BULL_CONS",
-                "label": f"LEVEL {level_count} CONS",
-                "breakout_dir": "up" if broken else "none"
-            })
+            # 3. Time Validation: Was it a real consolidation?
+            box_length = breakout_idx - highest_idx
+            if box_length >= min_box_length:
+                boxes.append({
+                    "time": int(dates[highest_idx]),
+                    "end_time": int(dates[breakout_idx]),
+                    "top": float(box_top),
+                    "bottom": float(box_bottom),
+                    "type": "BULL_CONS",
+                    "label": f"LEVEL {level_count} CONS",
+                    "breakout_dir": breakout_dir
+                })
+                level_count += 1
+                
+                # Stop if trend reverses or box is still forming
+                if breakout_dir == "down" or breakout_dir == "none":
+                    break 
 
-            level_count += 1
             current_idx = breakout_idx
 
     elif cycle.startswith("BEARISH"):
-        while level_count <= 3 and current_idx < len(closes) - 1:
-            # 1. Track the Level Drop (Push)
+        while level_count <= 3 and current_idx < len(closes) - min_box_length:
+            # 1. Track the "Level Drop"
             lowest_val = lows[current_idx]
             lowest_idx = current_idx
             pullback_idx = -1
@@ -280,50 +293,61 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 if lows[i] < lowest_val:
                     lowest_val = lows[i]
                     lowest_idx = i
-                # If price rises significantly from the low, a consolidation box has started
-                elif highs[i] - lowest_val >= pullback_thresh: 
+                # If price rises significantly from the local bottom, we found the consolidation start
+                elif highs[i] - lowest_val >= pullback_thresh:
                     pullback_idx = i
                     break
 
-            if pullback_idx == -1: 
-                break
+            if pullback_idx == -1: break
 
-            # Ensure the push was actually large enough
-            if highs[current_idx] - lowest_val < min_push:
+            # Validate the Drop distance
+            start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
+            if start_price - lowest_val < min_push:
                 current_idx = pullback_idx
                 continue
 
-            # 2. Map the Consolidation Box
-            highest_val = highs[pullback_idx]
-            highest_idx = pullback_idx
+            # 2. Map the "Consolidation/Manipulation" Box
+            box_bottom = lowest_val
+            box_top = highs[pullback_idx]
             breakout_idx = len(closes) - 1
-            broken = False
+            breakout_dir = "none"
 
             for i in range(pullback_idx, len(closes)):
-                if highs[i] > highest_val:
-                    highest_val = highs[i]
-                    highest_idx = i
+                # Expand box top if it wicks higher
+                if highs[i] > box_top:
+                    box_top = highs[i]
 
-                if closes[i] < lowest_val: # Price closes below the bottom of the box
+                # Check for Breakout BELOW (Continuation)
+                if closes[i] < box_bottom:
                     breakout_idx = i
-                    broken = True
+                    breakout_dir = "down"
+                    break
+                # Check for Breakout ABOVE (Reversal Trap)
+                elif closes[i] > box_top + (atr * 0.4):
+                    breakout_idx = i
+                    breakout_dir = "up"
                     break
 
-            boxes.append({
-                "time": int(dates[lowest_idx]), # Box starts at the low of the drop
-                "end_time": int(dates[breakout_idx]),
-                "top": float(highest_val),
-                "bottom": float(lowest_val),
-                "type": "BEAR_CONS",
-                "label": f"LEVEL {level_count} CONS",
-                "breakout_dir": "down" if broken else "none"
-            })
+            # 3. Time Validation
+            box_length = breakout_idx - lowest_idx
+            if box_length >= min_box_length:
+                boxes.append({
+                    "time": int(dates[lowest_idx]),
+                    "end_time": int(dates[breakout_idx]),
+                    "top": float(box_top),
+                    "bottom": float(box_bottom),
+                    "type": "BEAR_CONS",
+                    "label": f"LEVEL {level_count} CONS",
+                    "breakout_dir": breakout_dir
+                })
+                level_count += 1
+                
+                if breakout_dir == "up" or breakout_dir == "none":
+                    break
 
-            level_count += 1
             current_idx = breakout_idx
 
     return boxes
-
 
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
@@ -365,7 +389,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     use_bearish = best_high_score > best_low_score
 
-    # ── MMM PEAK RESET / INVALIDATION (The "Water & Mayo" Rule) ──────────────
+    # ── MMM PEAK RESET / INVALIDATION ──────────────
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
     ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
     
@@ -400,7 +424,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     
-    # 🟢 Get Visual Boxes
+    # 🟢 Get the refined boxes
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr)
 
     # 🟢 DYNAMIC LEVEL PHASE LOGIC
@@ -412,11 +436,17 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         phase_str = "LEVEL 1 (Initial Push)"
     else:
         last_box = consolidation_boxes[-1]
+        breakout_dir = last_box.get('breakout_dir', 'none')
         
-        if last_box['breakout_dir'] == 'none':
+        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
             in_pullback = True
             display_level = total_boxes
             phase_str = f"LEVEL {display_level} (Consolidating)"
+        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
+             (cycle.startswith("BULLISH") and breakout_dir == "down"):
+            in_pullback = False
+            display_level = total_boxes
+            phase_str = "CYCLE FAILED (Reversal Detected)"
         else:
             in_pullback = False
             display_level = total_boxes + 1
@@ -671,7 +701,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v2.0",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v2.1",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, decimals),
             "─── STRUCTURE ───": "──────────────────────────────────────",
