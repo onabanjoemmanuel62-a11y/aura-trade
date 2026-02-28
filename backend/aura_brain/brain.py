@@ -365,52 +365,41 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
     raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
 
-    if len(raw_highs) == 0: raw_highs = np.array([int(np.argmax(highs))])
-    if len(raw_lows)  == 0: raw_lows  = np.array([int(np.argmin(lows))])
-
-    ANCHOR_LOOKBACK = min(len(closes), 600)  
-    search_highs = raw_highs[raw_highs >= len(closes) - ANCHOR_LOOKBACK]
-    search_lows  = raw_lows[raw_lows   >= len(closes) - ANCHOR_LOOKBACK]
-
-    if len(search_highs) == 0: search_highs = raw_highs[-3:]
-    if len(search_lows)  == 0: search_lows  = raw_lows[-3:]
-
-    # Consequence Scoring for Anchor Peak
-    best_high_score, best_high_idx = -1.0, int(search_highs[-1])
-    for sh in search_highs:
-        subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
-        drop = float(highs[sh]) - subsequent_low
-        if drop > best_high_score:
-            best_high_score, best_high_idx = drop, int(sh)
-
-    best_low_score, best_low_idx = -1.0, int(search_lows[-1])
-    for sl in search_lows:
-        subsequent_high = float(np.max(highs[sl:])) if sl < len(highs) - 1 else float(lows[sl])
-        rally = subsequent_high - float(lows[sl])
-        if rally > best_low_score:
-            best_low_score, best_low_idx = rally, int(sl)
-
-    use_bearish = best_high_score > best_low_score
-
-    # ── MMM PEAK RESET / INVALIDATION ──────────────
+    # ── TRUE MMM PEAK DETECTION (Tied to EMA Crossovers) ───────────
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
     ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
-    
+    ema_50_array   = ema_50_series.values
+    ema_200_array  = ema_200_series.values
+
+    # 1. Determine current macro cycle by looking at the 50 & 200 EMA
+    is_bullish = ema_50_array[-1] > ema_200_array[-1]
+
+    # 2. Find the exact candle where the trend shifted (The Crossover)
+    cross_idx = 0
+    for i in range(len(closes) - 2, 0, -1):
+        if is_bullish and ema_50_array[i] <= ema_200_array[i]:
+            cross_idx = i
+            break
+        elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
+            cross_idx = i
+            break
+
+    # 3. Find the True Peak Formation (W or M) that initiated this cycle
+    # We look at the zone right around the crossover to find the absolute extreme
+    search_start = max(0, cross_idx - 150)
+    search_end   = min(len(closes), cross_idx + 50)
+
+    if is_bullish:
+        use_bearish = False
+        best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
+    else:
+        use_bearish = True
+        best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
+    # ───────────────────────────────────────────────────────────────
+
     current_price   = float(closes[-1])
     current_ema_200 = float(ema_200_series.iloc[-1])
     current_ema_50  = float(ema_50_series.iloc[-1])
-
-    if use_bearish:
-        if current_price > current_ema_200 and current_ema_50 > current_ema_200:
-            use_bearish = False
-            slice_lows = lows[best_high_idx:]
-            if len(slice_lows) > 0: best_low_idx = best_high_idx + int(np.argmin(slice_lows))
-    else:
-        if current_price < current_ema_200 and current_ema_50 < current_ema_200:
-            use_bearish = True
-            slice_highs = highs[best_low_idx:]
-            if len(slice_highs) > 0: best_high_idx = best_low_idx + int(np.argmax(slice_highs))
-    # ─────────────────────────────────────────────────────────────────────────
 
     if use_bearish:
         cycle        = "BEARISH CYCLE (Peak M)"
@@ -428,7 +417,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     
     # 🟢 Get the refined boxes (NOW PASSING EMA 50)
-    ema_50_array = ema_50_series.values
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array)
 
     # 🟢 DYNAMIC LEVEL PHASE LOGIC
