@@ -255,13 +255,13 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       rightPriceScale: { scaleMargins: { top: 0.2, bottom: 0.2 }, borderVisible: false, autoScale: true },
     });
     
+    // ✅ NEW SYNTAX: chart.addSeries() is the only method supported in modern lightweight-charts
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645',
     });
 
-    // ✅ ADDED: Curved EMA Line Series
-    const ema50 = chart.addLineSeries({ color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
-    const ema200 = chart.addLineSeries({ color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
+    const ema50 = chart.addSeries(LineSeries, { color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
+    const ema200 = chart.addSeries(LineSeries, { color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     
     const boxP = new BoxPrimitive();
     series.attachPrimitive(boxP);
@@ -340,12 +340,10 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const loop = () => {
       if (!isChartReady.current) return;
       
-      // Socket tick updates candles AND dynamically calculates newest EMA point
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current  = latestCandleRef.current;
         
-        // Recalculate EMAs efficiently to keep the lines curving smoothly live
         if (allDataRef.current.length) {
             if (ema50SeriesRef.current) ema50SeriesRef.current.setData(calculateEMA(allDataRef.current, 50));
             if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(allDataRef.current, 200));
@@ -356,12 +354,10 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       if (chartRef.current && candleSeriesRef.current) {
         const ts = chartRef.current.timeScale();
         
-        // Render MMM Consolidation Zones
         if (visuals?.smc_zones && boxPrimitiveRef.current) {
           boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, ts);
         }
         
-        // Render Peak Anchor and Stop Hunt Lines
         if (visuals?.bos_lines && linePrimitiveRef.current) {
            linePrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
         }
@@ -413,7 +409,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       addLine(tradeSetup.stop_loss,   '#FF1744', 'SL 🛑',    0, 2);
       addLine(tradeSetup.entry,       '#2962FF', 'ENTRY 🔵', 3, 2);
     }
-  }, [levels, tradeSetup]); // levels dependency kept in case other future lines are added
+  }, [levels, tradeSetup]);
 
   // Socket
   useEffect(() => {
