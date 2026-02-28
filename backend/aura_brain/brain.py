@@ -120,7 +120,7 @@ class AnalysisRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v1.2" (STRICT STAIRCASE LOGIC)
+# CORE ENGINE  — "AURA MMM v1.3" (PRECISION BREAKOUT DETECTION)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -175,7 +175,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
             wick_above = highs[i] - sh_price
             if wick_above >= min_wick and closes[i] < sh_price:
                 sweeps.append({
-                    "type":      "BULL_SWEEP", # Kept identical for frontend compatibility
+                    "type":      "BULL_SWEEP", 
                     "level":     float(sh_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]),
@@ -189,7 +189,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
             wick_below = sl_price - lows[i]
             if wick_below >= min_wick and closes[i] > sl_price:
                 sweeps.append({
-                    "type":      "BEAR_SWEEP", # Kept identical for frontend compatibility
+                    "type":      "BEAR_SWEEP", 
                     "level":     float(sl_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]),
@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 NEW STRICT STAIRCASE LOGIC: MMM CONSOLIDATION BOX DETECTOR
+# 🟢 UPDATED PRECISION LOGIC: MMM CONSOLIDATION BOX DETECTOR
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw_highs: np.ndarray, raw_lows: np.ndarray, atr: float) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -230,15 +230,15 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                 box_bottom = float(lows[sl_idx])
                 box_top = float(highs[sh_idx])
                 
-                # STRICT RULE: Must be a Lower Low and Lower High to count as the next level
                 if last_valid_bottom is not None and box_bottom > last_valid_bottom:
-                    continue # Trap/Invalid structure, keep searching
+                    continue 
                     
                 if (box_top - box_bottom) < (atr * 0.3): continue
                     
+                # 🟢 FIX: Use Wicks (lows[j]) for immediate breakout detection to prevent overlap
                 breakout_idx = len(closes) - 1
                 for j in range(sh_idx + 1, len(closes)):
-                    if closes[j] < box_bottom:
+                    if lows[j] < box_bottom:
                         breakout_idx = j
                         break
                         
@@ -258,7 +258,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                 found_level = True
                 break
                 
-            if not found_level: break # Escapes if no valid lower-structure is found
+            if not found_level: break 
             
     else: # BULLISH
         while level_count <= 3:
@@ -274,17 +274,17 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                 box_top = float(highs[sh_idx])
                 box_bottom = float(lows[sl_idx])
                 
-                # STRICT RULE: Must be a Higher High and Higher Low to count as the next level
                 if last_valid_top is not None and box_top < last_valid_top:
-                    continue # Trap/Invalid structure, keep searching
+                    continue 
                 if last_valid_bottom is not None and box_bottom < last_valid_bottom:
                     continue 
                     
                 if (box_top - box_bottom) < (atr * 0.3): continue
                     
+                # 🟢 FIX: Use Wicks (highs[j]) for immediate breakout detection
                 breakout_idx = len(closes) - 1
                 for j in range(sl_idx + 1, len(closes)):
-                    if closes[j] > box_top:
+                    if highs[j] > box_top:
                         breakout_idx = j
                         break
                         
@@ -308,7 +308,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
             
     return boxes
 
-
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -316,8 +315,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
 
     atr = calculate_atr(df, 14)
-    if atr == 0:
-        atr = float(df['Close'].mean()) * 0.001
+    if atr == 0: atr = float(df['Close'].mean()) * 0.001
 
     swing_order = adaptive_swing_order(df, atr)
     raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
@@ -333,7 +331,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     if len(search_highs) == 0: search_highs = raw_highs[-3:]
     if len(search_lows)  == 0: search_lows  = raw_lows[-3:]
 
-    # Consequence Scoring for Anchor Peak
     best_high_score, best_high_idx = -1.0, int(search_highs[-1])
     for sh in search_highs:
         subsequent_low = float(np.min(lows[sh:])) if sh < len(lows) - 1 else float(highs[sh])
@@ -350,7 +347,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     use_bearish = best_high_score > best_low_score
 
-    # ── MMM PEAK RESET / INVALIDATION (The "Water & Mayo" Rule) ──────────────
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
     ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
     
@@ -362,15 +358,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         if current_price > current_ema_200 and current_ema_50 > current_ema_200:
             use_bearish = False
             slice_lows = lows[best_high_idx:]
-            if len(slice_lows) > 0:
-                best_low_idx = best_high_idx + int(np.argmin(slice_lows))
+            if len(slice_lows) > 0: best_low_idx = best_high_idx + int(np.argmin(slice_lows))
     else:
         if current_price < current_ema_200 and current_ema_50 < current_ema_200:
             use_bearish = True
             slice_highs = highs[best_low_idx:]
-            if len(slice_highs) > 0:
-                best_high_idx = best_low_idx + int(np.argmax(slice_highs))
-    # ─────────────────────────────────────────────────────────────────────────
+            if len(slice_highs) > 0: best_high_idx = best_low_idx + int(np.argmax(slice_highs))
 
     if use_bearish:
         cycle        = "BEARISH CYCLE (Peak M)"
@@ -385,13 +378,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         pattern_name = "Peak Formation Low (W)"
         anchor_color = "rgba(59, 255, 130, 1)"
 
-    # Stop Hunts / Pins
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    
-    # 🟢 MMM Consolidation Boxes (Strict Staircase)
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, raw_highs, raw_lows, atr)
 
-    # 🟢 DYNAMIC LEVEL & PULLBACK CALCULATION
     total_boxes = len(consolidation_boxes)
     in_pullback = False
     
@@ -400,7 +389,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         phase_str = "EXPANSION (Initial Push)"
     else:
         last_box = consolidation_boxes[-1]
-        # If the box hasn't broken out yet (end_time is the very last candle), we are currently IN the pullback
         if last_box['end_time'] == int(dates[-1]):
             in_pullback = True
             display_level = total_boxes
@@ -414,7 +402,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         display_level = 3
         phase_str = "EXHAUSTION (Reversal Zone)"
 
-    # Package the Anchor line identical to how the frontend handled BOS/OBs
     all_lines = [{
         "level": anchor_price,
         "start_time": int(dates[anchor_idx]),
@@ -432,15 +419,13 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "lines":           all_lines,
         "anchor":          anchor_price,
         "anchor_idx":      int(anchor_idx),
-        "anchor_high_idx": int(best_high_idx),
-        "anchor_low_idx":  int(best_low_idx),
         "atr":             atr,
         "sweeps":          sweeps,
         "consolidation_boxes": consolidation_boxes
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DECISION ENGINE (MMM BASED)
+# SIGNAL ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
@@ -464,8 +449,6 @@ def calculate_trade_levels(current_price: float, signal: str,
                             atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
     try:
         entry = current_price
-        
-        # Stop Loss goes behind the 50 EMA + buffer
         if signal == "BUY":
             stop_loss = min(entry - (atr * 1.5), ema_50 - (atr * 0.5))
             risk = abs(entry - stop_loss)
@@ -492,7 +475,7 @@ def calculate_trade_levels(current_price: float, signal: str,
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API ENDPOINT
+# API
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
@@ -648,24 +631,15 @@ async def debug_analysis(req: AnalysisRequest):
         df = process_live_candles(req.candles)
     else:
         df = MARKET_MEMORY["df"]
-
     if df is None or df.empty:
         return {"error": "No data available"}
-
     try:
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price  = req.current_price if req.current_price > 0 else csv_last_price
         profile        = get_instrument_profile(req.currency, current_price)
-        decimals       = profile['decimals']
-        atr            = calculate_atr(df, 14)
-
         ms = analyze_market_structure(df, profile)
-
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v1.2",
-            "📊 INSTRUMENT":       req.currency,
-            "💰 CURRENT PRICE":    round(current_price, decimals),
-            "─── STRUCTURE ───": "──────────────────────────────────────",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v1.3",
             "🎯 CYCLE":            ms['cycle'],
             "📊 PHASE":            f"Level {ms['level']} {ms['phase_str']}",
             "📦 CONSOLIDATIONS":   ms.get('consolidation_boxes', []),
