@@ -6,9 +6,20 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟥 PLUGIN 1: MMM LEVEL CONSOLIDATION BOXES (Replaced SMC Order Blocks)
-// - Draws background shading for Level 1, Level 2, or Level 3 Consolidations
-// - Colors change based on bullish (green) or bearish (red) cycle
+// 🧮 HELPER: Calculate Curved EMAs on the Frontend
+// ─────────────────────────────────────────────────────────────────────────────
+const calculateEMA = (data, period) => {
+  if (!data || data.length === 0) return [];
+  const k = 2 / (period + 1);
+  let ema = data[0].close;
+  return data.map(d => {
+    ema = (d.close - ema) * k + ema;
+    return { time: d.time, value: ema };
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🟥 PLUGIN 1: MMM LEVEL CONSOLIDATION BOXES
 // ─────────────────────────────────────────────────────────────────────────────
 class BoxRenderer {
   constructor(data) { this._data = data; }
@@ -43,7 +54,7 @@ class BoxRenderer {
         // Border
         ctx.strokeStyle  = zone.borderColor;
         ctx.lineWidth    = 1.5 * hPR;
-        ctx.setLineDash([5 * hPR, 5 * hPR]); // Dashed borders for MMM levels
+        ctx.setLineDash([5 * hPR, 5 * hPR]); 
         ctx.strokeRect(x1, yTop, width, height);
         ctx.setLineDash([]);
 
@@ -102,11 +113,8 @@ class BoxPrimitive {
   paneViews() { return this._paneViews; }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 🔵 PLUGIN 2: PEAK ANCHORS & STOP HUNT PINS (Replaced BOS lines)
-// - Anchor line is solid gold/blue based on W/M
-// - Draws sharp dashed lines for Stop Hunt Pins
+// 🔵 PLUGIN 2: PEAK ANCHORS & STOP HUNT PINS
 // ─────────────────────────────────────────────────────────────────────────────
 class LineRenderer {
   constructor(data) { this._data = data; }
@@ -178,7 +186,6 @@ class LinePrimitive {
   paneViews() { return this._paneViews; }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 🚀 MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
@@ -186,6 +193,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef  = useRef(null);
   const chartRef           = useRef(null);
   const candleSeriesRef    = useRef(null);
+  const ema50SeriesRef     = useRef(null);
+  const ema200SeriesRef    = useRef(null);
+  
   const boxPrimitiveRef    = useRef(null);
   const linePrimitiveRef   = useRef(null);
   const activeLinesRef     = useRef([]);
@@ -197,19 +207,27 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const latestCandleRef    = useRef(null);
   const symbolRef          = useRef(symbol);
 
-  const [timeframe,          setTimeframe]          = useState('1h');
+  const [timeframe,           setTimeframe]           = useState('1h');
   const [connectionStatus,   setConnectionStatus]   = useState('Connecting...');
   const [newsData,           setNewsData]           = useState([]);
   const [isHoveringControls, setIsHoveringControls] = useState(false);
+
+  // 🔄 Update Series Data safely
+  const updateChartData = useCallback((data) => {
+    if (!candleSeriesRef.current || !data.length) return;
+    candleSeriesRef.current.setData(data);
+    if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(data, 50));
+    if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(data, 200));
+  }, []);
 
   // Wipe chart on symbol change
   useEffect(() => {
     symbolRef.current = symbol;
     if (candleSeriesRef.current) {
       allDataRef.current = [];
-      candleSeriesRef.current.setData([]);
+      updateChartData([]);
     }
-  }, [symbol]);
+  }, [symbol, updateChartData]);
 
   const processCandles = useCallback((rawData) => {
     if (!Array.isArray(rawData)) return [];
@@ -240,6 +258,10 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#089981', downColor: '#F23645', borderVisible: false, wickUpColor: '#089981', wickDownColor: '#F23645',
     });
+
+    // ✅ ADDED: Curved EMA Line Series
+    const ema50 = chart.addLineSeries({ color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
+    const ema200 = chart.addLineSeries({ color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     
     const boxP = new BoxPrimitive();
     series.attachPrimitive(boxP);
@@ -251,6 +273,8 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     
     chartRef.current = chart;
     candleSeriesRef.current = series;
+    ema50SeriesRef.current = ema50;
+    ema200SeriesRef.current = ema200;
     isChartReady.current = true;
     
     const onResize = () => { if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth }); };
@@ -266,6 +290,8 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
+      ema50SeriesRef.current = null;
+      ema200SeriesRef.current = null;
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -283,7 +309,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i)
         .sort((a, b) => a.time - b.time);
       allDataRef.current = combined;
-      if (candleSeriesRef.current) candleSeriesRef.current.setData(combined);
+      updateChartData(combined);
     } catch { /* silent */ }
     finally { isLoadingRef.current = false; }
   };
@@ -299,34 +325,43 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         const data = processCandles(res.data);
         if (isChartReady.current && candleSeriesRef.current) {
           allDataRef.current = data;
-          candleSeriesRef.current.setData(data);
+          updateChartData(data);
           if (data.length) currentBarRef.current = data[data.length - 1];
           setTimeout(() => chartRef.current?.timeScale().fitContent(), 50);
         }
       } catch { /* silent */ }
     };
     load();
-  }, [timeframe, symbol, processCandles]);
+  }, [timeframe, symbol, processCandles, updateChartData]);
 
-  // Render loop for Primitives (Boxes & Lines)
+  // Render loop for Primitives & Live EMAs
   useEffect(() => {
     let rafId;
     const loop = () => {
       if (!isChartReady.current) return;
+      
+      // Socket tick updates candles AND dynamically calculates newest EMA point
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current  = latestCandleRef.current;
+        
+        // Recalculate EMAs efficiently to keep the lines curving smoothly live
+        if (allDataRef.current.length) {
+            if (ema50SeriesRef.current) ema50SeriesRef.current.setData(calculateEMA(allDataRef.current, 50));
+            if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(allDataRef.current, 200));
+        }
         latestCandleRef.current = null;
       }
+      
       if (chartRef.current && candleSeriesRef.current) {
         const ts = chartRef.current.timeScale();
         
-        // Render MMM Consolidation Zones (mapped to old smc_zones payload safely)
+        // Render MMM Consolidation Zones
         if (visuals?.smc_zones && boxPrimitiveRef.current) {
           boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, ts);
         }
         
-        // Render Peak Anchor and Stop Hunt Lines (mapped to old bos_lines payload safely)
+        // Render Peak Anchor and Stop Hunt Lines
         if (visuals?.bos_lines && linePrimitiveRef.current) {
            linePrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
         }
@@ -361,7 +396,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     } catch { /* silent */ }
   }, [newsData]);
 
-  // Price lines (EMAs & Trade Setups)
+  // Price lines (Trade Setups only, horizontal EMAs removed)
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     activeLinesRef.current.forEach(l => { try { candleSeriesRef.current.removePriceLine(l); } catch { /* silent */ } });
@@ -378,12 +413,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       addLine(tradeSetup.stop_loss,   '#FF1744', 'SL 🛑',    0, 2);
       addLine(tradeSetup.entry,       '#2962FF', 'ENTRY 🔵', 3, 2);
     }
-    
-    // ✅ ADDED: Draw both the 200 EMA (Mayo) and 50 EMA (Water)
-    if (levels?.ema200) addLine(levels.ema200, '#FFD700', '200 EMA', 2, 1);
-    if (levels?.ema50)  addLine(levels.ema50,  '#2962FF', '50 EMA',  2, 1);
-    
-  }, [levels, tradeSetup]);
+  }, [levels, tradeSetup]); // levels dependency kept in case other future lines are added
 
   // Socket
   useEffect(() => {
