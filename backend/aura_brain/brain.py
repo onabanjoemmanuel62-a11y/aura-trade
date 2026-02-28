@@ -120,7 +120,7 @@ class AnalysisRequest(BaseModel):
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v1.3" (PRECISION BREAKOUT DETECTION)
+# CORE ENGINE  — "AURA MMM v1.3" (CYCLE FAILURE DETECTION)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 UPDATED PRECISION LOGIC: MMM CONSOLIDATION BOX DETECTOR
+# 🟢 NEW: BI-DIRECTIONAL BREAKOUT DETECTION
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw_highs: np.ndarray, raw_lows: np.ndarray, atr: float) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -235,11 +235,17 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     
                 if (box_top - box_bottom) < (atr * 0.3): continue
                     
-                # 🟢 FIX: Use Wicks (lows[j]) for immediate breakout detection to prevent overlap
                 breakout_idx = len(closes) - 1
+                breakout_dir = "none"
+
                 for j in range(sh_idx + 1, len(closes)):
-                    if lows[j] < box_bottom:
+                    if lows[j] < box_bottom: 
                         breakout_idx = j
+                        breakout_dir = "down" # Expected continuation
+                        break
+                    elif highs[j] > box_top: 
+                        breakout_idx = j
+                        breakout_dir = "up"   # Reversal / Box Failed
                         break
                         
                 boxes.append({
@@ -249,6 +255,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     "bottom": box_bottom,
                     "type": "BEAR_CONS",
                     "label": f"LEVEL {level_count}",
+                    "breakout_dir": breakout_dir # Track how it broke
                 })
                 
                 last_valid_bottom = box_bottom
@@ -256,6 +263,11 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                 search_start_idx = breakout_idx
                 level_count += 1
                 found_level = True
+                
+                # 🛑 IF THE BOX BROKE AGAINST THE TREND, THE CYCLE IS DEAD. STOP FORCING LEVELS.
+                if breakout_dir == "up":
+                    return boxes
+                    
                 break
                 
             if not found_level: break 
@@ -281,11 +293,17 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     
                 if (box_top - box_bottom) < (atr * 0.3): continue
                     
-                # 🟢 FIX: Use Wicks (highs[j]) for immediate breakout detection
                 breakout_idx = len(closes) - 1
+                breakout_dir = "none"
+                
                 for j in range(sl_idx + 1, len(closes)):
-                    if highs[j] > box_top:
+                    if highs[j] > box_top: 
                         breakout_idx = j
+                        breakout_dir = "up" # Expected continuation
+                        break
+                    elif lows[j] < box_bottom: 
+                        breakout_idx = j
+                        breakout_dir = "down" # Reversal / Box Failed
                         break
                         
                 boxes.append({
@@ -295,6 +313,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                     "bottom": box_bottom,
                     "type": "BULL_CONS",
                     "label": f"LEVEL {level_count}",
+                    "breakout_dir": breakout_dir # Track how it broke
                 })
                 
                 last_valid_top = box_top
@@ -302,6 +321,11 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, raw
                 search_start_idx = breakout_idx
                 level_count += 1
                 found_level = True
+                
+                # 🛑 IF THE BOX BROKE AGAINST THE TREND, THE CYCLE IS DEAD. STOP FORCING LEVELS.
+                if breakout_dir == "down":
+                    return boxes
+                    
                 break
                 
             if not found_level: break
@@ -381,6 +405,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, raw_highs, raw_lows, atr)
 
+    # 🟢 DYNAMIC LEVEL & PHASE ABORT CALCULATION
     total_boxes = len(consolidation_boxes)
     in_pullback = False
     
@@ -389,16 +414,23 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         phase_str = "EXPANSION (Initial Push)"
     else:
         last_box = consolidation_boxes[-1]
+        breakout_dir = last_box.get('breakout_dir', 'none')
+        
         if last_box['end_time'] == int(dates[-1]):
             in_pullback = True
             display_level = total_boxes
             phase_str = "PULLBACK (Consolidating)"
+        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
+             (cycle.startswith("BULLISH") and breakout_dir == "down"):
+            in_pullback = False
+            display_level = total_boxes
+            phase_str = "CYCLE FAILED (Reversal Detected)"
         else:
             in_pullback = False
             display_level = total_boxes + 1
             phase_str = "EXPANSION"
             
-    if display_level > 3:
+    if display_level > 3 and "FAILED" not in phase_str:
         display_level = 3
         phase_str = "EXHAUSTION (Reversal Zone)"
 
@@ -425,11 +457,15 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL ENGINE
+# SIGNAL DECISION ENGINE (MMM BASED)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
-                    level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float) -> int:
+                    level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float, phase_str: str) -> int:
+    # Do not trigger signals if the cycle has failed
+    if "FAILED" in phase_str:
+        return 0
+        
     score = 50 
     dist_to_ema = abs(current_price - ema_50)
 
@@ -475,7 +511,7 @@ def calculate_trade_levels(current_price: float, signal: str,
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# API
+# API ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
@@ -551,7 +587,9 @@ async def analyze(req: AnalysisRequest):
 
         dist = abs(current_price - ema_50)
         
-        if current_level >= 3 and not in_pullback:
+        if "FAILED" in phase_str:
+            reasoning.append("⚠️ Trend structure broken. Awaiting 200 EMA crossover to reset Anchor.")
+        elif current_level >= 3 and not in_pullback:
             reasoning.append("⏳ Level 3 Exhaustion. Anticipating macro reversal or reset.")
         elif not in_pullback:
             reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
@@ -559,14 +597,14 @@ async def analyze(req: AnalysisRequest):
             if cycle.startswith("BULLISH"):
                 if current_price >= ema_50 and dist <= (atr * 0.5):
                     signal = "BUY"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr)
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
                     reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {current_level} continuation.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
                 if current_price <= ema_50 and dist <= (atr * 0.5):
                     signal = "SELL"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr)
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
                     reasoning.append(f"🔥 KILLZONE: Pullback to 50 EMA ({ema_50:.{decimals}f}) for Level {current_level} continuation.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
@@ -631,15 +669,24 @@ async def debug_analysis(req: AnalysisRequest):
         df = process_live_candles(req.candles)
     else:
         df = MARKET_MEMORY["df"]
+
     if df is None or df.empty:
         return {"error": "No data available"}
+
     try:
         csv_last_price = safe_float(df['Close'].iloc[-1])
         current_price  = req.current_price if req.current_price > 0 else csv_last_price
         profile        = get_instrument_profile(req.currency, current_price)
+        decimals       = profile['decimals']
+        atr            = calculate_atr(df, 14)
+
         ms = analyze_market_structure(df, profile)
+
         return {
             "✅ ENGINE VERSION":    "AuraBrain MMM v1.3",
+            "📊 INSTRUMENT":       req.currency,
+            "💰 CURRENT PRICE":    round(current_price, decimals),
+            "─── STRUCTURE ───": "──────────────────────────────────────",
             "🎯 CYCLE":            ms['cycle'],
             "📊 PHASE":            f"Level {ms['level']} {ms['phase_str']}",
             "📦 CONSOLIDATIONS":   ms.get('consolidation_boxes', []),
