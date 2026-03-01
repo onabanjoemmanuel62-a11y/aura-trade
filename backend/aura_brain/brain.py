@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 TRUE MMM MACRO STATE MACHINE (Strict 200/50 EMA Crossing Logic)
+# 🟢 THE TRUE MACRO STATE MACHINE (200 EMA Gateway Logic)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -207,44 +207,43 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     
     boxes = []
-    current_idx = anchor_idx
-
-    # MACRO RULES TO ELIMINATE MICRO-CHOP
-    min_push = atr * 4.0           # Minimum distance for a macro Level push
-    pullback_depth = atr * 1.5     # Minimum depth of the manipulation pullback
-    ema_proximity = atr * 1.5      # How close it must get to the 50 EMA to count
-    min_box_length = 8             # True manipulation needs sideways time
-    max_boxes = 2                  # Standard MMM has exactly 2 tradeable consolidations
+    min_box_length = 6        # Must chop sideways for at least 6 hours
+    ema_proximity = atr * 1.0 # Pullback must get near the 50 EMA
 
     if cycle.startswith("BULLISH"):
-        for box_num in range(1, max_boxes + 1):
+        # 🛡️ GATEWAY RULE: Fast-forward until price physically breaks the 200 EMA
+        cross_200_idx = -1
+        for i in range(anchor_idx + 1, len(closes)):
+            if closes[i] > ema_200[i]:
+                cross_200_idx = i
+                break
+                
+        # If it hasn't broken the 200 EMA yet, there is no macro setup.
+        if cross_200_idx == -1: return boxes 
+
+        current_idx = cross_200_idx
+
+        # Now search for exactly 2 Consolidations
+        for box_num in range(1, 3):
             if current_idx >= len(closes) - min_box_length: break
 
             highest_val = highs[current_idx]
             highest_idx = current_idx
             pullback_idx = -1
 
-            start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
-
             for i in range(current_idx + 1, len(closes)):
                 if highs[i] > highest_val:
                     highest_val = highs[i]
                     highest_idx = i
 
-                # 1. Push must travel a macro distance
-                if highest_val - start_price >= min_push:
-                    # 2. 🛡️ THE GOLDEN RULE: LEVEL 1 MUST CROSS THE 200 EMA 
-                    if box_num == 1 and highest_val < ema_200[i]:
-                        continue
-                    
-                    # 3. Push must be above the 50 EMA
-                    if highest_val > ema_50[i]:
-                        # 4. Wait for price to pull back significantly from the peak
-                        if highest_val - lows[i] >= pullback_depth:
-                            # 5. Pullback must tap or get close to the 50 EMA
-                            if lows[i] <= ema_50[i] + ema_proximity:
-                                pullback_idx = i
-                                break
+                # Wait for a meaningful pullback from the local peak
+                if highest_val - lows[i] >= (atr * 1.2):
+                    # It MUST pull back to touch or closely approach the 50 EMA
+                    if lows[i] <= ema_50[i] + ema_proximity:
+                        # Ensure the pullback doesn't invalidate the macro trend by crashing way below 200 EMA
+                        if closes[i] > ema_200[i] - (atr * 1.0):
+                            pullback_idx = i
+                            break
 
             if pullback_idx == -1: break 
 
@@ -254,15 +253,12 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             breakout_dir = "none"
 
             for i in range(pullback_idx, len(closes)):
-                if lows[i] < box_bottom:
-                    box_bottom = lows[i]
+                if lows[i] < box_bottom: box_bottom = lows[i]
 
-                # Breakout confirmation
                 if closes[i] > box_top:
                     breakout_idx = i
                     breakout_dir = "up"
                     break
-                # Stop hunt / failure
                 elif closes[i] < box_bottom - atr: 
                     breakout_idx = i
                     breakout_dir = "down"
@@ -270,14 +266,13 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
 
             box_length = breakout_idx - highest_idx
             if box_length >= min_box_length:
-                target_level = box_num + 1
                 boxes.append({
                     "time": int(dates[highest_idx]),
                     "end_time": int(dates[breakout_idx]),
                     "top": float(box_top),
                     "bottom": float(box_bottom),
                     "type": "BULL_CONS",
-                    "label": f"CONS {box_num} (Prep L{target_level})",
+                    "label": f"CONS {box_num} (Prep L{box_num + 1})",
                     "breakout_dir": breakout_dir
                 })
                 if breakout_dir != "up": break 
@@ -290,32 +285,34 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             current_idx = breakout_idx
 
     elif cycle.startswith("BEARISH"):
-        for box_num in range(1, max_boxes + 1):
+        # 🛡️ GATEWAY RULE: Fast-forward until price physically drops below the 200 EMA
+        cross_200_idx = -1
+        for i in range(anchor_idx + 1, len(closes)):
+            if closes[i] < ema_200[i]:
+                cross_200_idx = i
+                break
+                
+        if cross_200_idx == -1: return boxes 
+
+        current_idx = cross_200_idx
+
+        for box_num in range(1, 3):
             if current_idx >= len(closes) - min_box_length: break
 
             lowest_val = lows[current_idx]
             lowest_idx = current_idx
             pullback_idx = -1
 
-            start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
-
             for i in range(current_idx + 1, len(closes)):
                 if lows[i] < lowest_val:
                     lowest_val = lows[i]
                     lowest_idx = i
 
-                if start_price - lowest_val >= min_push:
-                    # 🛡️ THE GOLDEN RULE: LEVEL 1 MUST DROP BELOW 200 EMA
-                    if box_num == 1 and lowest_val > ema_200[i]:
-                        continue
-                    
-                    if lowest_val < ema_50[i]:
-                        # Significant pullback (rally)
-                        if highs[i] - lowest_val >= pullback_depth:
-                            # Pullback taps the 50 EMA
-                            if highs[i] >= ema_50[i] - ema_proximity:
-                                pullback_idx = i
-                                break
+                if highs[i] - lowest_val >= (atr * 1.2):
+                    if highs[i] >= ema_50[i] - ema_proximity:
+                        if closes[i] < ema_200[i] + (atr * 1.0):
+                            pullback_idx = i
+                            break
 
             if pullback_idx == -1: break
 
@@ -325,8 +322,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             breakout_dir = "none"
 
             for i in range(pullback_idx, len(closes)):
-                if highs[i] > box_top:
-                    box_top = highs[i]
+                if highs[i] > box_top: box_top = highs[i]
 
                 if closes[i] < box_bottom:
                     breakout_idx = i
@@ -339,14 +335,13 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
 
             box_length = breakout_idx - lowest_idx
             if box_length >= min_box_length:
-                target_level = box_num + 1
                 boxes.append({
                     "time": int(dates[lowest_idx]),
                     "end_time": int(dates[breakout_idx]),
                     "top": float(box_top),
                     "bottom": float(box_bottom),
                     "type": "BEAR_CONS",
-                    "label": f"CONS {box_num} (Prep L{target_level})",
+                    "label": f"CONS {box_num} (Prep L{box_num + 1})",
                     "breakout_dir": breakout_dir
                 })
                 if breakout_dir != "down": break
