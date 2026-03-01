@@ -199,8 +199,8 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 TRUE MMM MACRO STATE MACHINE (Strict EMA Crossing Logic)
-def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray) -> List[Dict]:
+# 🟢 TRUE MMM MACRO STATE MACHINE (Strict 200/50 EMA Crossing Logic)
+def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -209,11 +209,12 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     boxes = []
     current_idx = anchor_idx
 
-    # STRICT MACRO RULES
-    min_push = atr * 2.0           # Must travel a fair distance to ignore micro-wicks
-    ema_proximity = atr * 0.5      # Must pull back closely to the 50 EMA
-    min_box_length = 5             # Must chop sideways for a bit
-    max_boxes = 2                  # MMM only has 2 consolidations (Before L2, and Before L3)
+    # MACRO RULES TO ELIMINATE MICRO-CHOP
+    min_push = atr * 4.0           # Minimum distance for a macro Level push
+    pullback_depth = atr * 1.5     # Minimum depth of the manipulation pullback
+    ema_proximity = atr * 1.5      # How close it must get to the 50 EMA to count
+    min_box_length = 8             # True manipulation needs sideways time
+    max_boxes = 2                  # Standard MMM has exactly 2 tradeable consolidations
 
     if cycle.startswith("BULLISH"):
         for box_num in range(1, max_boxes + 1):
@@ -223,26 +224,30 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             highest_idx = current_idx
             pullback_idx = -1
 
+            start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
+
             for i in range(current_idx + 1, len(closes)):
                 if highs[i] > highest_val:
                     highest_val = highs[i]
                     highest_idx = i
 
-                # CRITICAL RULE: For a bullish cycle, the peak MUST successfully cross ABOVE the 50 EMA
-                # If it's below the 50 EMA, it's just bottom chop, NOT Level 1 Rise.
-                if highest_val > ema_50[highest_idx]:
-                    start_price = lows[current_idx] if current_idx == anchor_idx else boxes[-1]['top'] if boxes else lows[anchor_idx]
+                # 1. Push must travel a macro distance
+                if highest_val - start_price >= min_push:
+                    # 2. 🛡️ THE GOLDEN RULE: LEVEL 1 MUST CROSS THE 200 EMA 
+                    if box_num == 1 and highest_val < ema_200[i]:
+                        continue
                     
-                    # Once above the 50 EMA, verify it pushed a decent distance
-                    if highest_val - start_price >= min_push:
-                        # Now wait for the pullback DOWN to touch the 50 EMA
-                        if lows[i] <= ema_50[i] + ema_proximity:
-                            pullback_idx = i
-                            break
+                    # 3. Push must be above the 50 EMA
+                    if highest_val > ema_50[i]:
+                        # 4. Wait for price to pull back significantly from the peak
+                        if highest_val - lows[i] >= pullback_depth:
+                            # 5. Pullback must tap or get close to the 50 EMA
+                            if lows[i] <= ema_50[i] + ema_proximity:
+                                pullback_idx = i
+                                break
 
             if pullback_idx == -1: break 
 
-            # Lock in the box top and bottom
             box_top = highest_val
             box_bottom = lows[pullback_idx]
             breakout_idx = len(closes) - 1
@@ -252,12 +257,13 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 if lows[i] < box_bottom:
                     box_bottom = lows[i]
 
-                # Wait for macro breakout
+                # Breakout confirmation
                 if closes[i] > box_top:
                     breakout_idx = i
                     breakout_dir = "up"
                     break
-                elif closes[i] < box_bottom - (atr * 0.5): 
+                # Stop hunt / failure
+                elif closes[i] < box_bottom - atr: 
                     breakout_idx = i
                     breakout_dir = "down"
                     break
@@ -291,20 +297,25 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             lowest_idx = current_idx
             pullback_idx = -1
 
+            start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
+
             for i in range(current_idx + 1, len(closes)):
                 if lows[i] < lowest_val:
                     lowest_val = lows[i]
                     lowest_idx = i
 
-                # CRITICAL RULE: For a bearish cycle, the trough MUST cross BELOW the 50 EMA
-                if lowest_val < ema_50[lowest_idx]:
-                    start_price = highs[current_idx] if current_idx == anchor_idx else boxes[-1]['bottom'] if boxes else highs[anchor_idx]
+                if start_price - lowest_val >= min_push:
+                    # 🛡️ THE GOLDEN RULE: LEVEL 1 MUST DROP BELOW 200 EMA
+                    if box_num == 1 and lowest_val > ema_200[i]:
+                        continue
                     
-                    if start_price - lowest_val >= min_push:
-                        # Pull back UP to the 50 EMA
-                        if highs[i] >= ema_50[i] - ema_proximity:
-                            pullback_idx = i
-                            break
+                    if lowest_val < ema_50[i]:
+                        # Significant pullback (rally)
+                        if highs[i] - lowest_val >= pullback_depth:
+                            # Pullback taps the 50 EMA
+                            if highs[i] >= ema_50[i] - ema_proximity:
+                                pullback_idx = i
+                                break
 
             if pullback_idx == -1: break
 
@@ -321,7 +332,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     breakout_idx = i
                     breakout_dir = "down"
                     break
-                elif closes[i] > box_top + (atr * 0.5):
+                elif closes[i] > box_top + atr:
                     breakout_idx = i
                     breakout_dir = "up"
                     break
@@ -409,7 +420,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     
     # 🟢 Get the MACRO boxes
-    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array)
+    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
 
     # 🟢 MMM TRADING LOGIC (No Level 1 Trades allowed)
     total_boxes = len(consolidation_boxes)
@@ -601,14 +612,14 @@ async def analyze(req: AnalysisRequest):
         else:
             # We are in a valid pullback (Cons 1 or Cons 2)
             if cycle.startswith("BULLISH"):
-                if current_price >= ema_50 and dist <= (atr * 0.5):
+                if current_price >= ema_50 and dist <= (atr * 1.0):
                     signal = "BUY"
                     confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
-                if current_price <= ema_50 and dist <= (atr * 0.5):
+                if current_price <= ema_50 and dist <= (atr * 1.0):
                     signal = "SELL"
                     confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
