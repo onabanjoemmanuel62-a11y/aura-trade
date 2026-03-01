@@ -199,7 +199,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 THE BULLETPROOF "EMA FAN" STATE MACHINE
+# 🟢 THE BULLETPROOF "EMA FAN" STATE MACHINE (Precision Tuned)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -207,27 +207,27 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     
     boxes = []
-    macro_push = atr * 3.5      # Massive push required to register a Level
-    min_box_length = 6          # Must chop sideways for 6+ hours
+    min_box_length = 5
+    ema_proximity = atr * 1.0 # Pullback must get near the 50 EMA
     
     if cycle.startswith("BULLISH"):
-        # 🛡️ THE GOLDEN RULE: Find where the 50 EMA crosses above the 200 EMA to confirm trend
+        # 🛡️ THE GATEWAY: Find exactly where the trend is confirmed
         cross_idx = -1
         for i in range(anchor_idx, len(closes)):
-            if ema_50[i] > ema_200[i]:
+            # Must be physically above both EMAs to start counting
+            if ema_50[i] > ema_200[i] and closes[i] > ema_200[i]:
                 cross_idx = i
                 break
                 
         if cross_idx == -1: return boxes # Trend not confirmed yet
 
-        current_idx = anchor_idx
+        # Start looking for the Peak ONLY AFTER the crossover is complete
+        current_idx = cross_idx 
 
-        # Map the 2 Macro Consolidations
         for box_num in range(1, 3):
             if current_idx >= len(closes) - min_box_length: break
 
-            base_price = lows[anchor_idx] if box_num == 1 else boxes[-1]['top']
-            peak_val = base_price
+            peak_val = highs[current_idx]
             peak_idx = current_idx
             pullback_idx = -1
 
@@ -236,21 +236,17 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     peak_val = highs[i]
                     peak_idx = i
 
-                # Must push a massive distance from base
-                if peak_val - base_price >= macro_push:
-                    # Wait for price to pull back down
-                    if peak_val - lows[i] >= atr:
-                        # Pullback must tap the 50 EMA
-                        if lows[i] <= ema_50[i] + (atr * 0.8):
-                            # 🛡️ CRITICAL: The pullback MUST happen AFTER the EMA Cross!
-                            if box_num == 1 and i < cross_idx:
-                                continue 
+                # Wait for price to pull back down from the peak
+                if peak_val - lows[i] >= atr:
+                    # Pullback must tap or get very close to the 50 EMA
+                    if lows[i] <= ema_50[i] + ema_proximity:
+                        # Ensure it doesn't crash back below the 200 EMA (invalidating structure)
+                        if closes[i] > ema_200[i] - (atr * 0.5):
                             pullback_idx = i
                             break
 
             if pullback_idx == -1: break 
 
-            # Lock the Box Dimensions
             box_top = peak_val
             box_bottom = lows[pullback_idx]
             breakout_idx = len(closes) - 1
@@ -288,22 +284,21 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 break
 
     elif cycle.startswith("BEARISH"):
-        # 🛡️ THE GOLDEN RULE: Find where the 50 EMA crosses below the 200 EMA
+        # 🛡️ THE GATEWAY: Find exactly where the trend is confirmed
         cross_idx = -1
         for i in range(anchor_idx, len(closes)):
-            if ema_50[i] < ema_200[i]:
+            if ema_50[i] < ema_200[i] and closes[i] < ema_200[i]:
                 cross_idx = i
                 break
                 
         if cross_idx == -1: return boxes 
 
-        current_idx = anchor_idx
+        current_idx = cross_idx
 
         for box_num in range(1, 3):
             if current_idx >= len(closes) - min_box_length: break
 
-            base_price = highs[anchor_idx] if box_num == 1 else boxes[-1]['bottom']
-            trough_val = base_price
+            trough_val = lows[current_idx]
             trough_idx = current_idx
             pullback_idx = -1
 
@@ -312,12 +307,9 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     trough_val = lows[i]
                     trough_idx = i
 
-                if base_price - trough_val >= macro_push:
-                    if highs[i] - trough_val >= atr:
-                        if highs[i] >= ema_50[i] - (atr * 0.8):
-                            # 🛡️ CRITICAL: Pullback MUST happen AFTER the EMA Cross!
-                            if box_num == 1 and i < cross_idx:
-                                continue
+                if highs[i] - trough_val >= atr:
+                    if highs[i] >= ema_50[i] - ema_proximity:
+                        if closes[i] < ema_200[i] + (atr * 0.5):
                             pullback_idx = i
                             break
 
