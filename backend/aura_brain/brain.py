@@ -12,8 +12,9 @@ from contextlib import asynccontextmanager
 import httpx
 from starlette.responses import Response
 
-from ta.trend import EMAIndicator
-from ta.momentum import RSIIndicator
+# 🟢 ADDED: SMA and Stochastic for AlphaPeak logic
+from ta.trend import EMAIndicator, SMAIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
 
 import joblib
 
@@ -118,9 +119,56 @@ class AnalysisRequest(BaseModel):
     htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
+
 # ─────────────────────────────────────────────────────────────────────────────
+# 🟢 NEW: ALPHAPEAK (BEAST MARKET SENTIMENT) ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "AURA MMM v2.1" (PUSH & TIME CONSTRAINTS)
+def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
+    """
+    Recreation of the AlphaPeak ($$ BEAST MARKET SENTIMENT) indicator.
+    Uses ZigZag (depth 60), Stochastic (7, 70/30), and SMA (10/15) cross.
+    """
+    try:
+        if len(df) < 100:
+            return {"signal": "NONE", "reason": "Not enough data for AlphaPeak"}
+
+        closes = df['Close']
+        highs = df['High'].values
+        lows = df['Low'].values
+        
+        # 1. Moving Average Trend Filter (Inputs: SMA 10, SMA 15)
+        sma_10 = SMAIndicator(close=closes, window=10).sma_indicator().iloc[-1]
+        sma_15 = SMAIndicator(close=closes, window=15).sma_indicator().iloc[-1]
+        
+        # 2. Stochastic Momentum Filter (Inputs: Len 7)
+        stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=closes, window=7, smooth_window=3)
+        current_stoch = stoch.stoch().iloc[-1]
+        
+        # 3. Peak Detection (ZigZag Approximation - Depth 60)
+        # Using argrelextrema with order=60 to find the macro peaks
+        recent_peak_highs = argrelextrema(highs, np.greater, order=60)[0]
+        recent_peak_lows = argrelextrema(lows, np.less, order=60)[0]
+        
+        # Check if a peak occurred in the last 5 candles
+        last_index = len(df) - 1
+        recent_bull_peak = any((last_index - idx) <= 5 for idx in recent_peak_lows)
+        recent_bear_peak = any((last_index - idx) <= 5 for idx in recent_peak_highs)
+
+        # 4. Evaluate AlphaPeak Rules
+        if recent_bull_peak and sma_10 > sma_15 and current_stoch < 30.0:
+            return {"signal": "BUY", "reason": "AlphaPeak Buy Vector Identified (Low Peak + Trend Up + Oversold)"}
+        elif recent_bear_peak and sma_10 < sma_15 and current_stoch > 70.0:
+            return {"signal": "SELL", "reason": "AlphaPeak Sell Vector Identified (High Peak + Trend Down + Overbought)"}
+            
+        return {"signal": "NONE", "reason": "No AlphaPeak confluence"}
+        
+    except Exception as e:
+        logger.error(f"AlphaPeak analysis failed: {e}")
+        return {"signal": "NONE", "reason": "AlphaPeak Engine Error"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CORE ENGINE  — "Aura MMM v2.1"
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -199,7 +247,6 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-# 🟢 THE BULLETPROOF "EMA FAN" STATE MACHINE (Precision Tuned)
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
@@ -208,20 +255,17 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     
     boxes = []
     min_box_length = 5
-    ema_proximity = atr * 1.0 # Pullback must get near the 50 EMA
+    ema_proximity = atr * 1.0 
     
     if cycle.startswith("BULLISH"):
-        # 🛡️ THE GATEWAY: Find exactly where the trend is confirmed
         cross_idx = -1
         for i in range(anchor_idx, len(closes)):
-            # Must be physically above both EMAs to start counting
             if ema_50[i] > ema_200[i] and closes[i] > ema_200[i]:
                 cross_idx = i
                 break
                 
-        if cross_idx == -1: return boxes # Trend not confirmed yet
+        if cross_idx == -1: return boxes 
 
-        # Start looking for the Peak ONLY AFTER the crossover is complete
         current_idx = cross_idx 
 
         for box_num in range(1, 3):
@@ -236,11 +280,8 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     peak_val = highs[i]
                     peak_idx = i
 
-                # Wait for price to pull back down from the peak
                 if peak_val - lows[i] >= atr:
-                    # Pullback must tap or get very close to the 50 EMA
                     if lows[i] <= ema_50[i] + ema_proximity:
-                        # Ensure it doesn't crash back below the 200 EMA (invalidating structure)
                         if closes[i] > ema_200[i] - (atr * 0.5):
                             pullback_idx = i
                             break
@@ -255,7 +296,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             for i in range(pullback_idx, len(closes)):
                 if lows[i] < box_bottom: box_bottom = lows[i]
 
-                # Breakout Confirmation
                 if closes[i] > box_top:
                     breakout_idx = i
                     breakout_dir = "up"
@@ -284,7 +324,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 break
 
     elif cycle.startswith("BEARISH"):
-        # 🛡️ THE GATEWAY: Find exactly where the trend is confirmed
         cross_idx = -1
         for i in range(anchor_idx, len(closes)):
             if ema_50[i] < ema_200[i] and closes[i] < ema_200[i]:
@@ -365,7 +404,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     raw_highs = argrelextrema(highs, np.greater, order=swing_order)[0]
     raw_lows  = argrelextrema(lows,  np.less,    order=swing_order)[0]
 
-    # ── TRUE MMM PEAK DETECTION (Tied to EMA Crossovers) ───────────
     ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
     ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
     ema_50_array   = ema_50_series.values
@@ -390,7 +428,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     else:
         use_bearish = True
         best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
-    # ───────────────────────────────────────────────────────────────
 
     current_price   = float(closes[-1])
     current_ema_200 = float(ema_200_series.iloc[-1])
@@ -410,11 +447,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    
-    # 🟢 Get the MACRO boxes
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
 
-    # 🟢 MMM TRADING LOGIC (No Level 1 Trades allowed)
     total_boxes = len(consolidation_boxes)
     in_pullback = False
     
@@ -465,10 +499,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "sweeps":          sweeps,
         "consolidation_boxes": consolidation_boxes
     }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL DECISION ENGINE (MMM BASED)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
                     level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float, phase_str: str) -> int:
@@ -570,6 +600,11 @@ async def analyze(req: AnalysisRequest):
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
         
+        # 🟢 NEW: Run the AlphaPeak Confluence Check
+        alpha_data = analyze_alpha_peak(df)
+        alpha_signal = alpha_data["signal"]
+        alpha_reason = alpha_data["reason"]
+
         sweep_nearby = False
         sweep_str = ""
         if sweeps:
@@ -602,7 +637,6 @@ async def analyze(req: AnalysisRequest):
         elif not in_pullback:
             reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
         else:
-            # We are in a valid pullback (Cons 1 or Cons 2)
             if cycle.startswith("BULLISH"):
                 if current_price >= ema_50 and dist <= (atr * 1.0):
                     signal = "BUY"
@@ -618,10 +652,19 @@ async def analyze(req: AnalysisRequest):
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
 
+        # 🟢 NEW: AlphaPeak Confluence Modifier
+        if signal != "NEUTRAL":
+            if alpha_signal == signal:
+                confidence = min(confidence + 15, 99) # Boost confidence up to 99% if they align
+                reasoning.append(f"🐺 BEAST SENTIMENT CONFLUENCE: {alpha_reason} (+15% Confidence)")
+            elif alpha_signal != "NONE":
+                confidence = max(confidence - 20, 10) # Drop confidence if they clash
+                reasoning.append(f"⚠️ CONFLICT: AlphaPeak suggests {alpha_signal}. Reducing confidence.")
+
         if signal != "NEUTRAL" and ML_MODEL:
             try:
                 features = pd.DataFrame([{
-                    'type':           1 if signal == "BUY" else 0,
+                    'type':          1 if signal == "BUY" else 0,
                     'fvg_size_pips':  0.0,
                     'rsi_at_entry':   rsi,
                     'atr_at_entry':   atr,
@@ -692,7 +735,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v2.1",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v2.2 (w/ AlphaPeak)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, decimals),
             "─── STRUCTURE ───": "──────────────────────────────────────",
