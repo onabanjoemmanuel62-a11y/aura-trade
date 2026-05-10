@@ -286,6 +286,7 @@ const s = {
     borderRight: '1px solid rgba(255,255,255,0.06)',
     display: 'flex', flexDirection: 'column',
     transition: 'width 0.2s ease', overflow: 'hidden',
+    display: window.innerWidth < 768 ? 'none' : 'flex',
   },
   logoWrap: {
     display: 'flex', alignItems: 'center', gap: 10,
@@ -336,7 +337,7 @@ const s = {
     display: 'flex', alignItems: 'center', justifyContent: 'space-between',
     padding: '0 16px', height: 50, flexShrink: 0,
     background: '#0d1117', borderBottom: '1px solid rgba(255,255,255,0.06)',
-    gap: 12, overflow: 'hidden',
+    gap: 12, overflow: 'auto',
   },
   pairTabs: { display: 'flex', gap: 2, overflow: 'hidden' },
   pairTab: {
