@@ -1,120 +1,34 @@
-.App {
-  text-align: center;
+/* Reset & base */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  background: #080c10;
+  font-family: 'Syne', sans-serif;
+  color: #e8edf3;
+  -webkit-font-smoothing: antialiased;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
-}
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #1e2a38; border-radius: 2px; }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
-}
+/* Range input accent */
+input[type="range"] { accent-color: #f0b429; cursor: pointer; }
 
-.App-header {
-  background-color: #282c34;
-  min-height: 100vh;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
-}
-
-.App-link {
-  color: #61dafb;
-}
-
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* =========================================
-   📱 MOBILE RESPONSIVENESS (Aura-Trade)
-   ========================================= */
-
-/* 1. The Trigger: Apply these rules ONLY for screens smaller than 768px */
+/* Mobile — sidebar hides, layout stacks */
 @media screen and (max-width: 768px) {
-
-  /* 🚨 MOBILE SCROLL UNLOCK (Critical Fix) 🚨 */
-  /* This forces the browser to allow scrolling instead of cutting off the screen */
-  html, body, #root, .App {
-    height: auto !important;       
-    min-height: 100vh !important;  /* Grow as tall as the content needs */
-    overflow-y: auto !important;   /* FORCE vertical scrolling */
-    overflow-x: hidden;            /* Block horizontal side-scrolling */
+  html, body, #root {
+    height: auto;
+    overflow-y: auto;
+    overflow-x: hidden;
   }
 
-  /* FORCE STACKING: Turn the main dashboard row into a vertical column */
-  /* Added padding-bottom so you can scroll past the last item */
-  .dashboard-container, 
-  .main-row,
-  .top-section {
-    flex-direction: column !important;
-    display: flex !important;
-    width: 100% !important;
-    height: auto !important;     /* Allow container to grow */
-    overflow-y: visible !important;
-    padding-bottom: 80px !important; /* Extra space at bottom */
-  }
-
-  /* FULL WIDTH CARDS: Make every box take up the full phone screen */
-  .signal-card, 
-  .news-panel,
-  .ai-brain-panel {
-    width: 100% !important;
-    max-width: 100% !important;
-    margin-bottom: 20px; /* Add space between stacked items */
-    height: auto !important; /* Let height grow naturally */
-  }
-
-  /* ⚡ CHART FIX: FORCE TALL HEIGHT ON MOBILE */
-  .chart-container, .chart-wrapper {
-    width: 100% !important;
-    height: 450px !important;       /* Force fixed height */
-    min-height: 50vh !important;    /* Take up half the screen */
-    margin-bottom: 20px !important; /* Space between chart and AI Brain */
-    display: block !important;
-  }
-
-  /* TEXT READABILITY: Bump up font sizes for thumb-scrolling */
-  body, p, span, div {
-    font-size: 16px; /* easier to read on mobile */
-  }
-
-  h1, h2 {
-    font-size: 22px !important; /* Prevent huge headers from breaking layout */
-  }
-
-  /* CHART LABELS: Ensure price text inside chart is readable */
-  .recharts-text {
-    font-size: 12px !important;
-  }
-
-  /* TIMEFRAME BUTTONS: Make them easier to tap */
-  .timeframe-selector button {
-    padding: 10px 15px !important; /* Fatter buttons for thumbs */
-    font-size: 14px !important;
-  }
-
-  /* TABLE SCROLLING: If you have a trade history table, let it scroll sideways */
   .trade-history-table {
-    display: block;
-    overflow-x: auto; /* Adds a scrollbar if the table is too wide */
+    overflow-x: auto;
     white-space: nowrap;
-  }
-
-  /* HIDE NON-ESSENTIALS: Hide complex decorative elements on mobile to save space */
-  .sidebar-desktop,
-  .decorative-background-shapes {
-    display: none !important;
   }
 }

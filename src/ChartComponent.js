@@ -263,6 +263,39 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const ema50 = chart.addSeries(LineSeries, { color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     const ema200 = chart.addSeries(LineSeries, { color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     
+    const drawSessionBoxes = (chart, series) => {
+  const now = Math.floor(Date.now() / 1000);
+  const dayStart = now - (now % 86400);
+
+  const sessions = [
+    { name: 'TOKYO',    start: 0,    end: 9,    color: 'rgba(124,58,237,0.06)',  border: 'rgba(124,58,237,0.25)' },
+    { name: 'LONDON',   start: 8,    end: 17,   color: 'rgba(14,165,233,0.06)',  border: 'rgba(14,165,233,0.25)' },
+    { name: 'NEW YORK', start: 13,   end: 22,   color: 'rgba(245,158,11,0.06)',  border: 'rgba(245,158,11,0.25)' },
+  ];
+
+  sessions.forEach(ses => {
+    const startTime = dayStart + ses.start * 3600;
+    const endTime   = dayStart + ses.end   * 3600;
+    try {
+      series.createPriceLine({
+        price: 0, color: 'transparent', lineWidth: 0, lineStyle: 0,
+        axisLabelVisible: false, title: '',
+      });
+    } catch { /* silent */ }
+
+    // Draw as vertical band using background pane primitive workaround
+    // We use two markers at session open/close as a lightweight indicator
+    const existing = series.markers ? series.markers() : [];
+    const markers = [
+      ...existing,
+      { time: startTime, position: 'belowBar', color: ses.border, shape: 'arrowUp',  text: ses.name, size: 0 },
+    ];
+    try {
+      if (typeof series.setMarkers === 'function') series.setMarkers(markers);
+    } catch { /* silent */ }
+  });
+};
+
     const boxP = new BoxPrimitive();
     series.attachPrimitive(boxP);
     boxPrimitiveRef.current = boxP;
@@ -276,6 +309,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     ema50SeriesRef.current = ema50;
     ema200SeriesRef.current = ema200;
     isChartReady.current = true;
+    drawSessionBoxes(chart, series);
     
     const onResize = () => { if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth }); };
     window.addEventListener('resize', onResize);
@@ -293,7 +327,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       ema50SeriesRef.current = null;
       ema200SeriesRef.current = null;
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); 
 
   const fetchOlderHistory = async () => {
     if (isLoadingRef.current || !allDataRef.current.length) return;
@@ -448,7 +482,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
           <span style={{ fontSize: 11, fontWeight: 600, color: '#FFF' }}>{connectionStatus}</span>
         </div>
         <div style={{ display: 'flex', gap: 2, background: '#2A2E39', padding: 2, borderRadius: 4 }}>
-          {['1h', '4h'].map(tf => (
+          {['15m', '1h', '4h'].map(tf => (
             <button key={tf} onClick={() => handleTimeframeChange(tf)}
               style={{ padding: '6px 14px', background: timeframe === tf ? '#4B4B69' : 'transparent', color: timeframe === tf ? '#FFF' : '#787B86', border: 'none', cursor: 'pointer', borderRadius: 3 }}>
               {tf.toUpperCase()}

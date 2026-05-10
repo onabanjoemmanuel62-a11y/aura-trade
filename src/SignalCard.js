@@ -1,23 +1,52 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, Lock, Target, Shield, Crosshair } from 'lucide-react';
+import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, Lock, Target, Shield, Crosshair, Calculator, Layers } from 'lucide-react';
 import axios from 'axios';
 
-// ☁️ LIVE SERVER ADDRESS
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// 🧠 AI PERSONALITY SETTINGS
-const ENTRY_THRESHOLD = 70;  
-const EXIT_THRESHOLD = 55;   
-const FLIP_THRESHOLD = 80;   
-const LOCK_EXPIRY_HOURS = 4; 
+const ENTRY_THRESHOLD = 70;
+const EXIT_THRESHOLD  = 55;
+const FLIP_THRESHOLD  = 80;
+const LOCK_EXPIRY_HOURS = 4;
+
+// ── Session detection (UTC) ──
+const SESSIONS = [
+  { name: 'TOKYO',    start: 0,  end: 9,  color: '#7c3aed' },
+  { name: 'LONDON',   start: 8,  end: 17, color: '#0ea5e9' },
+  { name: 'NEW YORK', start: 13, end: 22, color: '#f59e0b' },
+  { name: 'SYDNEY',   start: 21, end: 6,  color: '#10b981' },
+];
+const getActiveSession = () => {
+  const h = new Date().getUTCHours();
+  // Priority: NY > London > Tokyo > Sydney
+  return SESSIONS.find(s => {
+    if (s.start < s.end) return h >= s.start && h < s.end;
+    return h >= s.start || h < s.end;
+  }) || null;
+};
+
+// ── Lot size calculator ──
+const calcLotSize = (balance, riskPct, entryPrice, slPrice, pipValue = 10) => {
+  if (!balance || !entryPrice || !slPrice) return 0;
+  const riskAmount = (balance * riskPct) / 100;
+  const slPips = Math.abs(entryPrice - slPrice) * 10000; // works for most forex pairs
+  if (slPips === 0) return 0;
+  const lots = riskAmount / (slPips * pipValue);
+  return Math.max(0.01, parseFloat(lots.toFixed(2)));
+};
 
 const SignalCard = ({ externalData, loading, onRefresh }) => {
-  const [analysis, setAnalysis] = useState(null);
-  const [newsLoading, setNewsLoading] = useState(false);
-  
-  // 📰 Real News State (Now an ARRAY for multiple events)
-  const [upcomingNews, setUpcomingNews] = useState([]); 
-  const [now, setNow] = useState(Date.now()); // Global tick for all countdowns
+  const [analysis,        setAnalysis]        = useState(null);
+  const [newsLoading,     setNewsLoading]     = useState(false);
+  const [upcomingNews,    setUpcomingNews]     = useState([]);
+  const [now,             setNow]             = useState(Date.now());
+  const [activeTab,       setActiveTab]       = useState('signal'); // 'signal' | 'risk' | 'mtf'
+  const [activeSession,   setActiveSession]   = useState(getActiveSession());
+
+  // Risk calculator state
+  const [balance,   setBalance]   = useState(10000);
+  const [riskPct,   setRiskPct]   = useState(1);
+  const [pipValue,  setPipValue]  = useState(10);
 
   const getSavedLock = () => {
     try {
@@ -27,250 +56,373 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         const ageHours = (Date.now() - parsed.timestamp) / (1000 * 60 * 60);
         if (ageHours < LOCK_EXPIRY_HOURS) return parsed;
       }
-    } catch (e) { console.error("Storage Read Error", e); }
+    } catch { /* silent */ }
     return { type: 'NEUTRAL', confidence: 0, timestamp: Date.now() };
   };
 
-  const activeSignalRef = useRef(getSavedLock()); 
-  const [displayState, setDisplayState] = useState(activeSignalRef.current);
+  const activeSignalRef = useRef(getSavedLock());
+  const [displayState,  setDisplayState]  = useState(activeSignalRef.current);
 
   useEffect(() => {
     if (externalData) processNewData(externalData);
   }, [externalData]);
 
   const processNewData = (newData) => {
-    const rawConf = Math.max(0, newData.confidence || 0);
+    const rawConf   = Math.max(0, newData.confidence || 0);
     const rawSignal = (newData.signal || 'NEUTRAL').toUpperCase();
-    
-    let currentLock = activeSignalRef.current.type; 
-    let nextState = 'NEUTRAL';
+    let currentLock = activeSignalRef.current.type;
+    let nextState   = 'NEUTRAL';
 
     if (currentLock === 'NEUTRAL') {
       if (rawConf >= ENTRY_THRESHOLD) nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
-      else nextState = 'NEUTRAL';
-    } 
-    else {
-      const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) || 
+    } else {
+      const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) ||
                          (currentLock === 'SELL' && rawSignal.includes('BUY'));
-      
-      if (isOpposite && rawConf >= FLIP_THRESHOLD) nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL'; 
-      else if (rawConf < EXIT_THRESHOLD) nextState = 'NEUTRAL'; 
-      else nextState = currentLock; 
+      if (isOpposite && rawConf >= FLIP_THRESHOLD) nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
+      else if (rawConf < EXIT_THRESHOLD)            nextState = 'NEUTRAL';
+      else                                          nextState = currentLock;
     }
 
-    const newLockState = { type: nextState, confidence: rawConf, timestamp: Date.now() };
-    
-    activeSignalRef.current = newLockState;
-    localStorage.setItem('aura_ai_lock', JSON.stringify(newLockState));
-    
+    const newLock = { type: nextState, confidence: rawConf, timestamp: Date.now() };
+    activeSignalRef.current = newLock;
+    localStorage.setItem('aura_ai_lock', JSON.stringify(newLock));
     setAnalysis(newData);
-    setDisplayState(newLockState);
+    setDisplayState(newLock);
   };
 
-  const fetchLocalAnalysis = async (newsEvent = null) => {
-    setNewsLoading(true);
-    try {
-      const payload = { timeframe: '1h', currency: 'USD', eventName: newsEvent ? newsEvent.event : null };
-      const res = await axios.post(`${API_URL}/api/analyze`, payload);
-      if (res.data) processNewData(res.data);
-    } catch (err) {
-      console.error("❌ AI Analysis Failed:", err);
-    } finally {
-      setNewsLoading(false);
-    }
-  };
-
-  // --- 3. MULTI-NEWS FILTER ---
   const fetchDailyNews = async () => {
-      try {
-          const res = await axios.get(`${API_URL}/api/news`);
-          const today = new Date().toDateString(); 
-          
-          // Filter ALL high impact news for today that are still in the future
-          const criticalEvents = res.data.filter(n => {
-              const newsDate = new Date(n.time * 1000).toDateString();
-              const eventTime = new Date(n.time * 1000);
-              const isFuture = eventTime > new Date();
-              return (newsDate === today && n.impact === 'High' && n.currency === 'USD' && isFuture);
-          }).sort((a, b) => a.time - b.time); // Sort chronologically
-
-          setUpcomingNews(criticalEvents);
-
-          // If there is news, run analysis using the most imminent one
-          if (criticalEvents.length > 0) fetchLocalAnalysis(criticalEvents[0]);
-          
-      } catch (err) { console.error("News Fetch Failed:", err); }
+    try {
+      const res     = await axios.get(`${API_URL}/api/news`);
+      const today   = new Date().toDateString();
+      const events  = res.data.filter(n => {
+        const newsDate  = new Date(n.time * 1000).toDateString();
+        const eventTime = new Date(n.time * 1000);
+        return newsDate === today && n.impact === 'High' && n.currency === 'USD' && eventTime > new Date();
+      }).sort((a, b) => a.time - b.time);
+      setUpcomingNews(events);
+      if (events.length > 0) {
+        const res2 = await axios.post(`${API_URL}/api/analyze`, {
+          timeframe: '1h', currency: 'USD', eventName: events[0].event
+        });
+        if (res2.data) processNewData(res2.data);
+      }
+    } catch { /* silent */ }
   };
 
-  // --- 4. GLOBAL COUNTDOWN TIMER ---
   useEffect(() => {
-    fetchDailyNews(); 
-    const newsInterval = setInterval(fetchDailyNews, 60000); // Check for new news every minute
-    const tickInterval = setInterval(() => setNow(Date.now()), 1000); // Global tick
-    
-    return () => {
-        clearInterval(newsInterval);
-        clearInterval(tickInterval);
-    };
-  }, []); 
+    fetchDailyNews();
+    const newsId  = setInterval(fetchDailyNews, 60000);
+    const tickId  = setInterval(() => {
+      setNow(Date.now());
+      setActiveSession(getActiveSession());
+    }, 1000);
+    return () => { clearInterval(newsId); clearInterval(tickId); };
+  }, []);
 
-  // Format countdown text based on the global `now` tick
-  const getCountdownString = (targetTime) => {
-      const diff = targetTime - now;
-      if (diff <= 0) return "Releasing Now...";
-      const h = Math.floor((diff / (1000 * 60 * 60)) % 24);
-      const m = Math.floor((diff / (1000 * 60)) % 60);
-      const s = Math.floor((diff / 1000) % 60);
-      return `${h}h ${m}m ${s}s`;
+  const getCountdown = (target) => {
+    const diff = target - now;
+    if (diff <= 0) return 'Releasing Now...';
+    const h = Math.floor(diff / 3600000);
+    const m = Math.floor((diff % 3600000) / 60000);
+    const sec = Math.floor((diff % 60000) / 1000);
+    return `${h}h ${String(m).padStart(2,'0')}m ${String(sec).padStart(2,'0')}s`;
   };
 
-  const getSignalColor = (type) => {
-      if (type === 'BUY') return '#00E676'; 
-      if (type === 'SELL') return '#FF1744'; 
-      return '#FFC107'; 
-  };
+  const signalColor = displayState.type === 'BUY' ? '#00e676'
+                    : displayState.type === 'SELL' ? '#ff4757'
+                    : '#f0b429';
 
-  const signalColor = getSignalColor(displayState.type);
   const isLocked = displayState.type !== 'NEUTRAL';
-  
-  const radius = 36;
-  const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (displayState.confidence / 100) * circumference;
-  const isBusy = loading || newsLoading;
-  const cardBorder = upcomingNews.length > 0 ? '1px solid #ef5350' : `1px solid ${isLocked ? signalColor : 'rgba(255,255,255,0.08)'}`;
+  const isBusy   = loading || newsLoading;
+
+  const circumference  = 2 * Math.PI * 36;
+  const dashOffset     = circumference - (displayState.confidence / 100) * circumference;
+
+  // Calculated lot size
+  const lotSize = calcLotSize(
+    balance,
+    riskPct,
+    parseFloat(analysis?.tradeSetup?.entry) || 0,
+    parseFloat(analysis?.tradeSetup?.stop_loss) || 0,
+    pipValue
+  );
+  const riskAmount = ((balance * riskPct) / 100).toFixed(2);
+
+  // MTF confluence mock (replace with real API data when available)
+  const mtfData = analysis?.mtf_confluence || [
+    { tf: 'M15', bias: analysis?.signal || 'NEUTRAL', strength: displayState.confidence },
+    { tf: 'H1',  bias: analysis?.signal || 'NEUTRAL', strength: Math.min(100, displayState.confidence + 5) },
+    { tf: 'H4',  bias: 'NEUTRAL', strength: 45 },
+    { tf: 'D1',  bias: 'NEUTRAL', strength: 38 },
+  ];
+
+  const tabBtnStyle = (id) => ({
+    flex: 1, padding: '7px 4px', background: activeTab === id ? 'rgba(240,180,41,0.1)' : 'transparent',
+    border: `1px solid ${activeTab === id ? 'rgba(240,180,41,0.3)' : 'rgba(255,255,255,0.06)'}`,
+    color: activeTab === id ? '#f0b429' : '#6b7a8d', cursor: 'pointer',
+    borderRadius: 4, fontSize: 10, fontFamily: "'Space Mono', monospace",
+    fontWeight: 700, letterSpacing: 0.5, transition: 'all 0.15s',
+  });
 
   return (
     <div style={{
-      backgroundColor: 'rgba(21, 25, 32, 0.8)', backdropFilter: 'blur(12px)',
-      border: cardBorder, borderRadius: '16px', padding: '20px', height: '100%',
-      color: '#e1e3e6', display: 'flex', flexDirection: 'column', gap: '16px',
-      boxShadow: isLocked ? `0 0 15px ${signalColor}20` : '0 4px 20px rgba(0,0,0,0.2)',
-      transition: 'border 0.3s ease'
+      height: '100%', background: 'rgba(13,17,23,0.95)',
+      border: upcomingNews.length > 0
+        ? '1px solid rgba(239,83,80,0.5)'
+        : `1px solid ${isLocked ? signalColor + '40' : 'rgba(255,255,255,0.08)'}`,
+      borderRadius: 12, padding: 16, color: '#e8edf3',
+      display: 'flex', flexDirection: 'column', gap: 12,
+      transition: 'border 0.3s ease', overflow: 'hidden',
+      fontFamily: "'Syne', sans-serif",
     }}>
-      
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <h2 style={{ fontSize: '15px', margin: 0, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '8px', fontWeight: '600' }}>
-             <Activity size={16} color={signalColor} /> AI BRAIN
-        </h2>
-        <div style={{display: 'flex', gap: '8px', alignItems: 'center'}}>
-           {isLocked && (
-             <div style={{fontSize:'10px', background: `${signalColor}20`, color: signalColor, padding:'2px 8px', borderRadius:'4px', display:'flex', alignItems:'center', gap:'4px', fontWeight:'bold', border: `1px solid ${signalColor}40`}}>
-               <Lock size={10} /> LOCKED
-             </div>
-           )}
-           <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: '6px', cursor: 'pointer', padding: '6px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <RefreshCw size={14} className={isBusy ? "spin" : ""} />
-              <style>{`.spin { animation: spin 1s linear infinite; } @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
-           </button>
+      {/* Header */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Activity size={14} color={signalColor} />
+          <span style={{ fontSize: 12, color: '#9ca3af', fontWeight: 600, letterSpacing: 1, fontFamily: "'Space Mono', monospace" }}>AI BRAIN</span>
+          {activeSession && (
+            <span style={{ fontSize: 9, background: `${activeSession.color}18`, color: activeSession.color, border: `1px solid ${activeSession.color}40`, padding: '2px 6px', borderRadius: 3, fontFamily: "'Space Mono', monospace", fontWeight: 700, letterSpacing: 1 }}>
+              {activeSession.name.split(' ')[0]}
+            </span>
+          )}
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {isLocked && (
+            <div style={{ fontSize: 9, background: `${signalColor}18`, color: signalColor, border: `1px solid ${signalColor}40`, padding: '2px 8px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              <Lock size={9} /> LOCKED
+            </div>
+          )}
+          <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: 5, cursor: 'pointer', padding: 5, display: 'flex', alignItems: 'center' }}>
+            <RefreshCw size={13} style={isBusy ? { animation: 'spin 1s linear infinite' } : {}} />
+          </button>
         </div>
       </div>
 
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
+        <button style={tabBtnStyle('signal')} onClick={() => setActiveTab('signal')}><Activity size={10} style={{ display: 'inline', marginRight: 4 }} />SIGNAL</button>
+        <button style={tabBtnStyle('risk')}   onClick={() => setActiveTab('risk')}><Calculator size={10} style={{ display: 'inline', marginRight: 4 }} />RISK</button>
+        <button style={tabBtnStyle('mtf')}    onClick={() => setActiveTab('mtf')}><Layers size={10} style={{ display: 'inline', marginRight: 4 }} />MTF</button>
+      </div>
+
+      {/* Loading state */}
       {isBusy && !analysis ? (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: '8px', color: '#6b7280' }}>
-              <RefreshCw size={20} className="spin" />
-              <span style={{fontSize: '12px'}}>Simulating Outcomes...</span>
-          </div>
+        <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 8, color: '#6b7a8d' }}>
+          <RefreshCw size={18} style={{ animation: 'spin 1s linear infinite' }} />
+          <span style={{ fontSize: 11, fontFamily: "'Space Mono', monospace" }}>Simulating outcomes...</span>
+        </div>
       ) : (
-        <>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'linear-gradient(145deg, rgba(255,255,255,0.03) 0%, rgba(0,0,0,0.2) 100%)', padding: '15px', borderRadius: '12px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                <div style={{ display: 'flex', flexDirection: 'column' }}>
-                    <span style={{ fontSize: '11px', color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Probability</span>
-                    <span style={{ fontSize: '28px', fontWeight: '900', color: signalColor, lineHeight: '1' }}>
-                        {displayState.confidence}%
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', minHeight: 0 }}>
+
+          {/* ─── TAB: SIGNAL ─── */}
+          {activeTab === 'signal' && (
+            <>
+              {/* Probability ring */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: 'rgba(255,255,255,0.02)', padding: 12, borderRadius: 8, border: '1px solid rgba(255,255,255,0.04)', flexShrink: 0 }}>
+                <div style={{ position: 'relative', width: 76, height: 76, flexShrink: 0 }}>
+                  <svg width="76" height="76" style={{ transform: 'rotate(-90deg)' }}>
+                    <circle cx="38" cy="38" r="32" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
+                    <circle cx="38" cy="38" r="32" stroke={signalColor} strokeWidth="6" fill="transparent"
+                      strokeDasharray={circumference} strokeDashoffset={dashOffset} strokeLinecap="round"
+                      style={{ transition: 'stroke-dashoffset 1s ease-in-out' }} />
+                  </svg>
+                  <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {displayState.type === 'BUY'  ? <TrendingUp size={16} color={signalColor} /> :
+                     displayState.type === 'SELL' ? <TrendingUp size={16} color={signalColor} style={{ transform: 'scaleY(-1)' }} /> :
+                     <Shield size={16} color={signalColor} />}
+                  </div>
+                </div>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2 }}>PROBABILITY</div>
+                  <div style={{ fontSize: 26, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
+                  <div style={{ fontSize: 11, color: signalColor, fontWeight: 700, letterSpacing: 2, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>{displayState.type}</div>
+                </div>
+              </div>
+
+              {/* Strategy logic */}
+              <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flexShrink: 0 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+                  <History size={12} /> STRATEGY LOGIC
+                </div>
+                <div style={{ fontSize: 11, color: '#d1d5db', lineHeight: 1.6, maxHeight: 90, overflowY: 'auto' }}>
+                  {analysis?.reasoning && Array.isArray(analysis.reasoning)
+                    ? analysis.reasoning.map((r, i) => (
+                        <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 3 }}>
+                          <span style={{ color: signalColor }}>•</span>
+                          <span>{r.replace(/OB/g, 'Order Block')}</span>
+                        </div>
+                      ))
+                    : (analysis?.reason || 'Scanning market structure...')}
+                </div>
+              </div>
+
+              {/* Trade setup levels */}
+              {isLocked && analysis?.tradeSetup && (
+                <div style={{ background: 'rgba(0,0,0,0.25)', padding: 10, borderRadius: 7, border: '1px solid rgba(255,255,255,0.05)', flexShrink: 0 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                    <span style={{ fontSize: 9, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: 3, fontFamily: "'Space Mono', monospace" }}>
+                      <Crosshair size={11} /> ENTRY
                     </span>
-                    <span style={{ fontSize: '10px', color: signalColor, opacity: 0.8, marginTop: '4px', fontWeight: 'bold', letterSpacing: '1px' }}>
-                        {displayState.type}
-                    </span>
-                </div>
-                
-                <div style={{ position: 'relative', width: '80px', height: '80px' }}>
-                    <svg width="80" height="80" style={{ transform: 'rotate(-90deg)' }}>
-                        <circle cx="40" cy="40" r={radius} stroke="#374357" strokeWidth="6" fill="transparent" opacity="0.3" />
-                        <circle 
-                            cx="40" cy="40" r={radius} stroke={signalColor} strokeWidth="6" fill="transparent" 
-                            strokeDasharray={circumference} strokeDashoffset={strokeDashoffset} strokeLinecap="round"
-                            style={{ transition: 'stroke-dashoffset 1s ease-in-out' }}
-                        />
-                    </svg>
-                    <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', color: '#FFF' }}>
-                         {displayState.type === 'BUY' ? <TrendingUp size={18} /> : 
-                          displayState.type === 'SELL' ? <TrendingUp size={18} style={{transform:'scaleY(-1)'}} /> : 
-                          <Shield size={18} />}
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.entry}</span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                    <div style={{ background: 'rgba(255,71,87,0.12)', padding: '6px 8px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(255,71,87,0.2)' }}>
+                      <div style={{ fontSize: 9, color: '#ff4757', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>STOP LOSS</div>
+                      <div style={{ fontSize: 11, color: '#ffcdd2', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.stop_loss}</div>
                     </div>
+                    <div style={{ background: 'rgba(0,230,118,0.12)', padding: '6px 8px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(0,230,118,0.2)' }}>
+                      <div style={{ fontSize: 9, color: '#00e676', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TAKE PROFIT</div>
+                      <div style={{ fontSize: 11, color: '#b9f6ca', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.take_profit}</div>
+                    </div>
+                  </div>
+                  <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#9ca3af', fontFamily: "'Space Mono', monospace" }}>
+                    RR 1:{analysis.tradeSetup.risk_reward}
+                  </div>
                 </div>
+              )}
+
+              {/* News alerts */}
+              {upcomingNews.length > 0 && (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#ef5350', fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+                    <AlertTriangle size={12} /> HIGH-IMPACT EVENTS
+                  </div>
+                  {upcomingNews.map((news, i) => (
+                    <div key={i} style={{ background: 'rgba(239,83,80,0.08)', padding: '8px 10px', borderRadius: 6, border: '1px solid rgba(239,83,80,0.2)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span style={{ fontSize: 10, color: '#ff8a80', fontWeight: 700, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '55%' }}>{news.title || news.event}</span>
+                      <span style={{ fontSize: 10, color: '#ef5350', fontFamily: "'Space Mono', monospace", display: 'flex', alignItems: 'center', gap: 3 }}>
+                        <Clock size={10} /> {getCountdown(news.time > 2000000000 ? news.time : news.time * 1000)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {!isLocked && (
+                <div style={{ marginTop: 'auto', padding: 12, textAlign: 'center', border: '1px dashed rgba(240,180,41,0.2)', borderRadius: 7, color: '#f0b429', fontSize: 11, fontStyle: 'italic', background: 'rgba(240,180,41,0.03)' }}>
+                  Awaiting high-probability setup (&gt;{ENTRY_THRESHOLD}%)
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ─── TAB: RISK CALCULATOR ─── */}
+          {activeTab === 'risk' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <div style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>POSITION SIZING</div>
+
+              <RiskInput label="Account Balance ($)" value={balance} onChange={setBalance} min={100} max={1000000} step={100} />
+              <RiskInput label="Risk %" value={riskPct} onChange={setRiskPct} min={0.1} max={10} step={0.1} decimals={1} />
+              <RiskInput label="Pip Value ($)" value={pipValue} onChange={setPipValue} min={1} max={100} step={1} />
+
+              <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '4px 0' }} />
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <ResultBox label="LOT SIZE"    value={lotSize}    color="#f0b429" unit="lots" />
+                <ResultBox label="RISK AMOUNT" value={`$${riskAmount}`} color="#ff4757" />
+              </div>
+
+              {analysis?.tradeSetup && (
+                <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)', fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
+                  <div style={{ color: '#6b7a8d', marginBottom: 6, fontSize: 9, letterSpacing: 1 }}>USING CURRENT SETUP</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ color: '#9ca3af' }}>Entry</span>
+                    <span style={{ color: '#fff' }}>{analysis.tradeSetup.entry}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ color: '#9ca3af' }}>Stop Loss</span>
+                    <span style={{ color: '#ff4757' }}>{analysis.tradeSetup.stop_loss}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: '#9ca3af' }}>RR</span>
+                    <span style={{ color: '#00e676' }}>1:{analysis.tradeSetup.risk_reward}</span>
+                  </div>
+                </div>
+              )}
+
+              <div style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace", lineHeight: 1.5, marginTop: 4 }}>
+                * Pip value varies by broker and pair. Adjust accordingly for gold (XAU) or JPY pairs.
+              </div>
             </div>
+          )}
 
-            <div style={{ background: 'rgba(255,255,255,0.02)', padding: '12px', borderRadius: '8px', borderLeft: `3px solid ${signalColor}` }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px', color: signalColor, fontSize: '11px', fontWeight: 'bold' }}>
-                    <History size={14} /> STRATEGY LOGIC
-                </div>
-                <div style={{ fontSize: '12px', color: '#d1d5db', lineHeight: '1.5', maxHeight: '100px', overflowY: 'auto', whiteSpace: 'pre-wrap', fontFamily: 'monospace' }}>
-                    <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
-                       {analysis?.reasoning && Array.isArray(analysis.reasoning) 
-                           ? analysis.reasoning.map((r, i) => (
-                               <div key={i} style={{display: 'flex', gap: '6px'}}>
-                                  <span style={{color: signalColor}}>•</span>
-                                  <span>{r.replace(/OB/g, 'Order Block')}</span>
-                               </div>
-                             )) 
-                           : (analysis?.reason || "Scanning market structure...")
-                       }
+          {/* ─── TAB: MTF CONFLUENCE ─── */}
+          {activeTab === 'mtf' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>MULTI-TIMEFRAME ALIGNMENT</div>
+              {mtfData.map((tf, i) => {
+                const tfColor = tf.bias === 'BUY' || tf.bias?.includes('BUY') ? '#00e676'
+                              : tf.bias === 'SELL' || tf.bias?.includes('SELL') ? '#ff4757'
+                              : '#f0b429';
+                return (
+                  <div key={i} style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace", color: '#e8edf3' }}>{tf.tf}</span>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: tfColor, fontFamily: "'Space Mono', monospace", background: `${tfColor}15`, padding: '2px 8px', borderRadius: 3 }}>
+                        {typeof tf.bias === 'string' ? tf.bias.replace('STRONG_','') : 'NEUTRAL'}
+                      </span>
                     </div>
+                    <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${tf.strength || 0}%`, background: tfColor, borderRadius: 2, transition: 'width 0.5s ease' }} />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 3 }}>
+                      <span style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace" }}>STRENGTH</span>
+                      <span style={{ fontSize: 9, color: tfColor, fontFamily: "'Space Mono', monospace" }}>{tf.strength || 0}%</span>
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ marginTop: 4, padding: '8px 10px', background: 'rgba(255,255,255,0.02)', borderRadius: 6, border: '1px solid rgba(255,255,255,0.04)' }}>
+                <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>CONFLUENCE SCORE</div>
+                <div style={{ fontSize: 20, fontWeight: 800, color: signalColor, fontFamily: "'Space Mono', monospace" }}>
+                  {Math.round(mtfData.filter(t => {
+                    const b = (t.bias || '').toString();
+                    return b.includes('BUY') || b.includes('SELL');
+                  }).length / mtfData.length * 100)}%
                 </div>
+                <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with signal</div>
+              </div>
             </div>
-
-            {isLocked && analysis?.tradeSetup && (
-                <div style={{ background: 'rgba(0,0,0,0.3)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)' }}>
-                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
-                         <span style={{fontSize: '10px', color: '#9ca3af', display: 'flex', alignItems: 'center', gap: '4px'}}>
-                            <Crosshair size={12}/> ENTRY
-                         </span>
-                         <span style={{fontSize: '12px', fontWeight: 'bold', color: '#fff'}}>{analysis.tradeSetup.entry}</span>
-                    </div>
-                    <div style={{ display: 'flex', gap: '8px' }}>
-                        <div style={{ flex: 1, background: 'rgba(239, 83, 80, 0.15)', padding: '6px', borderRadius: '4px', textAlign: 'center' }}>
-                            <div style={{ fontSize: '9px', color: '#ef5350', fontWeight: 'bold' }}>STOP LOSS</div>
-                            <div style={{ fontSize: '11px', color: '#ffcdd2' }}>{analysis.tradeSetup.stop_loss}</div>
-                        </div>
-                        <div style={{ flex: 1, background: 'rgba(0, 230, 118, 0.15)', padding: '6px', borderRadius: '4px', textAlign: 'center' }}>
-                            <div style={{ fontSize: '9px', color: '#00e676', fontWeight: 'bold' }}>TAKE PROFIT</div>
-                            <div style={{ fontSize: '11px', color: '#b9f6ca' }}>{analysis.tradeSetup.take_profit}</div>
-                        </div>
-                    </div>
-                    <div style={{textAlign: 'center', marginTop: '6px', fontSize: '9px', color: '#9ca3af'}}>
-                        RR: 1:{analysis.tradeSetup.risk_reward}
-                    </div>
-                </div>
-            )}
-
-            {/* 4. MULTI-IMPACT ALERTS (REPLACES SINGLE ALERT) */}
-            {upcomingNews.length > 0 && (
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#ef5350', fontSize: '11px', fontWeight: 'bold' }}>
-                        <AlertTriangle size={14} /> MULTIPLE HIGH-IMPACT EVENTS TODAY
-                    </div>
-                    {upcomingNews.map((news, idx) => (
-                        <div key={idx} style={{ background: 'rgba(239, 83, 80, 0.1)', padding: '10px', borderRadius: '8px', border: '1px solid rgba(239, 83, 80, 0.2)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                            <div style={{ fontSize: '11px', color: '#ff8a80', fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: '60%' }}>
-                                {news.title || news.event}
-                            </div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#ef5350', fontSize: '11px', fontFamily: 'monospace' }}>
-                                <Clock size={12} /> {getCountdownString(news.time > 2000000000 ? news.time : news.time * 1000)}
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            )}
-
-            {!isLocked && (
-                <div style={{ marginTop: 'auto', padding: '15px', textAlign: 'center', border: '1px dashed #374357', borderRadius: '8px', color: '#fbbf24', fontSize: '12px', fontStyle: 'italic', backgroundColor: 'rgba(251, 191, 36, 0.05)' }}>
-                    Awaiting high-probability setup (&gt;{ENTRY_THRESHOLD}%)
-                </div>
-            )}
-        </>
+          )}
+        </div>
       )}
+
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+        .spin { animation: spin 1s linear infinite; }
+        @keyframes spin { 0%{transform:rotate(0deg)} 100%{transform:rotate(360deg)} }
+        ::-webkit-scrollbar { width: 3px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #1e2a38; border-radius: 2px; }
+      `}</style>
     </div>
   );
 };
+
+// ── Risk input row ──
+const RiskInput = ({ label, value, onChange, min, max, step, decimals = 0 }) => (
+  <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+      <span style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace" }}>{label}</span>
+      <span style={{ fontSize: 10, color: '#e8edf3', fontFamily: "'Space Mono', monospace", fontWeight: 700 }}>
+        {decimals > 0 ? parseFloat(value).toFixed(decimals) : value}
+      </span>
+    </div>
+    <input
+      type="range" min={min} max={max} step={step} value={value}
+      onChange={e => onChange(parseFloat(e.target.value))}
+      style={{ width: '100%', accentColor: '#f0b429', cursor: 'pointer' }}
+    />
+  </div>
+);
+
+// ── Result display box ──
+const ResultBox = ({ label, value, color, unit }) => (
+  <div style={{ background: 'rgba(0,0,0,0.3)', padding: '10px 12px', borderRadius: 6, border: `1px solid ${color}25`, textAlign: 'center' }}>
+    <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>{label}</div>
+    <div style={{ fontSize: 18, fontWeight: 800, color, fontFamily: "'Space Mono', monospace", lineHeight: 1 }}>{value}</div>
+    {unit && <div style={{ fontSize: 9, color, opacity: 0.6, marginTop: 2, fontFamily: "'Space Mono', monospace" }}>{unit}</div>}
+  </div>
+);
 
 export default SignalCard;

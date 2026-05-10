@@ -1,149 +1,380 @@
-import React, { useState, useEffect } from 'react';
-import axios from 'axios'; 
+import React, { useState, useEffect, useCallback } from 'react';
+import axios from 'axios';
 import ChartComponent from './ChartComponent';
 import SignalCard from './SignalCard';
 import HistoryTable from './HistoryTable';
 import './App.css';
 
-// ☁️ LIVE CLOUD SERVER ADDRESS
-const API_URL = 'https://aura-trade-v1.onrender.com'; 
+const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// 🏆 THE ROSTER: Exact ticker mappings required by MongoDB and Python
 const ASSETS = [
-  { id: 'GC=F', name: 'Gold (XAU/USD)', icon: '🟡' },
-  { id: 'EURUSD=X', name: 'EUR/USD', icon: '🇪🇺' },
-  { id: 'GBPUSD=X', name: 'GBP/USD', icon: '🇬🇧' },
-  { id: 'JPY=X', name: 'USD/JPY', icon: '🇯🇵' },
-  { id: 'CHF=X', name: 'USD/CHF', icon: '🇨🇭' },
-  { id: 'AUDUSD=X', name: 'AUD/USD', icon: '🇦🇺' },
-  { id: 'CAD=X', name: 'USD/CAD', icon: '🇨🇦' },
-  { id: 'NZDUSD=X', name: 'NZD/USD', icon: '🇳🇿' }
+  { id: 'GC=F',      name: 'XAU/USD',  label: 'Gold',        icon: '⬡', category: 'metals'  },
+  { id: 'EURUSD=X',  name: 'EUR/USD',  label: 'Euro',        icon: '€', category: 'majors'  },
+  { id: 'GBPUSD=X',  name: 'GBP/USD',  label: 'Cable',       icon: '£', category: 'majors'  },
+  { id: 'JPY=X',     name: 'USD/JPY',  label: 'Yen',         icon: '¥', category: 'majors'  },
+  { id: 'CHF=X',     name: 'USD/CHF',  label: 'Swissy',      icon: 'F', category: 'majors'  },
+  { id: 'AUDUSD=X',  name: 'AUD/USD',  label: 'Aussie',      icon: 'A', category: 'minors'  },
+  { id: 'CAD=X',     name: 'USD/CAD',  label: 'Loonie',      icon: 'C', category: 'minors'  },
+  { id: 'NZDUSD=X',  name: 'NZD/USD',  label: 'Kiwi',        icon: 'N', category: 'minors'  },
+];
+
+// Session windows in UTC hours
+const SESSIONS = [
+  { name: 'TOKYO',    start: 0,  end: 9,  color: '#7c3aed', abbr: 'TKY' },
+  { name: 'LONDON',   start: 8,  end: 17, color: '#0ea5e9', abbr: 'LON' },
+  { name: 'NEW YORK', start: 13, end: 22, color: '#f59e0b', abbr: 'NYC' },
+  { name: 'SYDNEY',   start: 21, end: 6,  color: '#10b981', abbr: 'SYD' },
+];
+
+const getActiveSessions = (utcHour) => {
+  return SESSIONS.filter(s => {
+    if (s.start < s.end) return utcHour >= s.start && utcHour < s.end;
+    return utcHour >= s.start || utcHour < s.end; // overnight (Sydney)
+  });
+};
+
+const NAV_ITEMS = [
+  { id: 'chart',    label: 'Chart',    icon: 'M3 3h18v2H3zM3 7h12v2H3zM3 11h18v2H3z' },
+  { id: 'signals',  label: 'Signals',  icon: 'M13 2L3 14h9l-1 8 10-12h-9l1-8z' },
+  { id: 'journal',  label: 'Journal',  icon: 'M4 6h16M4 10h16M4 14h10' },
+  { id: 'settings', label: 'Settings', icon: 'M12 4a8 8 0 100 16A8 8 0 0012 4zm0 2a6 6 0 110 12A6 6 0 0112 6z' },
 ];
 
 function App() {
-  const [aiData, setAiData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  
-  // 🏆 Track the currently selected asset (Defaults to Gold)
-  const [activeSymbol, setActiveSymbol] = useState('GC=F');
-  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [aiData,        setAiData]        = useState(null);
+  const [loading,       setLoading]       = useState(false);
+  const [activeSymbol,  setActiveSymbol]  = useState('GC=F');
+  const [activeNav,     setActiveNav]     = useState('chart');
+  const [utcTime,       setUtcTime]       = useState(new Date());
+  const [activeSessions, setActiveSessions] = useState([]);
+  const [stats,         setStats]         = useState({ winRate: 0, totalPips: 0, signals: 0, streak: 0 });
+  const [sidebarOpen,   setSidebarOpen]   = useState(true);
 
-  // THE BRAIN: Fetch Logic
-  const runAnalysis = async (symbolToAnalyze) => {
+  // UTC clock + session detection
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      setUtcTime(now);
+      setActiveSessions(getActiveSessions(now.getUTCHours()));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Fetch performance stats from backend
+  useEffect(() => {
+    const fetchStats = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/api/trades`);
+        if (Array.isArray(res.data) && res.data.length > 0) {
+          const trades = res.data;
+          const wins = trades.filter(t => t.result === 'WON').length;
+          const winRate = Math.round((wins / trades.length) * 100);
+          const totalPips = trades.reduce((sum, t) => sum + (parseFloat(t.profit) || 0), 0);
+
+          // Calculate current streak
+          let streak = 0;
+          for (let i = trades.length - 1; i >= 0; i--) {
+            if (i === trades.length - 1) {
+              streak = trades[i].result === 'WON' ? 1 : -1;
+            } else {
+              if (trades[i].result === 'WON' && streak > 0) streak++;
+              else if (trades[i].result !== 'WON' && streak < 0) streak--;
+              else break;
+            }
+          }
+          setStats({ winRate, totalPips: totalPips.toFixed(1), signals: trades.length, streak });
+        }
+      } catch { /* silent — stats are decorative if API is down */ }
+    };
+    fetchStats();
+  }, []);
+
+  const runAnalysis = useCallback(async (sym) => {
     setLoading(true);
     try {
-      console.log(`🧠 App: Ping AI for ${symbolToAnalyze}...`);
       const res = await axios.post(`${API_URL}/api/analyze`, {
-        symbol: symbolToAnalyze, // 👈 Tell the AI Brain exactly which asset to analyze
+        symbol: sym || activeSymbol,
         timeframe: '1h'
       });
-      
-      if (res.data) {
-        console.log("🧠 Data Received:", res.data);
-        setAiData(res.data);
-      }
+      if (res.data) setAiData(res.data);
     } catch (err) {
-      console.error("Analysis Error:", err);
+      console.error('Analysis error:', err);
     } finally {
       setLoading(false);
     }
-  };
+  }, [activeSymbol]);
 
-  // AUTOMATION: Run immediately on load or when the symbol changes
   useEffect(() => {
     runAnalysis(activeSymbol);
-    const timer = setInterval(() => runAnalysis(activeSymbol), 60000); // Auto-refresh every minute
-    return () => clearInterval(timer);
-  }, [activeSymbol]);
+    const id = setInterval(() => runAnalysis(activeSymbol), 60000);
+    return () => clearInterval(id);
+  }, [activeSymbol, runAnalysis]);
 
   const selectedAsset = ASSETS.find(a => a.id === activeSymbol) || ASSETS[0];
 
+  const pad = n => String(n).padStart(2, '0');
+  const utcStr = `${pad(utcTime.getUTCHours())}:${pad(utcTime.getUTCMinutes())}:${pad(utcTime.getUTCSeconds())} UTC`;
+
   return (
-    <div className="dashboard-container" style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden', backgroundColor: '#0b0e11' }}>
-      
-      {/* 1. SIDEBAR */}
-      <div className="sidebar-desktop" style={{ width: '60px', backgroundColor: '#151920', borderRight: '1px solid #333', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '20px 0', flexShrink: 0 }}>
-        <div style={{ width: '10px', height: '10px', background: '#26a69a', borderRadius: '50%' }}></div>
-      </div>
+    <div style={s.root}>
 
-      {/* 2. MAIN PITCH */}
-      <div className="main-content" style={{ flex: 1, display: 'flex', flexDirection: 'column', padding: '20px', gap: '20px', overflowY: 'auto' }}>
-        
-        {/* === HEADER & MODERN ASSET SWITCHER === */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', position: 'relative', zIndex: 100 }}>
-          <h1 style={{ margin: 0, fontSize: '24px', color: '#e1e3e6' }}>AuraTrade AI</h1>
-          
-          {/* 🎛️ THE TACTICAL DROPDOWN */}
-          <div style={{ position: 'relative' }}>
-            <button 
-              onClick={() => setDropdownOpen(!dropdownOpen)}
-              style={{ display: 'flex', alignItems: 'center', gap: '10px', background: '#151920', border: '1px solid #333', padding: '10px 18px', borderRadius: '8px', color: '#e1e3e6', cursor: 'pointer', fontSize: '15px', fontWeight: 'bold', transition: 'border-color 0.2s' }}
-              onMouseOver={(e) => e.currentTarget.style.borderColor = '#26a69a'}
-              onMouseOut={(e) => e.currentTarget.style.borderColor = '#333'}
+      {/* ── SIDEBAR ── */}
+      <aside style={{ ...s.sidebar, width: sidebarOpen ? 200 : 60 }}>
+        {/* Logo */}
+        <div style={s.logoWrap} onClick={() => setSidebarOpen(!sidebarOpen)}>
+          <div style={s.logoMark}>A</div>
+          {sidebarOpen && <span style={s.logoText}>AURA<span style={{ color: '#f0b429', fontWeight: 400 }}>TRADE</span></span>}
+        </div>
+
+        {/* Nav */}
+        <nav style={s.nav}>
+          {NAV_ITEMS.map(item => (
+            <button
+              key={item.id}
+              onClick={() => setActiveNav(item.id)}
+              style={{ ...s.navBtn, ...(activeNav === item.id ? s.navBtnActive : {}) }}
+              title={item.label}
             >
-              <span>{selectedAsset.icon} {selectedAsset.name}</span>
-              <span style={{ fontSize: '12px', color: '#787b86' }}>▼</span>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                stroke={activeNav === item.id ? '#f0b429' : '#6b7a8d'}
+                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d={item.icon} />
+              </svg>
+              {sidebarOpen && <span style={{ ...s.navLabel, color: activeNav === item.id ? '#f0b429' : '#6b7a8d' }}>{item.label}</span>}
             </button>
-            
-            {dropdownOpen && (
-              <div style={{ position: 'absolute', top: '50px', right: '0', background: '#151920', border: '1px solid #333', borderRadius: '8px', width: '200px', overflow: 'hidden', boxShadow: '0 8px 24px rgba(0,0,0,0.8)' }}>
-                {ASSETS.map(asset => (
-                  <div 
-                    key={asset.id} 
-                    onClick={() => { 
-                        setActiveSymbol(asset.id); 
-                        setDropdownOpen(false); 
-                    }}
-                    style={{ padding: '12px 16px', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '12px', color: asset.id === activeSymbol ? '#26a69a' : '#e1e3e6', background: asset.id === activeSymbol ? 'rgba(38, 166, 154, 0.1)' : 'transparent', borderBottom: '1px solid #1e222d', transition: 'background 0.2s' }}
-                    onMouseOver={(e) => { if (asset.id !== activeSymbol) e.currentTarget.style.background = '#1e222d'; }}
-                    onMouseOut={(e) => { if (asset.id !== activeSymbol) e.currentTarget.style.background = 'transparent'; }}
-                  >
-                    <span style={{ fontSize: '16px' }}>{asset.icon}</span>
-                    <span style={{ fontWeight: asset.id === activeSymbol ? 'bold' : 'normal' }}>{asset.name}</span>
+          ))}
+        </nav>
+
+        {/* Session Killzones */}
+        <div style={s.sessionBox}>
+          {sidebarOpen && <div style={s.sessionTitle}>KILLZONES</div>}
+          {SESSIONS.map(ses => {
+            const isActive = activeSessions.some(a => a.name === ses.name);
+            return (
+              <div key={ses.name} style={{ ...s.sessionRow, opacity: isActive ? 1 : 0.35 }} title={ses.name}>
+                <div style={{ ...s.sessionDot, background: ses.color, boxShadow: isActive ? `0 0 6px ${ses.color}` : 'none' }} />
+                {sidebarOpen && (
+                  <div style={s.sessionInfo}>
+                    <span style={{ fontSize: 11, color: isActive ? '#e8edf3' : '#6b7a8d', fontWeight: isActive ? 700 : 400 }}>{ses.name}</span>
+                    {isActive && <span style={{ fontSize: 9, color: ses.color, fontWeight: 700, letterSpacing: 1 }}>ACTIVE</span>}
                   </div>
-                ))}
+                )}
               </div>
-            )}
-          </div>
-        </div>
-        
-        {/* === TOP ZONE === */}
-        <div className="top-section" style={{ display: 'flex', flexDirection: 'row', gap: '20px', height: '500px', minHeight: '500px', width: '100%', zIndex: 1 }}>
-          
-          {/* Chart Area */}
-          <div className="chart-container" style={{ flex: 0.7, border: '1px solid #333', borderRadius: '12px', overflow: 'hidden', background: '#161A25' }}>
-            {/* 🛑 CRITICAL FIX: Add key to force re-render, and change prop name to match ChartComponent */}
-            <ChartComponent 
-               key={activeSymbol}
-               symbol={activeSymbol}
-               levels={aiData?.keyLevels || { resistance: 0, support: 0, ema: 0 }} 
-               visuals={aiData?.visuals || {}}
-               tradeSetup={aiData?.tradeSetup} 
-            />
-          </div>
-
-          {/* Signal Area */}
-          <div className="signal-card" style={{ flex: 0.3 }}>
-            <SignalCard 
-               externalData={aiData} 
-               onRefresh={() => runAnalysis(activeSymbol)} 
-               loading={loading}
-            />
-          </div>
-
+            );
+          })}
         </div>
 
-        {/* === BOTTOM ZONE === */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '15px', zIndex: 1 }}>
-          <h2 style={{ fontSize: '18px', margin: 0, color: '#9ca3af' }}>Verified AI Performance</h2>
-          <div className="trade-history-table">
-            <HistoryTable />
-          </div>
+        {/* UTC Clock */}
+        <div style={s.clockBox}>
+          <div style={{ ...s.clockDot, animation: 'pulse 2s infinite' }} />
+          {sidebarOpen && <span style={s.clockText}>{utcStr}</span>}
         </div>
+      </aside>
 
+      {/* ── MAIN ── */}
+      <div style={s.main}>
+
+        {/* ── TOPBAR ── */}
+        <header style={s.topbar}>
+
+          {/* Pair tabs */}
+          <div style={s.pairTabs}>
+            {ASSETS.map(asset => (
+              <button
+                key={asset.id}
+                onClick={() => setActiveSymbol(asset.id)}
+                style={{ ...s.pairTab, ...(activeSymbol === asset.id ? s.pairTabActive : {}) }}
+              >
+                <span style={s.pairTabIcon}>{asset.icon}</span>
+                <span>{asset.name}</span>
+              </button>
+            ))}
+          </div>
+
+          {/* Stats bar */}
+          <div style={s.statsBar}>
+            <StatPill label="WIN RATE"   value={`${stats.winRate}%`}   color="#00e676" />
+            <StatPill label="PIPS"       value={stats.totalPips}        color={stats.totalPips >= 0 ? '#00e676' : '#ff4757'} />
+            <StatPill label="SIGNALS"    value={stats.signals}          color="#f0b429" />
+            <StatPill label="STREAK"     value={stats.streak > 0 ? `+${stats.streak}` : stats.streak} color={stats.streak >= 0 ? '#00e676' : '#ff4757'} />
+            {activeSessions.map(ses => (
+              <div key={ses.name} style={{ ...s.sessionPill, background: `${ses.color}18`, border: `1px solid ${ses.color}50`, color: ses.color }}>
+                {ses.abbr}
+              </div>
+            ))}
+          </div>
+        </header>
+
+        {/* ── CONTENT ── */}
+        <div style={s.content}>
+          {activeNav === 'chart' || activeNav === 'signals' ? (
+            <>
+              {/* Chart + Signal row */}
+              <div style={s.topRow}>
+                <div style={s.chartWrap}>
+                  <ChartComponent
+                    key={activeSymbol}
+                    symbol={activeSymbol}
+                    levels={aiData?.keyLevels || { resistance: 0, support: 0, ema: 0 }}
+                    visuals={aiData?.visuals || {}}
+                    tradeSetup={aiData?.tradeSetup}
+                  />
+                </div>
+                <div style={s.signalWrap}>
+                  <SignalCard
+                    externalData={aiData}
+                    onRefresh={() => runAnalysis(activeSymbol)}
+                    loading={loading}
+                  />
+                </div>
+              </div>
+
+              {/* History */}
+              <div style={s.historyWrap}>
+                <div style={s.sectionHeader}>
+                  <span style={s.sectionTitle}>Verified AI Performance</span>
+                  <span style={s.sectionSub}>Live results from backend</span>
+                </div>
+                <HistoryTable />
+              </div>
+            </>
+          ) : activeNav === 'journal' ? (
+            <div style={s.placeholderPage}>
+              <span style={s.placeholderIcon}>📓</span>
+              <span style={s.placeholderText}>Trade Journal — coming soon</span>
+            </div>
+          ) : (
+            <div style={s.placeholderPage}>
+              <span style={s.placeholderIcon}>⚙️</span>
+              <span style={s.placeholderText}>Settings — coming soon</span>
+            </div>
+          )}
+        </div>
       </div>
+
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;700;800&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background: #080c10; font-family: 'Syne', sans-serif; }
+        ::-webkit-scrollbar { width: 4px; height: 4px; }
+        ::-webkit-scrollbar-track { background: #0d1117; }
+        ::-webkit-scrollbar-thumb { background: #1e2a38; border-radius: 2px; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+      `}</style>
     </div>
   );
 }
+
+// ── Small stat pill component ──
+const StatPill = ({ label, value, color }) => (
+  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '4px 12px', borderRadius: 4, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+    <span style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>{label}</span>
+    <span style={{ fontSize: 13, fontWeight: 700, color, fontFamily: "'Space Mono', monospace" }}>{value}</span>
+  </div>
+);
+
+// ── Styles object ──
+const s = {
+  root: {
+    display: 'flex', height: '100vh', width: '100vw',
+    overflow: 'hidden', background: '#080c10', color: '#e8edf3',
+  },
+  sidebar: {
+    flexShrink: 0, background: '#0d1117',
+    borderRight: '1px solid rgba(255,255,255,0.06)',
+    display: 'flex', flexDirection: 'column',
+    transition: 'width 0.2s ease', overflow: 'hidden',
+  },
+  logoWrap: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '18px 14px', cursor: 'pointer',
+    borderBottom: '1px solid rgba(255,255,255,0.05)',
+    flexShrink: 0,
+  },
+  logoMark: {
+    width: 32, height: 32, borderRadius: 6, background: '#f0b429',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    fontSize: 16, fontWeight: 800, color: '#080c10', flexShrink: 0,
+  },
+  logoText: {
+    fontSize: 15, fontWeight: 800, color: '#e8edf3',
+    letterSpacing: 2, whiteSpace: 'nowrap',
+    fontFamily: "'Syne', sans-serif",
+  },
+  nav: { display: 'flex', flexDirection: 'column', padding: '12px 8px', gap: 2 },
+  navBtn: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '10px 10px', borderRadius: 6, border: 'none',
+    background: 'transparent', cursor: 'pointer', width: '100%',
+    transition: 'background 0.15s',
+  },
+  navBtnActive: { background: 'rgba(240,180,41,0.08)' },
+  navLabel: { fontSize: 13, fontWeight: 600, whiteSpace: 'nowrap' },
+  sessionBox: {
+    marginTop: 'auto', padding: '12px 10px',
+    borderTop: '1px solid rgba(255,255,255,0.05)',
+    display: 'flex', flexDirection: 'column', gap: 8,
+  },
+  sessionTitle: {
+    fontSize: 9, color: '#3d4d5e', letterSpacing: 2,
+    fontFamily: "'Space Mono', monospace", marginBottom: 4,
+  },
+  sessionRow: { display: 'flex', alignItems: 'center', gap: 8, transition: 'opacity 0.3s' },
+  sessionDot: { width: 7, height: 7, borderRadius: '50%', flexShrink: 0, transition: 'box-shadow 0.3s' },
+  sessionInfo: { display: 'flex', flexDirection: 'column', gap: 1 },
+  clockBox: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    padding: '10px 12px', borderTop: '1px solid rgba(255,255,255,0.05)',
+    flexShrink: 0,
+  },
+  clockDot: { width: 6, height: 6, borderRadius: '50%', background: '#00e676', flexShrink: 0 },
+  clockText: { fontSize: 10, fontFamily: "'Space Mono', monospace", color: '#6b7a8d', whiteSpace: 'nowrap' },
+  main: { flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 },
+  topbar: {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    padding: '0 16px', height: 50, flexShrink: 0,
+    background: '#0d1117', borderBottom: '1px solid rgba(255,255,255,0.06)',
+    gap: 12, overflow: 'hidden',
+  },
+  pairTabs: { display: 'flex', gap: 2, overflow: 'hidden' },
+  pairTab: {
+    display: 'flex', alignItems: 'center', gap: 5,
+    padding: '5px 10px', borderRadius: 4, border: '1px solid transparent',
+    background: 'transparent', color: '#6b7a8d', cursor: 'pointer',
+    fontSize: 11, fontFamily: "'Space Mono', monospace",
+    transition: 'all 0.15s', whiteSpace: 'nowrap',
+  },
+  pairTabActive: {
+    background: 'rgba(240,180,41,0.1)',
+    border: '1px solid rgba(240,180,41,0.3)',
+    color: '#f0b429',
+  },
+  pairTabIcon: { fontSize: 12 },
+  statsBar: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 },
+  sessionPill: {
+    padding: '4px 10px', borderRadius: 4,
+    fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace",
+    letterSpacing: 1,
+  },
+  content: { flex: 1, display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: '16px', gap: 16 },
+  topRow: { display: 'flex', gap: 16, height: 500, minHeight: 500 },
+  chartWrap: {
+    flex: '0 0 70%', border: '1px solid rgba(255,255,255,0.07)',
+    borderRadius: 10, overflow: 'hidden', background: '#161A25',
+  },
+  signalWrap: { flex: '0 0 calc(30% - 16px)' },
+  historyWrap: { display: 'flex', flexDirection: 'column', gap: 8 },
+  sectionHeader: { display: 'flex', alignItems: 'baseline', gap: 10 },
+  sectionTitle: { fontSize: 15, fontWeight: 700, color: '#9ca3af' },
+  sectionSub: { fontSize: 11, color: '#3d4d5e', fontFamily: "'Space Mono', monospace" },
+  placeholderPage: {
+    flex: 1, display: 'flex', flexDirection: 'column',
+    alignItems: 'center', justifyContent: 'center', gap: 12,
+  },
+  placeholderIcon: { fontSize: 40 },
+  placeholderText: { fontSize: 14, color: '#3d4d5e', fontFamily: "'Space Mono', monospace" },
+};
 
 export default App;

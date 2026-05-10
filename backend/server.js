@@ -129,6 +129,7 @@ const isMarketClosed = (timestampInSeconds) => {
 };
 
 const getBucketTime = (timestamp, timeframe) => {
+  if (timeframe === '15m') return timestamp - (timestamp % 900);
   if (timeframe === '1h') return timestamp - (timestamp % 3600);
   if (timeframe === '4h') return timestamp - (timestamp % 14400); 
   return timestamp;
@@ -137,7 +138,7 @@ const getBucketTime = (timestamp, timeframe) => {
 const handleNewTick = async (data, symbol) => {
   try {
     const weekendFlag = isMarketClosed(data.time);
-    const targetTimeframes = ['1h', '4h'];
+    const targetTimeframes = ['15m', '1h', '4h'];
 
     const updatePromises = targetTimeframes.map(async (tf) => {
       const bucketTime = getBucketTime(data.time, tf);
@@ -176,7 +177,7 @@ const syncHistoricalData = async () => {
 
                 if (rawData.length === 0) continue;
 
-                for (const tf of ['1h', '4h']) {
+                for (const tf of ['15m', '1h', '4h']) {
                     const bulkOps = rawData.map(candle => {
                         if (!candle.date || !candle.close) return null;
                         const timeInSeconds = Math.floor(new Date(candle.date).getTime() / 1000);
