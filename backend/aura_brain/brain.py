@@ -271,6 +271,122 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
     tr_series = pd.Series(tr_list)
     return float(tr_series.rolling(period).mean().iloc[-1]) if len(tr_list) >= period else float(tr_series.mean())
 
+def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    
+    obs = []
+    # look at last 100 candles only — recent OBs matter most
+    start = max(0, len(closes) - 100)
+    
+    for i in range(start + 2, len(closes) - 1):
+        body_size = abs(closes[i] - closes[i-1])
+        if body_size < atr * 0.3:
+            continue  # ignore small candles, not a real OB
+            
+        if bias == 'BULLISH':
+            # Bullish OB: last bearish candle before a strong bullish impulse
+            is_bearish_candle = closes[i-1] < closes[i-2]  # candle i-1 closed down
+            strong_up_move    = closes[i] > highs[i-1] and (closes[i] - closes[i-1]) > atr * 0.8
+            if is_bearish_candle and strong_up_move:
+                obs.append({
+                    'type':       'BULL_OB',
+                    'top':        float(highs[i-1]),
+                    'bottom':     float(lows[i-1]),
+                    'time':       int(dates[i-1]),
+                    'end_time':   int(dates[-1]),
+                    'label':      'Bull OB',
+                    'mitigated':  float(lows[-1]) > float(lows[i-1])  # price hasn't returned yet
+                })
+        else:
+            # Bearish OB: last bullish candle before a strong bearish impulse
+            is_bullish_candle = closes[i-1] > closes[i-2]
+            strong_down_move  = closes[i] < lows[i-1] and (closes[i-1] - closes[i]) > atr * 0.8
+            if is_bullish_candle and strong_down_move:
+                obs.append({
+                    'type':       'BEAR_OB',
+                    'top':        float(highs[i-1]),
+                    'bottom':     float(lows[i-1]),
+                    'time':       int(dates[i-1]),
+                    'end_time':   int(dates[-1]),
+                    'label':      'Bear OB',
+                    'mitigated':  float(highs[-1]) < float(highs[i-1])
+                })
+    
+    # return only last 3 unmitigated OBs — most recent ones only
+    unmitigated = [ob for ob in obs if not ob['mitigated']]
+    return unmitigated[-3:] if unmitigated else obs[-2:]
+
+
+def detect_fvgs(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
+    highs = df['High'].values
+    lows  = df['Low'].values
+    dates = df['Date'].values if 'Date' in df.columns else df.index.values
+    
+    fvgs = []
+    start = max(0, len(highs) - 100)
+    
+    for i in range(start + 1, len(highs) - 1):
+        if bias == 'BULLISH':
+            gap = lows[i+1] - highs[i-1]
+            if gap > atr * 0.3:
+                filled = any(lows[j] <= highs[i-1] for j in range(i+2, len(lows)))
+                if not filled:
+                    fvgs.append({
+                        'type':     'BULL_FVG',
+                        'top':      float(lows[i+1]),
+                        'bottom':   float(highs[i-1]),
+                        'time':     int(dates[i]),
+                        'end_time': int(dates[-1]),
+                        'label':    'FVG',
+                        'size':     float(gap)
+                    })
+        else:
+            gap = lows[i-1] - highs[i+1]
+            if gap > atr * 0.3:
+                filled = any(highs[j] >= lows[i-1] for j in range(i+2, len(highs)))
+                if not filled:
+                    fvgs.append({
+                        'type':     'BEAR_FVG',
+                        'top':      float(lows[i-1]),
+                        'bottom':   float(highs[i+1]),
+                        'time':     int(dates[i]),
+                        'end_time': int(dates[-1]),
+                        'label':    'FVG',
+                        'size':     float(gap)
+                    })
+    
+    return fvgs[-3:]
+
+
+def get_session_levels(df: pd.DataFrame) -> Dict:
+    if len(df) < 24:
+        return {}
+    
+    try:
+        prev_day    = df.iloc[-48:-24]
+        weekly_open = df.iloc[-120] if len(df) >= 120 else df.iloc[0]
+        
+        prev_day_high  = float(prev_day['High'].max())
+        prev_day_low   = float(prev_day['Low'].min())
+        weekly_open_px = float(weekly_open['Open']) if 'Open' in df.columns else float(weekly_open['Close'])
+        current_price  = float(df['Close'].iloc[-1])
+        
+        return {
+            'prev_day_high':  prev_day_high,
+            'prev_day_low':   prev_day_low,
+            'weekly_open':    weekly_open_px,
+            'price_vs_pdh':   current_price > prev_day_high,
+            'price_vs_pdl':   current_price < prev_day_low,
+            'price_vs_wopen': current_price > weekly_open_px,
+        }
+    except Exception as e:
+        logger.error(f"Session levels error: {e}")
+        return {}
+
+
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
     sweeps = []
     closes = df['Close'].values
@@ -595,24 +711,39 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "consolidation_boxes": consolidation_boxes
     }
 
-def score_mmm_setup(current_price: float, ema_50: float, ema_200: float, rsi: float, 
-                    level: int, in_pullback: bool, cycle: str, sweep_nearby: bool, atr: float, phase_str: str) -> int:
+def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False) -> int:
     if "FAILED" in phase_str: return 0
-        
-    score = 50 
-    dist_to_ema = abs(current_price - ema_50)
+    if not in_pullback: return 0  # never score outside pullback phase
 
+    score = 0
+
+    # Layer 1 — HTF bias (20pts)
+    if htf_aligned: score += 20
+
+    # Layer 2 — MMM phase (15pts)
     if level in [1, 2]: score += 15
-    elif level >= 3: score -= 20
+    elif level >= 3: score -= 10
 
-    if dist_to_ema <= atr * 0.5: score += 20
-        
-    if cycle.startswith("BULLISH") and ema_50 > ema_200: score += 10
-    elif cycle.startswith("BEARISH") and ema_50 < ema_200: score += 10
+    # Layer 3 — Price at liquidity zone (15pts)
+    dist = abs(current_price - ema_50)
+    if dist <= atr * 0.5: score += 15
+    elif dist <= atr * 1.0: score += 8
 
+    # Layer 4 — ICT triggers (25pts)
+    if ob_present: score += 15
+    if fvg_present: score += 10
+
+    # Layer 5 — Liquidity sweep nearby (10pts)
     if sweep_nearby: score += 10
 
-    return min(max(score, 0), 95)
+    # Layer 6 — Session timing (5pts)
+    if session_aligned: score += 5
+
+    # RSI confirmation
+    if cycle.startswith("BULLISH") and rsi < 50: score += 5
+    elif cycle.startswith("BEARISH") and rsi > 50: score += 5
+
+    return min(max(score, 0), 99)
 
 def calculate_trade_levels(current_price: float, signal: str,
                             atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
@@ -694,6 +825,31 @@ async def analyze(req: AnalysisRequest):
         lines         = ms['lines']
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
+
+        # ICT triggers
+        bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
+        order_blocks = detect_order_blocks(df, ms['atr'], bias_str)
+        fvgs         = detect_fvgs(df, ms['atr'], bias_str)
+        session_lvls = get_session_levels(df)
+
+        ob_present = any(ob['bottom'] <= current_price <= ob['top'] for ob in order_blocks)
+        fvg_present = any(fvg['bottom'] <= current_price <= fvg['top'] for fvg in fvgs)
+
+        htf_aligned = False
+        if req.htf_candles and len(req.htf_candles) > 50:
+            htf_df = process_live_candles(req.htf_candles)
+            if htf_df is not None:
+                htf_ema50  = safe_float(EMAIndicator(close=htf_df['Close'], window=50).ema_indicator().iloc[-1])
+                htf_ema200 = safe_float(EMAIndicator(close=htf_df['Close'], window=200).ema_indicator().iloc[-1])
+                htf_aligned = (cycle.startswith('BULLISH') and htf_ema50 > htf_ema200) or \
+                              (cycle.startswith('BEARISH') and htf_ema50 < htf_ema200)
+        else:
+            htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
+                          (cycle.startswith('BEARISH') and ema_50 < ema_200)
+
+        from datetime import datetime, timezone
+        current_utc_hour = datetime.now(timezone.utc).hour
+        session_aligned = (8 <= current_utc_hour < 17) or (13 <= current_utc_hour < 22)
         
         alpha_data = analyze_alpha_peak(df)
         alpha_signal = alpha_data["signal"]
@@ -734,14 +890,14 @@ async def analyze(req: AnalysisRequest):
             if cycle.startswith("BULLISH"):
                 if current_price >= ema_50 and dist <= (atr * 1.0):
                     signal = "BUY"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
                 if current_price <= ema_50 and dist <= (atr * 1.0):
                     signal = "SELL"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str)
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
@@ -794,12 +950,21 @@ async def analyze(req: AnalysisRequest):
                 "ema200":     round(ema_200, decimals),
                 "ema50":      round(ema_50, decimals),
             },
+
             "visuals": {
-                "smc_zones":  boxes,
-                "bos_lines":  lines,  
-                "fvgs":       [],     
-                "sweeps":     sweeps,     
+                "smc_zones":    boxes,
+                "bos_lines":    lines,
+                "fvgs":         fvgs,
+                "sweeps":       sweeps,
+                "order_blocks": order_blocks,
             },
+            "mtf_confluence": [
+                {"tf": "4H",  "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 40},
+                {"tf": "1H",  "bias": bias_str, "strength": int(confidence)},
+                {"tf": "OB",  "bias": bias_str if ob_present else "NEUTRAL",  "strength": 80 if ob_present else 30},
+                {"tf": "FVG", "bias": bias_str if fvg_present else "NEUTRAL", "strength": 75 if fvg_present else 25},
+            ],
+
             "tradeSetup":  trade_setup,
             "dataSource":  data_source,
         }
@@ -831,7 +996,7 @@ async def debug_analysis(req: AnalysisRequest):
         alpha = analyze_alpha_peak(df)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v2.3 (improved peaks 2025)",
+            "✅ ENGINE VERSION":    "AuraBrain MMM v2.3 (improved peaks 2026)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",

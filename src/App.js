@@ -112,7 +112,6 @@ function App() {
     return () => clearInterval(id);
   }, [activeSymbol, runAnalysis]);
 
-  const selectedAsset = ASSETS.find(a => a.id === activeSymbol) || ASSETS[0];
 
   const pad = n => String(n).padStart(2, '0');
   const utcStr = `${pad(utcTime.getUTCHours())}:${pad(utcTime.getUTCMinutes())}:${pad(utcTime.getUTCSeconds())} UTC`;
@@ -282,12 +281,11 @@ const s = {
     overflow: 'hidden', background: '#080c10', color: '#e8edf3',
   },
   sidebar: {
-    flexShrink: 0, background: '#0d1117',
-    borderRight: '1px solid rgba(255,255,255,0.06)',
-    display: 'flex', flexDirection: 'column',
-    transition: 'width 0.2s ease', overflow: 'hidden',
-    display: window.innerWidth < 768 ? 'none' : 'flex',
-  },
+  flexShrink: 0, background: '#0d1117',
+  borderRight: '1px solid rgba(255,255,255,0.06)',
+  display: 'flex', flexDirection: 'column',
+  transition: 'width 0.2s ease', overflow: 'hidden',
+},
   logoWrap: {
     display: 'flex', alignItems: 'center', gap: 10,
     padding: '18px 14px', cursor: 'pointer',
