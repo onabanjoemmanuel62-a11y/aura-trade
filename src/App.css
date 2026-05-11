@@ -27,6 +27,16 @@ input[type="range"] { accent-color: #f0b429; cursor: pointer; }
     overflow-x: hidden;
   }
 
+  /* Stack the whole layout vertically */
+  .main-content {
+    flex-direction: column !important;
+  }
+
+  /* Hide pair tabs on mobile to save space */
+  .pair-tabs {
+    display: none !important;
+  }
+
   .trade-history-table {
     overflow-x: auto;
     white-space: nowrap;
