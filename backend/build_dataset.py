@@ -115,12 +115,19 @@ for i in range(10, len(all_swings) - 2):
     elif is_bullish_ob and closes[ob_idx] > opens[ob_idx] and closes[ob_idx-1] < opens[ob_idx-1]:
         ob_idx = ob_idx - 1
 
+    # ✅ FIX — everything gets 4 spaces so it's inside the loop
     ob_top = highs[ob_idx]
     ob_bottom = lows[ob_idx]
     
-    has_bullish_fvg = lows[ob_idx+2] > ob_top if (ob_idx+2 < len(lows)) else False
-    has_bearish_fvg = highs[ob_idx+2] < ob_bottom if (ob_idx+2 < len(highs)) else False
-    
+    c1 = ob_idx + 1
+    c3 = ob_idx + 3
+    if c3 < len(lows):
+        has_bullish_fvg = lows[c3] > highs[c1]
+        has_bearish_fvg = highs[c3] < lows[c1]
+    else:
+        has_bullish_fvg = False
+        has_bearish_fvg = False
+        
     if is_bullish_ob and not has_bullish_fvg: continue
     if is_bearish_ob and not has_bearish_fvg: continue
 
@@ -138,7 +145,7 @@ for i in range(10, len(all_swings) - 2):
             mitigation_idx = fut
             break
             
-    if not mitigation_idx: continue 
+    if mitigation_idx is None: continue 
     
     trend = 1 if ema50[mitigation_idx] > ema200[mitigation_idx] else -1
     
@@ -151,7 +158,7 @@ for i in range(10, len(all_swings) - 2):
     tp = entry_price + (risk * 2.0) if is_bullish_ob else entry_price - (risk * 2.0)
 
     label = 0 
-    for sim_idx in range(mitigation_idx + 1, min(mitigation_idx + 100, len(highs))):
+    for sim_idx in range(mitigation_idx + 1, min(mitigation_idx + 300, len(highs))):
         c_high = highs[sim_idx]
         c_low = lows[sim_idx]
         
@@ -172,7 +179,7 @@ for i in range(10, len(all_swings) - 2):
     dataset.append({
         "date": date_val,
         "type": 1 if is_bullish_ob else 0, 
-        "fvg_size_pips": round(abs(lows[ob_idx+2] - ob_top) if is_bullish_ob else abs(ob_bottom - highs[ob_idx+2]), 2),
+        "fvg_size_pips": round(abs(lows[c3] - highs[c1]) if is_bullish_ob else abs(lows[c1] - highs[c3]), 2),
         "rsi_at_entry": round(rsi[mitigation_idx], 2),
         "atr_at_entry": round(atr[mitigation_idx], 2),
         "momentum_ratio": round(momentum / current_atr, 2),
