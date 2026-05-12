@@ -960,9 +960,9 @@ async def analyze(req: AnalysisRequest):
             },
             "mtf_confluence": [
                 {"tf": "4H",  "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 40},
-                {"tf": "1H",  "bias": bias_str, "strength": int(confidence)},
-                {"tf": "OB",  "bias": bias_str if ob_present else "NEUTRAL",  "strength": 80 if ob_present else 30},
-                {"tf": "FVG", "bias": bias_str if fvg_present else "NEUTRAL", "strength": 75 if fvg_present else 25},
+                {"tf": "1H", "bias": bias_str, "strength": 75 if bias_str == "BULLISH" else 65 if bias_str == "BEARISH" else 20},
+                {"tf": "OB",  "bias": bias_str if len(order_blocks) > 0 else "NEUTRAL",  "strength": 80 if len(order_blocks) > 0 else 30},
+                {"tf": "FVG", "bias": bias_str if len(fvgs) > 0 else "NEUTRAL", "strength": 75 if len(fvgs) > 0 else 25},
             ],
 
             "tradeSetup":  trade_setup,
