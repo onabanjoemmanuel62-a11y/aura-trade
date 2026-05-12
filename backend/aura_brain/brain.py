@@ -833,13 +833,13 @@ async def analyze(req: AnalysisRequest):
         session_lvls = get_session_levels(df)
 
         ob_present = any(
-    (ob['bottom'] - ms['atr']) <= current_price <= (ob['top'] + ms['atr'])
-    for ob in order_blocks
-)
-fvg_present = any(
-    (fvg['bottom'] - ms['atr']) <= current_price <= (fvg['top'] + ms['atr'])
-    for fvg in fvgs
-)
+            (ob['bottom'] - ms['atr']) <= current_price <= (ob['top'] + ms['atr'])
+            for ob in order_blocks
+        )
+        fvg_present = any(
+            (fvg['bottom'] - ms['atr']) <= current_price <= (fvg['top'] + ms['atr'])
+            for fvg in fvgs
+        )
 
         htf_aligned = False
         if req.htf_candles and len(req.htf_candles) > 50:
