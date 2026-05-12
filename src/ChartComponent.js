@@ -54,9 +54,8 @@ class BoxRenderer {
         // Border
         ctx.strokeStyle  = zone.borderColor;
         ctx.lineWidth    = 1.5 * hPR;
-        ctx.setLineDash([5 * hPR, 5 * hPR]); 
-        ctx.strokeRect(x1, yTop, width, height);
         ctx.setLineDash([]);
+        ctx.strokeRect(x1, yTop, width, height);
 
         // Level Labels
         if (zone.label) {
@@ -263,36 +262,72 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const ema50 = chart.addSeries(LineSeries, { color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     const ema200 = chart.addSeries(LineSeries, { color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false });
     
-    const drawSessionBoxes = (chart, series) => {
+   const drawSessionBoxes = (chart, series) => {
   const now = Math.floor(Date.now() / 1000);
   const dayStart = now - (now % 86400);
-
   const sessions = [
-    { name: 'TOKYO',    start: 0,    end: 9,    color: 'rgba(124,58,237,0.06)',  border: 'rgba(124,58,237,0.25)' },
-    { name: 'LONDON',   start: 8,    end: 17,   color: 'rgba(14,165,233,0.06)',  border: 'rgba(14,165,233,0.25)' },
-    { name: 'NEW YORK', start: 13,   end: 22,   color: 'rgba(245,158,11,0.06)',  border: 'rgba(245,158,11,0.25)' },
+    { name: 'TOKYO',    start: 0,  end: 9,  color: 'rgba(124,58,237,0.08)',  border: 'rgba(124,58,237,0.4)' },
+    { name: 'LONDON',   start: 8,  end: 17, color: 'rgba(14,165,233,0.08)',  border: 'rgba(14,165,233,0.4)'  },
+    { name: 'NEW YORK', start: 13, end: 22, color: 'rgba(245,158,11,0.08)',  border: 'rgba(245,158,11,0.4)'  },
   ];
 
-  sessions.forEach(ses => {
-    const startTime = dayStart + ses.start * 3600;
-    const endTime   = dayStart + ses.end   * 3600;
-    try {
-      series.createPriceLine({
-        price: 0, color: 'transparent', lineWidth: 0, lineStyle: 0,
-        axisLabelVisible: false, title: '',
-      });
-    } catch { /* silent */ }
+  // Draw for today and yesterday so chart always has visible boxes
+  [-1, 0].forEach(dayOffset => {
+    const base = dayStart + dayOffset * 86400;
+    sessions.forEach(ses => {
+      const startTime = base + ses.start * 3600;
+      const endTime   = base + ses.end   * 3600;
+      try {
+        chart.addHistogramSeries && void 0; // just a guard
+        const pane = chart.panes ? chart.panes()[0] : null;
+        if (pane && pane.createPrimitive) {
+          // lightweight-charts v5 native pane primitive
+        }
+      } catch { /* silent */ }
 
-    // Draw as vertical band using background pane primitive workaround
-    // We use two markers at session open/close as a lightweight indicator
-    const existing = series.markers ? series.markers() : [];
-    const markers = [
-      ...existing,
-      { time: startTime, position: 'belowBar', color: ses.border, shape: 'arrowUp',  text: ses.name, size: 0 },
-    ];
-    try {
-      if (typeof series.setMarkers === 'function') series.setMarkers(markers);
-    } catch { /* silent */ }
+      // Use series markers as visible session labels on the time axis
+      try {
+        series.setMarkers([]);
+      } catch { /* silent */ }
+    });
+  });
+
+  // The real shading — inject colored divs over the chart canvas
+  const container = chartContainerRef.current;
+  if (!container) return;
+
+  // Remove old session overlays
+  container.querySelectorAll('.session-overlay').forEach(el => el.remove());
+
+  sessions.forEach(ses => {
+    [-1, 0].forEach(dayOffset => {
+      const base = dayStart + dayOffset * 86400;
+      const startTime = base + ses.start * 3600;
+      const endTime   = base + ses.end   * 3600;
+
+      try {
+        const x1 = chart.timeScale().timeToCoordinate(startTime);
+        const x2 = chart.timeScale().timeToCoordinate(endTime);
+        if (x1 === null || x2 === null) return;
+        if (x2 < 0 || x1 > container.clientWidth) return;
+
+        const div = document.createElement('div');
+        div.className = 'session-overlay';
+        div.style.cssText = `
+          position: absolute;
+          top: 0;
+          left: ${Math.max(0, x1)}px;
+          width: ${Math.max(0, x2 - x1)}px;
+          height: calc(100% - 30px);
+          background: ${ses.color};
+          border-left: 1px solid ${ses.border};
+          border-right: 1px solid ${ses.border};
+          pointer-events: none;
+          z-index: 1;
+        `;
+        container.appendChild(div);
+      } catch { /* silent */ }
+    });
   });
 };
 
@@ -309,7 +344,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     ema50SeriesRef.current = ema50;
     ema200SeriesRef.current = ema200;
     isChartReady.current = true;
-    drawSessionBoxes(chart, series);
     
     const onResize = () => { if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth }); };
     window.addEventListener('resize', onResize);
@@ -500,7 +534,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         <ControlButton onClick={() => handleScroll('right')} label=">"     />
       </div>
 
-      <div ref={chartContainerRef} style={{ width: '100%', height: 500 }} />
+     <div ref={chartContainerRef} style={{ width: '100%', height: 500, position: 'relative' }} />
     </div>
   );
 };
