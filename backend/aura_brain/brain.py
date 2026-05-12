@@ -28,6 +28,9 @@ logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
+# Signal lock — prevents signal flipping on every refresh
+SIGNAL_LOCK = {}  
+
 base_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(base_dir, "aura_model.pkl")
 try:
@@ -934,8 +937,30 @@ async def analyze(req: AnalysisRequest):
                 logger.warning(f"ML inference failed: {ml_e}")
 
         trade_setup = None
-        if signal in ("BUY", "SELL") and confidence >= 65:
-            trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
+symbol_key = req.symbol
+
+# Check if there's an active lock for this symbol
+existing_lock = SIGNAL_LOCK.get(symbol_key)
+if existing_lock:
+    # Only release lock if SL breached or 4H bias flipped
+    sl_breached = (existing_lock['signal'] == 'BUY' and current_price < existing_lock['sl']) or \
+                  (existing_lock['signal'] == 'SELL' and current_price > existing_lock['sl'])
+    bias_flipped = existing_lock['signal'] == 'BUY' and not cycle.startswith('BULLISH') or \
+                   existing_lock['signal'] == 'SELL' and not cycle.startswith('BEARISH')
+    if sl_breached or bias_flipped:
+        del SIGNAL_LOCK[symbol_key]
+    else:
+        signal = existing_lock['signal']
+        confidence = existing_lock['confidence']
+
+if signal in ("BUY", "SELL") and confidence >= 65:
+    trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
+    if trade_setup and symbol_key not in SIGNAL_LOCK:
+        SIGNAL_LOCK[symbol_key] = {
+            'signal': signal,
+            'confidence': confidence,
+            'sl': trade_setup['stop_loss']
+        }
             if trade_setup:
                 reasoning.append(
                     f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"

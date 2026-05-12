@@ -377,7 +377,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 <div style={{ fontSize: 20, fontWeight: 800, color: signalColor, fontFamily: "'Space Mono', monospace" }}>
                   {Math.round(mtfData.filter(t => {
                     const b = (t.bias || '').toString();
-                    return b.includes('BUY') || b.includes('SELL');
+                    return b.includes('BULLISH') || b.includes('BEARISH');
                   }).length / mtfData.length * 100)}%
                 </div>
                 <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with signal</div>
