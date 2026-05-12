@@ -832,8 +832,14 @@ async def analyze(req: AnalysisRequest):
         fvgs         = detect_fvgs(df, ms['atr'], bias_str)
         session_lvls = get_session_levels(df)
 
-        ob_present = any(ob['bottom'] <= current_price <= ob['top'] for ob in order_blocks)
-        fvg_present = any(fvg['bottom'] <= current_price <= fvg['top'] for fvg in fvgs)
+        ob_present = any(
+    (ob['bottom'] - ms['atr']) <= current_price <= (ob['top'] + ms['atr'])
+    for ob in order_blocks
+)
+fvg_present = any(
+    (fvg['bottom'] - ms['atr']) <= current_price <= (fvg['top'] + ms['atr'])
+    for fvg in fvgs
+)
 
         htf_aligned = False
         if req.htf_candles and len(req.htf_candles) > 50:
@@ -888,14 +894,14 @@ async def analyze(req: AnalysisRequest):
             reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
         else:
             if cycle.startswith("BULLISH"):
-                if current_price >= ema_50 and dist <= (atr * 1.0):
+                if current_price >= ema_50 * 0.998 and dist <= (atr * 1.5):
                     signal = "BUY"
                     confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
-                if current_price <= ema_50 and dist <= (atr * 1.0):
+                if current_price <= ema_50 * 1.002 and dist <= (atr * 1.5):
                     signal = "SELL"
                     confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
                     reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
@@ -926,9 +932,6 @@ async def analyze(req: AnalysisRequest):
                 reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
             except Exception as ml_e:
                 logger.warning(f"ML inference failed: {ml_e}")
-
-        if confidence == 0 and signal != "NEUTRAL":
-            confidence = 60  
 
         trade_setup = None
         if signal in ("BUY", "SELL") and confidence >= 65:
