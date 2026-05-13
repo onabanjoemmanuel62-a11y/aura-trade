@@ -79,6 +79,8 @@ def load_csv_fallback():
 
         df.dropna(subset=numeric_cols, inplace=True)
         df.reset_index(drop=True, inplace=True)
+        if 'Date' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
         return df if len(df) > 50 else None
     except Exception as e:
         logger.error(f"CSV load failed: {e}")
@@ -467,8 +469,9 @@ def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, 
     swing_lows  = np.array(swing_lows)
 
     # Only look at pivots after anchor
-    swing_highs = swing_highs[swing_highs >= anchor_idx]
-    swing_lows  = swing_lows[swing_lows   >= anchor_idx]
+    recent_start = max(0, len(closes) - 500)
+    swing_highs = swing_highs[swing_highs >= recent_start]
+    swing_lows  = swing_lows[swing_lows   >= recent_start]
 
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return []
@@ -838,6 +841,7 @@ async def analyze(req: AnalysisRequest):
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
         ms = analyze_market_structure(df, profile)
+        logger.info(f"Anchor idx: {ms['anchor_idx']}, Total candles: {len(df)}, Cycle: {ms['cycle']}")
         cycle         = ms['cycle']
         current_level = ms['level']
         phase_str     = ms['phase_str']
