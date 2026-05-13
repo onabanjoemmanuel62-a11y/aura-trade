@@ -645,13 +645,14 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         if is_bullish and ema_50_array[i] <= ema_200_array[i]:
             cross_idx = i
             break
-        elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
+
+            elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
             cross_idx = i
             break
 
-            search_start = max(0, len(closes) - 200)
+    search_start = max(0, len(closes) - 200)
     search_end   = len(closes)
-
+    
     if is_bullish:
         use_bearish  = False
         best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
