@@ -591,6 +591,184 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
             break
     
     return boxes
+
+
+def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    closes = df['Close'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+
+    atr = calculate_atr(df, 14)
+    if atr == 0: atr = float(df['Close'].mean()) * 0.001
+
+    swing_order = adaptive_swing_order(df, atr)
+    min_prominence = atr * 0.3
+
+    raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
+    raw_lows_idx  = argrelextrema(lows,  np.less,    order=swing_order)[0]
+
+    filtered_highs = []
+    for idx in raw_highs_idx:
+        if idx > swing_order and idx < len(highs) - swing_order:
+            neigh_min = min(np.min(highs[idx-swing_order:idx]), np.min(highs[idx+1:idx+swing_order+1]))
+            if highs[idx] - neigh_min >= min_prominence:
+                filtered_highs.append(idx)
+
+    filtered_lows = []
+    for idx in raw_lows_idx:
+        if idx > swing_order and idx < len(lows) - swing_order:
+            neigh_max = max(np.max(lows[idx-swing_order:idx]), np.max(lows[idx+1:idx+swing_order+1]))
+            if neigh_max - lows[idx] >= min_prominence:
+                filtered_lows.append(idx)
+
+    raw_highs = np.array(filtered_highs)
+    raw_lows  = np.array(filtered_lows)
+
+    logger.info(f"Core MMM swings: order={swing_order}, prominence={min_prominence:.5f}")
+    logger.info(f"Detected swing highs: {raw_highs.tolist()}")
+    logger.info(f"Detected swing lows : {raw_lows.tolist()}")
+
+    ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
+    ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
+    ema_50_array   = ema_50_series.values
+    ema_200_array  = ema_200_series.values
+
+    is_bullish = ema_50_array[-1] > ema_200_array[-1]
+    cross_idx = 0
+    for i in range(len(closes) - 2, 0, -1):
+        if is_bullish and ema_50_array[i] <= ema_200_array[i]:
+            cross_idx = i
+            break
+        elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
+            cross_idx = i
+            break
+
+    search_start = max(0, cross_idx - 150)
+    search_end   = min(len(closes), cross_idx + 50)
+
+    if is_bullish:
+        use_bearish  = False
+        best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
+    else:
+        use_bearish   = True
+        best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
+
+    if use_bearish:
+        cycle        = "BEARISH CYCLE (Peak M)"
+        anchor_idx   = best_high_idx
+        anchor_price = float(highs[anchor_idx])
+        pattern_name = "Peak Formation High (M)"
+        anchor_color = "rgba(255, 59, 59, 1)"
+    else:
+        cycle        = "BULLISH CYCLE (Peak W)"
+        anchor_idx   = best_low_idx
+        anchor_price = float(lows[anchor_idx])
+        pattern_name = "Peak Formation Low (W)"
+        anchor_color = "rgba(59, 255, 130, 1)"
+
+    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
+    if consolidation_boxes:
+        consolidation_boxes = consolidation_boxes[-2:]
+    total_boxes = len(consolidation_boxes)
+    in_pullback = False
+
+    if total_boxes == 0:
+        display_level = 1
+        phase_str = "LEVEL 1 (Initial Breakaway - No Trade Zone)"
+    else:
+        last_box     = consolidation_boxes[-1]
+        breakout_dir = last_box.get('breakout_dir', 'none')
+
+        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
+            in_pullback   = True
+            target_lvl    = total_boxes + 1
+            phase_str     = f"PULLBACK (Prep for Level {target_lvl} Trade)"
+            display_level = total_boxes
+        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
+             (cycle.startswith("BULLISH") and breakout_dir == "down"):
+            in_pullback   = False
+            display_level = total_boxes
+            phase_str     = "CYCLE FAILED (Reversal Detected)"
+        else:
+            in_pullback = False
+            if total_boxes == 2:
+                display_level = 3
+                phase_str     = "LEVEL 3 EXHAUSTION (Blowoff Active)"
+            else:
+                display_level = total_boxes + 1
+                phase_str     = f"LEVEL {display_level} (Pushing Active)"
+
+    all_lines = [{
+        "level":      anchor_price,
+        "start_time": int(dates[anchor_idx]),
+        "end_time":   int(dates[-1]),
+        "type":       pattern_name,
+        "color":      anchor_color,
+        "is_choch":   False
+    }]
+
+    return {
+        "cycle":               cycle,
+        "level":               display_level,
+        "phase_str":           phase_str,
+        "in_pullback":         in_pullback,
+        "lines":               all_lines,
+        "anchor":              anchor_price,
+        "anchor_idx":          int(anchor_idx),
+        "atr":                 atr,
+        "sweeps":              sweeps,
+        "consolidation_boxes": consolidation_boxes
+    }
+
+
+def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False) -> int:
+    if "FAILED" in phase_str: return 0
+    if not in_pullback: return 0
+
+    score = 0
+    if htf_aligned: score += 20
+    if level in [1, 2]: score += 15
+    elif level >= 3: score -= 10
+    dist = abs(current_price - ema_50)
+    if dist <= atr * 0.5: score += 15
+    elif dist <= atr * 1.0: score += 8
+    if ob_present: score += 15
+    if fvg_present: score += 10
+    if sweep_nearby: score += 10
+    if session_aligned: score += 5
+    if cycle.startswith("BULLISH") and rsi < 50: score += 5
+    elif cycle.startswith("BEARISH") and rsi > 50: score += 5
+    return min(max(score, 0), 99)
+
+
+def calculate_trade_levels(current_price: float, signal: str,
+                            atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
+    try:
+        entry = current_price
+        if signal == "BUY":
+            stop_loss   = min(entry - (atr * 1.5), ema_50 - (atr * 0.5))
+            risk        = abs(entry - stop_loss)
+            take_profit = entry + (risk * 2.0)
+        elif signal == "SELL":
+            stop_loss   = max(entry + (atr * 1.5), ema_50 + (atr * 0.5))
+            risk        = abs(entry - stop_loss)
+            take_profit = entry - (risk * 2.0)
+        else:
+            return None
+        risk = abs(entry - stop_loss)
+        if risk == 0: return None
+        rr = round(abs(take_profit - entry) / risk, 2)
+        return {
+            "entry":       round(entry, decimals),
+            "stop_loss":   round(stop_loss, decimals),
+            "take_profit": round(take_profit, decimals),
+            "risk_reward": rr
+        }
+    except Exception as e:
+        logger.error(f"Trade level calc error: {e}")
+        return None
 # ─────────────────────────────────────────────────────────────────────────────
 # API ENDPOINT (unchanged except using improved functions)
 # ─────────────────────────────────────────────────────────────────────────────
