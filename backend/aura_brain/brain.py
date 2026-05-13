@@ -448,8 +448,10 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     # Start searching from anchor point
     search_start = anchor_idx
     
-    for start in range(search_start, len(closes) - min_candles * 3):
+    start = search_start
+    while start < len(closes) - min_candles * 3:
         
+        # ─── PHASE 1: Find Accumulation...
         # ─── PHASE 1: Find Accumulation (tight consolidation) ───
         acc_high = highs[start]
         acc_low  = lows[start]
@@ -510,7 +512,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
         
         for i in range(manip_idx + 1, min(manip_idx + 15, len(closes))):
             candle_range = highs[i] - lows[i]
-            candle_body  = abs(closes[i] - opens[i]) if 'Open' not in df.columns else abs(closes[i] - df['Open'].values[i])
             
             # Use close-open as body approximation if Open not available
             if 'Open' in df.columns:
@@ -568,6 +569,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
         boxes.append({
             "time":                 int(dates[start]),
             "end_time":             int(dates[distrib_idx]),
+            "pullback_zone_end_time": int(dates[min(distrib_idx + 30, len(dates) - 1)]),
             "top":                  float(acc_high),
             "bottom":               float(manip_low if cycle.startswith("BULLISH") else acc_low),
             "type":                 box_type,
@@ -583,12 +585,14 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
         })
         
         # Move search start past this pattern to find next one
-        search_start = distrib_idx + 1
-        start = distrib_idx
-        
-        # Max 2 patterns per cycle
+        # pattern found — jump past it
+        start = distrib_idx + 1
         if len(boxes) >= 2:
             break
+        continue
+
+    # fallthrough — no pattern found at this candle, step forward
+    start += 1
     
     return boxes
 
@@ -644,8 +648,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             cross_idx = i
             break
 
-    search_start = max(0, cross_idx - 150)
-    search_end   = min(len(closes), cross_idx + 50)
+            search_start = max(0, len(closes) - 200)
+    search_end   = len(closes)
 
     if is_bullish:
         use_bearish  = False
