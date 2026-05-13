@@ -433,170 +433,189 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
+def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-    
+
     boxes = []
-    min_candles = 5      # minimum candles to form accumulation
-    max_candles = 60     # maximum candles to look for accumulation
-    atr_threshold = 3.5  # accumulation range must be tight — <= 3.5x ATR
-    displacement_ratio = 0.65  # displacement candle body/range ratio
-    
-    # Start searching from anchor point
-    search_start = anchor_idx
-    
-    start = search_start
-    while start < len(closes) - min_candles * 3:
-        
-        # ─── PHASE 1: Find Accumulation...
-        # ─── PHASE 1: Find Accumulation (tight consolidation) ───
-        acc_high = highs[start]
-        acc_low  = lows[start]
-        acc_end  = -1
-        
-        for i in range(start + 1, min(start + max_candles, len(closes))):
-            acc_high = max(acc_high, highs[i])
-            acc_low  = min(acc_low,  lows[i])
-            acc_range = acc_high - acc_low
-            
-            # Range must stay tight relative to ATR
-            if acc_range > atr * atr_threshold:
+
+    # Use the same adaptive swing detection already in analyze_market_structure
+    swing_order = adaptive_swing_order(df, atr)
+    min_prominence = atr * 0.3
+
+    raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
+    raw_lows_idx  = argrelextrema(lows,  np.less,    order=swing_order)[0]
+
+    # Filter by prominence — same logic as analyze_market_structure
+    swing_highs = []
+    for idx in raw_highs_idx:
+        if idx > swing_order and idx < len(highs) - swing_order:
+            neigh_min = min(np.min(highs[idx-swing_order:idx]), np.min(highs[idx+1:idx+swing_order+1]))
+            if highs[idx] - neigh_min >= min_prominence:
+                swing_highs.append(idx)
+
+    swing_lows = []
+    for idx in raw_lows_idx:
+        if idx > swing_order and idx < len(lows) - swing_order:
+            neigh_max = max(np.max(lows[idx-swing_order:idx]), np.max(lows[idx+1:idx+swing_order+1]))
+            if neigh_max - lows[idx] >= min_prominence:
+                swing_lows.append(idx)
+
+    swing_highs = np.array(swing_highs)
+    swing_lows  = np.array(swing_lows)
+
+    # Only look at pivots after anchor
+    swing_highs = swing_highs[swing_highs >= anchor_idx]
+    swing_lows  = swing_lows[swing_lows   >= anchor_idx]
+
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return []
+
+    if cycle.startswith("BEARISH"):
+        # Need at least: LS_high, LL_low, Head_high, RS_low, RS_high
+        for i in range(len(swing_highs) - 2):
+            ls_idx   = swing_highs[i]
+            ls_price = highs[ls_idx]
+
+            # Find LL_low between ls_idx and next high
+            lows_between = swing_lows[(swing_lows > ls_idx)]
+            if len(lows_between) == 0:
+                continue
+            ll_idx   = lows_between[0]
+            ll_price = lows[ll_idx]
+
+            # Find Head — higher high after LL
+            highs_after_ll = swing_highs[(swing_highs > ll_idx)]
+            if len(highs_after_ll) == 0:
+                continue
+            head_idx   = highs_after_ll[0]
+            head_price = highs[head_idx]
+
+            # Head must be higher than LS
+            if head_price <= ls_price:
+                continue
+
+            # Find RS_low — swing low after head that goes LOWER than LL
+            lows_after_head = swing_lows[(swing_lows > head_idx)]
+            if len(lows_after_head) == 0:
+                continue
+            rs_low_idx   = lows_after_head[0]
+            rs_low_price = lows[rs_low_idx]
+
+            # RS low must break below LL (structure break)
+            if rs_low_price >= ll_price:
+                continue
+
+            # Find RS_high — swing high after RS_low that is LOWER than Head
+            highs_after_rs_low = swing_highs[(swing_highs > rs_low_idx)]
+            if len(highs_after_rs_low) == 0:
+                continue
+            rs_high_idx   = highs_after_rs_low[0]
+            rs_high_price = highs[rs_high_idx]
+
+            # RS high must be lower than head (failed to reach head)
+            if rs_high_price >= head_price:
+                continue
+
+            # Valid Bearish QM found
+            entry_zone_top    = float(rs_high_price + atr * 0.2)
+            entry_zone_bottom = float(rs_low_price)
+            sl_price          = float(head_price + atr * 0.5)
+            tp_price          = float(ll_price)
+
+            boxes.append({
+                "time":                   int(dates[ls_idx]),
+                "end_time":               int(dates[rs_high_idx]),
+                "pullback_zone_end_time": int(dates[min(rs_high_idx + 30, len(dates) - 1)]),
+                "top":                    float(head_price),
+                "bottom":                 float(rs_low_price),
+                "type":                   "BEAR_QM",
+                "label":                  f"QM Bear (RS @ {rs_high_price:.5f})",
+                "breakout_dir":           "down",
+                "pullback_zone_top":      entry_zone_top,
+                "pullback_zone_bottom":   entry_zone_bottom,
+                "pullback_label":         "QM Right Shoulder Zone",
+                "sl_price":               sl_price,
+                "tp_price":               tp_price,
+                "head_price":             float(head_price),
+                "rs_high_price":          float(rs_high_price),
+                "rs_low_price":           float(rs_low_price),
+            })
+
+            if len(boxes) >= 2:
                 break
-            
-            # Need at least min_candles of consolidation
-            if i - start >= min_candles:
-                acc_end = i
-        
-        if acc_end == -1:
-            start += 1
-            continue
-        
-        acc_range  = acc_high - acc_low
-        acc_mid    = (acc_high + acc_low) / 2
-        
-        # ─── PHASE 2: Find Manipulation (sweep beyond accumulation) ───
-        manip_found = False
-        manip_idx   = -1
-        manip_low   = acc_low
-        manip_high  = acc_high
-        sweep_type  = None
-        
-        for i in range(acc_end + 1, min(acc_end + 20, len(closes))):
-            if cycle.startswith("BULLISH"):
-                # SSL sweep — price dips below accumulation low
-                if lows[i] < acc_low - (atr * 0.1):
-                    manip_found = True
-                    manip_idx   = i
-                    manip_low   = lows[i]
-                    sweep_type  = "SSL_SWEEP"
-                    break
-            else:
-                # BSL sweep — price spikes above accumulation high
-                if highs[i] > acc_high + (atr * 0.1):
-                    manip_found = True
-                    manip_idx   = i
-                    manip_high  = highs[i]
-                    sweep_type  = "BSL_SWEEP"
-                    break
-        
-        if not manip_found:
-            start += 1
-            continue
-        
-        # ─── PHASE 3: Find Distribution (displacement candle reversing back) ───
-        distrib_found = False
-        distrib_idx   = -1
-        fvg_top       = None
-        fvg_bottom    = None
-        
-        for i in range(manip_idx + 1, min(manip_idx + 15, len(closes))):
-            candle_range = highs[i] - lows[i]
-            
-            # Use close-open as body approximation if Open not available
-            if 'Open' in df.columns:
-                candle_body = abs(closes[i] - df['Open'].values[i])
-            else:
-                candle_body = abs(closes[i] - closes[i-1])
-            
-            body_ratio = candle_body / candle_range if candle_range > 0 else 0
-            
-            if cycle.startswith("BULLISH"):
-                # Bullish displacement — strong candle closing above accumulation mid
-                is_bullish_candle = closes[i] > closes[i-1]
-                strong_move = candle_range >= atr * 0.8
-                closes_above_mid = closes[i] > acc_mid
-                
-                if is_bullish_candle and strong_move and closes_above_mid and body_ratio >= displacement_ratio:
-                    distrib_found = True
-                    distrib_idx   = i
-                    # FVG = gap between candle i-1 high and candle i+1 low (if exists)
-                    if i + 1 < len(lows):
-                        fvg_top    = lows[i+1] if lows[i+1] > highs[i-1] else highs[i-1]
-                        fvg_bottom = highs[i-1]
-                    break
-            else:
-                # Bearish displacement — strong candle closing below accumulation mid
-                is_bearish_candle = closes[i] < closes[i-1]
-                strong_move = candle_range >= atr * 0.8
-                closes_below_mid = closes[i] < acc_mid
-                
-                if is_bearish_candle and strong_move and closes_below_mid and body_ratio >= displacement_ratio:
-                    distrib_found = True
-                    distrib_idx   = i
-                    if i + 1 < len(highs):
-                        fvg_top    = lows[i-1]
-                        fvg_bottom = highs[i+1] if highs[i+1] < lows[i-1] else lows[i-1]
-                    break
-        
-        if not distrib_found:
-            start += 1
-            continue
-        
-        # ─── Valid MMM Pattern Found ───
-        # Entry zone = FVG created during displacement, or 50 EMA ± 0.5 ATR
-        if fvg_top and fvg_bottom and fvg_top > fvg_bottom:
-            entry_zone_top    = float(fvg_top)
-            entry_zone_bottom = float(fvg_bottom)
-            entry_label = "FVG Entry Zone"
-        else:
-            entry_zone_top    = float(ema_50[distrib_idx] + atr * 0.5)
-            entry_zone_bottom = float(ema_50[distrib_idx] - atr * 0.5)
-            entry_label = "EMA Entry Zone"
-        
-        box_type = "BULL_CONS" if cycle.startswith("BULLISH") else "BEAR_CONS"
-        box_num  = len(boxes) + 1
-        
-        boxes.append({
-            "time":                 int(dates[start]),
-            "end_time":             int(dates[distrib_idx]),
-            "pullback_zone_end_time": int(dates[min(distrib_idx + 30, len(dates) - 1)]),
-            "top":                  float(acc_high),
-            "bottom":               float(manip_low if cycle.startswith("BULLISH") else acc_low),
-            "type":                 box_type,
-            "label":                f"MMM L{box_num} ({sweep_type})",
-            "breakout_dir":         "up" if cycle.startswith("BULLISH") else "down",
-            "pullback_zone_top":    entry_zone_top,
-            "pullback_zone_bottom": entry_zone_bottom,
-            "pullback_label":       entry_label,
-            "acc_high":             float(acc_high),
-            "acc_low":              float(acc_low),
-            "manip_low":            float(manip_low),
-            "manip_high":           float(manip_high),
-        })
-        
-        # Move search start past this pattern to find next one
-        # pattern found — jump past it
-        start = distrib_idx + 1
-        if len(boxes) >= 2:
-            break
-        continue
 
-    # fallthrough — no pattern found at this candle, step forward
+    else:  # BULLISH
+        for i in range(len(swing_lows) - 2):
+            ls_idx   = swing_lows[i]
+            ls_price = lows[ls_idx]
+
+            highs_between = swing_highs[(swing_highs > ls_idx)]
+            if len(highs_between) == 0:
+                continue
+            hh_idx   = highs_between[0]
+            hh_price = highs[hh_idx]
+
+            lows_after_hh = swing_lows[(swing_lows > hh_idx)]
+            if len(lows_after_hh) == 0:
+                continue
+            head_idx   = lows_after_hh[0]
+            head_price = lows[head_idx]
+
+            # Head must be lower than LS
+            if head_price >= ls_price:
+                continue
+
+            highs_after_head = swing_highs[(swing_highs > head_idx)]
+            if len(highs_after_head) == 0:
+                continue
+            rs_high_idx   = highs_after_head[0]
+            rs_high_price = highs[rs_high_idx]
+
+            # RS high must break above HH (structure break up)
+            if rs_high_price <= hh_price:
+                continue
+
+            lows_after_rs_high = swing_lows[(swing_lows > rs_high_idx)]
+            if len(lows_after_rs_high) == 0:
+                continue
+            rs_low_idx   = lows_after_rs_high[0]
+            rs_low_price = lows[rs_low_idx]
+
+            # RS low must be higher than head (failed to reach head)
+            if rs_low_price <= head_price:
+                continue
+
+            entry_zone_top    = float(rs_high_price)
+            entry_zone_bottom = float(rs_low_price - atr * 0.2)
+            sl_price          = float(head_price - atr * 0.5)
+            tp_price          = float(hh_price)
+
+            boxes.append({
+                "time":                   int(dates[ls_idx]),
+                "end_time":               int(dates[rs_low_idx]),
+                "pullback_zone_end_time": int(dates[min(rs_low_idx + 30, len(dates) - 1)]),
+                "top":                    float(rs_high_price),
+                "bottom":                 float(head_price),
+                "type":                   "BULL_QM",
+                "label":                  f"QM Bull (RS @ {rs_low_price:.5f})",
+                "breakout_dir":           "up",
+                "pullback_zone_top":      entry_zone_top,
+                "pullback_zone_bottom":   entry_zone_bottom,
+                "pullback_label":         "QM Right Shoulder Zone",
+                "sl_price":               sl_price,
+                "tp_price":               tp_price,
+                "head_price":             float(head_price),
+                "rs_high_price":          float(rs_high_price),
+                "rs_low_price":           float(rs_low_price),
+            })
+
+            if len(boxes) >= 2:
+                break
+
     return boxes
-
 
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
@@ -649,7 +668,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
             cross_idx = i
             break
-            
+
     search_start = max(0, len(closes) - 200)
     search_end   = len(closes)
 
@@ -674,7 +693,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
+    consolidation_boxes = detect_quasimodo(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
     if consolidation_boxes:
         consolidation_boxes = consolidation_boxes[-2:]
     total_boxes = len(consolidation_boxes)
@@ -687,7 +706,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         last_box     = consolidation_boxes[-1]
         breakout_dir = last_box.get('breakout_dir', 'none')
 
-        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
+        if breakout_dir == 'none' or (len(closes) - 1 - np.searchsorted(dates, last_box['end_time'])) <= 30:
             in_pullback   = True
             target_lvl    = total_boxes + 1
             phase_str     = f"PULLBACK (Prep for Level {target_lvl} Trade)"
@@ -917,7 +936,7 @@ async def analyze(req: AnalysisRequest):
                 confidence = max(confidence - 20, 10)
                 reasoning.append(f"⚠️ CONFLICT: AlphaPeak suggests {alpha_signal}. Reducing confidence.")
 
-        if signal != "NEUTRAL" and ML_MODEL:
+        if signal != "NEUTRAL" and ML_MODEL and False:  # retrain needed for QM
             try:
                 features = pd.DataFrame([{
                     'type':          1 if signal == "BUY" else 0,
