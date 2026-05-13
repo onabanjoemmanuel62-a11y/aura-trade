@@ -943,7 +943,7 @@ async def analyze(req: AnalysisRequest):
                 }])
                 prob = ML_MODEL.predict_proba(features)[0][1]
                 ml_conf = int(prob * 100)
-                confidence = int((confidence + ml_conf) / 2)  
+                confidence = int((confidence * 0.7) + (ml_conf * 0.3))
                 reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
             except Exception as ml_e:
                 logger.warning(f"ML inference failed: {ml_e}")
