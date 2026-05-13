@@ -48,23 +48,52 @@ class BoxRenderer {
         if (height <= 0) return;
 
         // Fill Consolidation Box
-        ctx.fillStyle   = zone.fillColor;
+        ctx.fillStyle = zone.fillColor;
         ctx.fillRect(x1, yTop, width, height);
 
         // Border
-        ctx.strokeStyle  = zone.borderColor;
-        ctx.lineWidth    = 1.5 * hPR;
+        ctx.strokeStyle = zone.borderColor;
+        ctx.lineWidth   = 1.5 * hPR;
         ctx.setLineDash([]);
         ctx.strokeRect(x1, yTop, width, height);
 
-        // Level Labels
+        // Level Label
         if (zone.label) {
-          const fontSize   = Math.max(11, Math.min(14, height / vPR * 0.30)) * hPR;
-          const pad        = 6 * hPR;
-          ctx.font         = `bold ${fontSize}px monospace`;
-          ctx.fillStyle    = zone.borderColor;
+          const fontSize = Math.max(11, Math.min(14, height / vPR * 0.30)) * hPR;
+          const pad      = 6 * hPR;
+          ctx.font       = `bold ${fontSize}px monospace`;
+          ctx.fillStyle  = zone.borderColor;
           ctx.fillText(zone.label, x1 + pad, yTop + fontSize * 1.2);
         }
+
+        // Pullback entry zone — drawn to the right of the box
+        if (zone.pullbackTop !== null && zone.pullbackBottom !== null) {
+          const pyTop     = zone.pullbackTop * vPR;
+          const pyBottom  = zone.pullbackBottom * vPR;
+          const zoneX     = zone.x2 !== null ? zone.x2 * hPR : rightEdge;
+          const zoneWidth = rightEdge - zoneX;
+          if (zoneWidth > 0) {
+            ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.12)' : 'rgba(38,166,154,0.12)';
+            ctx.fillRect(zoneX, pyTop, zoneWidth, pyBottom - pyTop);
+            ctx.strokeStyle = zone.isBear ? 'rgba(239,83,80,0.6)' : 'rgba(38,166,154,0.6)';
+            ctx.lineWidth = 1 * hPR;
+            ctx.setLineDash([4 * hPR, 4 * hPR]);
+            ctx.beginPath();
+            ctx.moveTo(zoneX, pyTop);
+            ctx.lineTo(rightEdge, pyTop);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(zoneX, pyBottom);
+            ctx.lineTo(rightEdge, pyBottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            const lFontSize = 11 * hPR;
+            ctx.font      = `bold ${lFontSize}px monospace`;
+            ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.9)' : 'rgba(38,166,154,0.9)';
+            ctx.fillText(zone.pullbackLabel || 'ENTRY ZONE', zoneX + 6 * hPR, pyTop + lFontSize * 1.4);
+          }
+        }
+
       });
     });
   }
@@ -90,21 +119,27 @@ class BoxPrimitive {
         x1 = timeScale.timeToCoordinate(zone.time);
         if (zone.end_time) x2 = timeScale.timeToCoordinate(zone.end_time);
       } catch { return null; }
-      
+
       const yTop    = series.priceToCoordinate(zone.top);
       const yBottom = series.priceToCoordinate(zone.bottom);
       if (x1 === null || yTop === null || yBottom === null) return null;
-      
-      const isBear      = zone.type?.includes('BEAR');
-      
+
+      const isBear         = zone.type?.includes('BEAR');
+      const pullbackTop    = zone.pullback_zone_top    ? series.priceToCoordinate(zone.pullback_zone_top)    : null;
+      const pullbackBottom = zone.pullback_zone_bottom ? series.priceToCoordinate(zone.pullback_zone_bottom) : null;
+
       return {
-        x:          x1,
-        x2:         x2,
+        x:             x1,
+        x2:            x2,
         yTop,
         yBottom,
-        fillColor:   isBear ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)',
-        borderColor: isBear ? 'rgba(239,83,80,0.8)'  : 'rgba(38,166,154,0.8)',
-        label:       zone.label || 'CONSOLIDATION',
+        fillColor:     isBear ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)',
+        borderColor:   isBear ? 'rgba(239,83,80,0.8)'  : 'rgba(38,166,154,0.8)',
+        label:         zone.label || 'CONSOLIDATION',
+        isBear,
+        pullbackTop,
+        pullbackBottom,
+        pullbackLabel: zone.pullback_label || 'ENTRY ZONE',
       };
     }).filter(Boolean);
   }
@@ -500,9 +535,16 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   }, []);
 
   const handleTimeframeChange = (tf) => { setTimeframe(tf); timeframeRef.current = tf; };
-  const handleReset   = () => chartRef.current?.timeScale().scrollToPosition(0, false);
-  const handleZoomIn  = () => { const ts = chartRef.current?.timeScale(); if (ts) ts.applyOptions({ barSpacing: ts.options().barSpacing * 1.2 }); };
-  const handleZoomOut = () => { const ts = chartRef.current?.timeScale(); if (ts) ts.applyOptions({ barSpacing: ts.options().barSpacing * 0.8 }); };
+  const handleReset = () => {
+  const ts = chartRef.current?.timeScale();
+  if (!ts) return;
+  ts.fitContent();
+  setTimeout(() => {
+    ts.applyOptions({ rightOffset: 20, barSpacing: 12 });
+  }, 50);
+};
+  const handleZoomIn  = () => { const ts = chartRef.current?.timeScale(); if (ts) ts.applyOptions({ barSpacing: Math.min(ts.options().barSpacing * 1.15, 50) }); };
+  const handleZoomOut = () => { const ts = chartRef.current?.timeScale(); if (ts) ts.applyOptions({ barSpacing: Math.max(ts.options().barSpacing * 0.85, 3) }); };
   const handleScroll  = (dir) => { const ts = chartRef.current?.timeScale(); if (ts) ts.scrollToPosition(ts.scrollPosition() + (dir === 'left' ? 10 : -10), true); };
   const statusColor   = connectionStatus === 'Connected' ? '#089981' : '#F23645';
 

@@ -495,6 +495,8 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     break
 
             if breakout_idx - peak_idx >= min_box_length:
+                pullback_top    = float(ema_50[breakout_idx] + atr * 0.5)
+                pullback_bottom = float(ema_50[breakout_idx] - atr * 0.5)
                 boxes.append({
                     "time": int(dates[peak_idx]),
                     "end_time": int(dates[breakout_idx]),
@@ -502,8 +504,12 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     "bottom": float(box_bottom),
                     "type": "BULL_CONS",
                     "label": f"CONS {box_num} (Prep L{box_num + 1})",
-                    "breakout_dir": breakout_dir
+                    "breakout_dir": breakout_dir,
+                    "pullback_zone_top": pullback_top,
+                    "pullback_zone_bottom": pullback_bottom,
+                    "pullback_label": f"L{box_num + 1} Entry Zone"
                 })
+
                 if breakout_dir != "up": break 
                 current_idx = breakout_idx
             else:
@@ -560,16 +566,22 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     breakout_dir = "up"
                     break
 
-            if breakout_idx - trough_idx >= min_box_length:
+            if breakout_idx - peak_idx >= min_box_length:
+                pullback_top    = float(ema_50[breakout_idx] + atr * 0.5)
+                pullback_bottom = float(ema_50[breakout_idx] - atr * 0.5)
                 boxes.append({
-                    "time": int(dates[trough_idx]),
+                    "time": int(dates[peak_idx]),
                     "end_time": int(dates[breakout_idx]),
                     "top": float(box_top),
                     "bottom": float(box_bottom),
                     "type": "BEAR_CONS",
                     "label": f"CONS {box_num} (Prep L{box_num + 1})",
-                    "breakout_dir": breakout_dir
+                    "breakout_dir": breakout_dir,
+                    "pullback_zone_top": pullback_top,
+                    "pullback_zone_bottom": pullback_bottom,
+                    "pullback_label": f"L{box_num + 1} Entry Zone"
                 })
+
                 if breakout_dir != "down": break
                 current_idx = breakout_idx
             else:
@@ -937,34 +949,32 @@ async def analyze(req: AnalysisRequest):
                 logger.warning(f"ML inference failed: {ml_e}")
 
         trade_setup = None
-symbol_key = req.symbol
+        symbol_key = req.symbol
+        existing_lock = SIGNAL_LOCK.get(symbol_key)
+        if existing_lock:
+            sl_breached = (existing_lock['signal'] == 'BUY' and current_price < existing_lock['sl']) or \
+                          (existing_lock['signal'] == 'SELL' and current_price > existing_lock['sl'])
+            bias_flipped = existing_lock['signal'] == 'BUY' and not cycle.startswith('BULLISH') or \
+                           existing_lock['signal'] == 'SELL' and not cycle.startswith('BEARISH')
+            if sl_breached or bias_flipped:
+                del SIGNAL_LOCK[symbol_key]
+            else:
+                signal = existing_lock['signal']
+                confidence = existing_lock['confidence']
 
-# Check if there's an active lock for this symbol
-existing_lock = SIGNAL_LOCK.get(symbol_key)
-if existing_lock:
-    # Only release lock if SL breached or 4H bias flipped
-    sl_breached = (existing_lock['signal'] == 'BUY' and current_price < existing_lock['sl']) or \
-                  (existing_lock['signal'] == 'SELL' and current_price > existing_lock['sl'])
-    bias_flipped = existing_lock['signal'] == 'BUY' and not cycle.startswith('BULLISH') or \
-                   existing_lock['signal'] == 'SELL' and not cycle.startswith('BEARISH')
-    if sl_breached or bias_flipped:
-        del SIGNAL_LOCK[symbol_key]
-    else:
-        signal = existing_lock['signal']
-        confidence = existing_lock['confidence']
-
-if signal in ("BUY", "SELL") and confidence >= 65:
-    trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
-    if trade_setup and symbol_key not in SIGNAL_LOCK:
-        SIGNAL_LOCK[symbol_key] = {
-            'signal': signal,
-            'confidence': confidence,
-            'sl': trade_setup['stop_loss']
-        }
+        if signal in ("BUY", "SELL") and confidence >= 65:
+            trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
+            if trade_setup and symbol_key not in SIGNAL_LOCK:
+                SIGNAL_LOCK[symbol_key] = {
+                    'signal': signal,
+                    'confidence': confidence,
+                    'sl': trade_setup['stop_loss']
+                }
             if trade_setup:
                 reasoning.append(
                     f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"
                 )
+              
 
         return {
             "signal":     signal,

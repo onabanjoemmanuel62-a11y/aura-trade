@@ -232,7 +232,7 @@ function App() {
     {activeSessions.length > 0 && activeSessions.map(ses => (
       <div key={ses.name} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '4px 12px', borderRadius: 4, background: `${ses.color}15`, border: `1px solid ${ses.color}40` }}>
         <span style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>SESSION</span>
-        <span style={{ fontSize: 13, fontWeight: 700, color: ses.color, fontFamily: "'Space Mono', monospace" }}>{ses.name.split(' ')[0]}</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: ses.color, fontFamily: "'Space Mono', monospace" }}>{ses.abbr}</span>
       </div>
     ))}
   </div>
