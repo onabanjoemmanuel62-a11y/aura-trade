@@ -434,361 +434,163 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     return sweeps[-5:]
 
 def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
-    # ─────────────────────────────────────────────────────────────────────────────
-    # (unchanged from your original — keeping as is)
-    # ─────────────────────────────────────────────────────────────────────────────
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     
     boxes = []
-    min_box_length = 5
-    ema_proximity = atr * 1.0 
+    min_candles = 5      # minimum candles to form accumulation
+    max_candles = 60     # maximum candles to look for accumulation
+    atr_threshold = 3.5  # accumulation range must be tight — <= 3.5x ATR
+    displacement_ratio = 0.65  # displacement candle body/range ratio
     
-    if cycle.startswith("BULLISH"):
-        cross_idx = -1
-        for i in range(anchor_idx, len(closes)):
-            if ema_50[i] > ema_200[i] and closes[i] > ema_200[i]:
-                cross_idx = i
-                break
-                
-        if cross_idx == -1: return boxes 
-
-        current_idx = cross_idx 
-
-        for box_num in range(1, 3):
-            if current_idx >= len(closes) - min_box_length: break
-
-            peak_val = highs[current_idx]
-            peak_idx = current_idx
-            pullback_idx = -1
-
-            for i in range(current_idx, len(closes)):
-                if highs[i] > peak_val:
-                    peak_val = highs[i]
-                    peak_idx = i
-
-                if peak_val - lows[i] >= atr:
-                    if lows[i] <= ema_50[i] + ema_proximity:
-                        if closes[i] > ema_200[i] - (atr * 0.5):
-                            pullback_idx = i
-                            break
-
-            if pullback_idx == -1: break 
-
-            box_top = peak_val
-            box_bottom = lows[pullback_idx]
-            breakout_idx = len(closes) - 1
-            breakout_dir = "none"
-
-            for i in range(pullback_idx, len(closes)):
-                if lows[i] < box_bottom: box_bottom = lows[i]
-
-                if closes[i] > box_top:
-                    breakout_idx = i
-                    breakout_dir = "up"
-                    break
-                elif closes[i] < box_bottom - atr: 
-                    breakout_idx = i
-                    breakout_dir = "down"
-                    break
-
-            if breakout_idx - peak_idx >= min_box_length:
-                pullback_top    = float(ema_50[breakout_idx] + atr * 0.5)
-                pullback_bottom = float(ema_50[breakout_idx] - atr * 0.5)
-                boxes.append({
-                    "time": int(dates[peak_idx]),
-                    "end_time": int(dates[breakout_idx]),
-                    "top": float(box_top),
-                    "bottom": float(box_bottom),
-                    "type": "BULL_CONS",
-                    "label": f"CONS {box_num} (Prep L{box_num + 1})",
-                    "breakout_dir": breakout_dir,
-                    "pullback_zone_top": pullback_top,
-                    "pullback_zone_bottom": pullback_bottom,
-                    "pullback_label": f"L{box_num + 1} Entry Zone"
-                })
-
-                if breakout_dir != "up": break 
-                current_idx = breakout_idx
-            else:
-                if breakout_dir == "up":
-                    current_idx = breakout_idx
-                    continue
-                break
-
-    elif cycle.startswith("BEARISH"):
-        cross_idx = -1
-        for i in range(anchor_idx, len(closes)):
-            if ema_50[i] < ema_200[i] and closes[i] < ema_200[i]:
-                cross_idx = i
-                break
-                
-        if cross_idx == -1: return boxes 
-
-        current_idx = cross_idx
-
-        for box_num in range(1, 3):
-            if current_idx >= len(closes) - min_box_length: break
-
-            trough_val = lows[current_idx]
-            trough_idx = current_idx
-            pullback_idx = -1
-
-            for i in range(current_idx, len(closes)):
-                if lows[i] < trough_val:
-                    trough_val = lows[i]
-                    trough_idx = i
-
-                if highs[i] - trough_val >= atr:
-                    if highs[i] >= ema_50[i] - ema_proximity:
-                        if closes[i] < ema_200[i] + (atr * 0.5):
-                            pullback_idx = i
-                            break
-
-            if pullback_idx == -1: break
-
-            box_bottom = trough_val
-            box_top = highs[pullback_idx]
-            breakout_idx = len(closes) - 1
-            breakout_dir = "none"
-
-            for i in range(pullback_idx, len(closes)):
-                if highs[i] > box_top: box_top = highs[i]
-
-                if closes[i] < box_bottom:
-                    breakout_idx = i
-                    breakout_dir = "down"
-                    break
-                elif closes[i] > box_top + atr:
-                    breakout_idx = i
-                    breakout_dir = "up"
-                    break
-
-            if breakout_idx - trough_idx >= min_box_length:
-                pullback_top    = float(ema_50[breakout_idx] + atr * 0.5)
-                pullback_bottom = float(ema_50[breakout_idx] - atr * 0.5)
-                boxes.append({
-                    "time": int(dates[trough_idx]),
-                    "end_time": int(dates[breakout_idx]),
-                    "top": float(box_top),
-                    "bottom": float(box_bottom),
-                    "type": "BEAR_CONS",
-                    "label": f"CONS {box_num} (Prep L{box_num + 1})",
-                    "breakout_dir": breakout_dir,
-                    "pullback_zone_top": pullback_top,
-                    "pullback_zone_bottom": pullback_bottom,
-                    "pullback_label": f"L{box_num + 1} Entry Zone"
-                })
-
-                if breakout_dir != "down": break
-                current_idx = breakout_idx
-            else:
-                if breakout_dir == "down":
-                    current_idx = breakout_idx
-                    continue
-                break
-
-    return boxes
-
-def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    closes = df['Close'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    atr = calculate_atr(df, 14)
-    if atr == 0: atr = float(df['Close'].mean()) * 0.001
-
-    swing_order = adaptive_swing_order(df, atr)
-    min_prominence = atr * 0.3  # NEW: filter small swings
-
-    raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
-    raw_lows_idx  = argrelextrema(lows,  np.less,    order=swing_order)[0]
-
-    # Prominence filter for core swings
-    filtered_highs = []
-    for idx in raw_highs_idx:
-        if idx > swing_order and idx < len(highs) - swing_order:
-            neigh_min = min(np.min(highs[idx-swing_order:idx]), np.min(highs[idx+1:idx+swing_order+1]))
-            if highs[idx] - neigh_min >= min_prominence:
-                filtered_highs.append(idx)
-
-    filtered_lows = []
-    for idx in raw_lows_idx:
-        if idx > swing_order and idx < len(lows) - swing_order:
-            neigh_max = max(np.max(lows[idx-swing_order:idx]), np.max(lows[idx+1:idx+swing_order+1]))
-            if neigh_max - lows[idx] >= min_prominence:
-                filtered_lows.append(idx)
-
-    raw_highs = np.array(filtered_highs)
-    raw_lows  = np.array(filtered_lows)
-
-    # Debug log for core swings
-    logger.info(f"Core MMM swings: order={swing_order}, prominence={min_prominence:.5f}")
-    logger.info(f"Detected swing highs: {raw_highs.tolist()}")
-    logger.info(f"Detected swing lows : {raw_lows.tolist()}")
-
-    ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
-    ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
-    ema_50_array   = ema_50_series.values
-    ema_200_array  = ema_200_series.values
-
-    is_bullish = ema_50_array[-1] > ema_200_array[-1]
-    cross_idx = 0
-    for i in range(len(closes) - 2, 0, -1):
-        if is_bullish and ema_50_array[i] <= ema_200_array[i]:
-            cross_idx = i
-            break
-        elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
-            cross_idx = i
-            break
-
-    search_start = max(0, cross_idx - 150)
-    search_end   = min(len(closes), cross_idx + 50)
-
-    if is_bullish:
-        use_bearish = False
-        best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
-    else:
-        use_bearish = True
-        best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
-
-    current_price   = float(closes[-1])
-    current_ema_200 = float(ema_200_series.iloc[-1])
-    current_ema_50  = float(ema_50_series.iloc[-1])
-
-    if use_bearish:
-        cycle        = "BEARISH CYCLE (Peak M)"
-        anchor_idx   = best_high_idx
-        anchor_price = float(highs[anchor_idx])
-        pattern_name = "Peak Formation High (M)"
-        anchor_color = "rgba(255, 59, 59, 1)"
-    else:
-        cycle        = "BULLISH CYCLE (Peak W)"
-        anchor_idx   = best_low_idx
-        anchor_price = float(lows[anchor_idx])
-        pattern_name = "Peak Formation Low (W)"
-        anchor_color = "rgba(59, 255, 130, 1)"
-    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
-    if consolidation_boxes:
-        consolidation_boxes = consolidation_boxes[-2:]
-    total_boxes = len(consolidation_boxes)
-    in_pullback = False
+    # Start searching from anchor point
+    search_start = anchor_idx
     
-    if total_boxes == 0:
-        display_level = 1
-        phase_str = "LEVEL 1 (Initial Breakaway - No Trade Zone)"
-    else:
-        last_box = consolidation_boxes[-1]
-        breakout_dir = last_box.get('breakout_dir', 'none')
+    for start in range(search_start, len(closes) - min_candles * 3):
         
-        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
-            in_pullback = True
-            target_lvl = total_boxes + 1
-            phase_str = f"PULLBACK (Prep for Level {target_lvl} Trade)"
-            display_level = total_boxes
-        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
-             (cycle.startswith("BULLISH") and breakout_dir == "down"):
-            in_pullback = False
-            display_level = total_boxes
-            phase_str = "CYCLE FAILED (Reversal Detected)"
-        else:
-            in_pullback = False
-            if total_boxes == 2:
-                display_level = 3
-                phase_str = "LEVEL 3 EXHAUSTION (Blowoff Active)"
+        # ─── PHASE 1: Find Accumulation (tight consolidation) ───
+        acc_high = highs[start]
+        acc_low  = lows[start]
+        acc_end  = -1
+        
+        for i in range(start + 1, min(start + max_candles, len(closes))):
+            acc_high = max(acc_high, highs[i])
+            acc_low  = min(acc_low,  lows[i])
+            acc_range = acc_high - acc_low
+            
+            # Range must stay tight relative to ATR
+            if acc_range > atr * atr_threshold:
+                break
+            
+            # Need at least min_candles of consolidation
+            if i - start >= min_candles:
+                acc_end = i
+        
+        if acc_end == -1:
+            continue
+        
+        acc_range  = acc_high - acc_low
+        acc_mid    = (acc_high + acc_low) / 2
+        
+        # ─── PHASE 2: Find Manipulation (sweep beyond accumulation) ───
+        manip_found = False
+        manip_idx   = -1
+        manip_low   = acc_low
+        manip_high  = acc_high
+        sweep_type  = None
+        
+        for i in range(acc_end + 1, min(acc_end + 20, len(closes))):
+            if cycle.startswith("BULLISH"):
+                # SSL sweep — price dips below accumulation low
+                if lows[i] < acc_low - (atr * 0.1):
+                    manip_found = True
+                    manip_idx   = i
+                    manip_low   = lows[i]
+                    sweep_type  = "SSL_SWEEP"
+                    break
             else:
-                display_level = total_boxes + 1
-                phase_str = f"LEVEL {display_level} (Pushing Active)"
-
-    all_lines = [{
-        "level": anchor_price,
-        "start_time": int(dates[anchor_idx]),
-        "end_time": int(dates[-1]),
-        "type": pattern_name,
-        "color": anchor_color,
-        "is_choch": False
-    }]
-
-    return {
-        "cycle":           cycle,
-        "level":           display_level,  
-        "phase_str":       phase_str,
-        "in_pullback":     in_pullback,
-        "lines":           all_lines,
-        "anchor":          anchor_price,
-        "anchor_idx":      int(anchor_idx),
-        "atr":             atr,
-        "sweeps":          sweeps,
-        "consolidation_boxes": consolidation_boxes
-    }
-
-def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False) -> int:
-    if "FAILED" in phase_str: return 0
-    if not in_pullback: return 0  # never score outside pullback phase
-
-    score = 0
-
-    # Layer 1 — HTF bias (20pts)
-    if htf_aligned: score += 20
-
-    # Layer 2 — MMM phase (15pts)
-    if level in [1, 2]: score += 15
-    elif level >= 3: score -= 10
-
-    # Layer 3 — Price at liquidity zone (15pts)
-    dist = abs(current_price - ema_50)
-    if dist <= atr * 0.5: score += 15
-    elif dist <= atr * 1.0: score += 8
-
-    # Layer 4 — ICT triggers (25pts)
-    if ob_present: score += 15
-    if fvg_present: score += 10
-
-    # Layer 5 — Liquidity sweep nearby (10pts)
-    if sweep_nearby: score += 10
-
-    # Layer 6 — Session timing (5pts)
-    if session_aligned: score += 5
-
-    # RSI confirmation
-    if cycle.startswith("BULLISH") and rsi < 50: score += 5
-    elif cycle.startswith("BEARISH") and rsi > 50: score += 5
-
-    return min(max(score, 0), 99)
-
-def calculate_trade_levels(current_price: float, signal: str,
-                            atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
-    try:
-        entry = current_price
-        if signal == "BUY":
-            stop_loss = min(entry - (atr * 1.5), ema_50 - (atr * 0.5))
-            risk = abs(entry - stop_loss)
-            take_profit = entry + (risk * 2.0)
-        elif signal == "SELL":
-            stop_loss = max(entry + (atr * 1.5), ema_50 + (atr * 0.5))
-            risk = abs(entry - stop_loss)
-            take_profit = entry - (risk * 2.0)
+                # BSL sweep — price spikes above accumulation high
+                if highs[i] > acc_high + (atr * 0.1):
+                    manip_found = True
+                    manip_idx   = i
+                    manip_high  = highs[i]
+                    sweep_type  = "BSL_SWEEP"
+                    break
+        
+        if not manip_found:
+            continue
+        
+        # ─── PHASE 3: Find Distribution (displacement candle reversing back) ───
+        distrib_found = False
+        distrib_idx   = -1
+        fvg_top       = None
+        fvg_bottom    = None
+        
+        for i in range(manip_idx + 1, min(manip_idx + 15, len(closes))):
+            candle_range = highs[i] - lows[i]
+            candle_body  = abs(closes[i] - opens[i]) if 'Open' not in df.columns else abs(closes[i] - df['Open'].values[i])
+            
+            # Use close-open as body approximation if Open not available
+            if 'Open' in df.columns:
+                candle_body = abs(closes[i] - df['Open'].values[i])
+            else:
+                candle_body = abs(closes[i] - closes[i-1])
+            
+            body_ratio = candle_body / candle_range if candle_range > 0 else 0
+            
+            if cycle.startswith("BULLISH"):
+                # Bullish displacement — strong candle closing above accumulation mid
+                is_bullish_candle = closes[i] > closes[i-1]
+                strong_move = candle_range >= atr * 0.8
+                closes_above_mid = closes[i] > acc_mid
+                
+                if is_bullish_candle and strong_move and closes_above_mid and body_ratio >= displacement_ratio:
+                    distrib_found = True
+                    distrib_idx   = i
+                    # FVG = gap between candle i-1 high and candle i+1 low (if exists)
+                    if i + 1 < len(lows):
+                        fvg_top    = lows[i+1] if lows[i+1] > highs[i-1] else highs[i-1]
+                        fvg_bottom = highs[i-1]
+                    break
+            else:
+                # Bearish displacement — strong candle closing below accumulation mid
+                is_bearish_candle = closes[i] < closes[i-1]
+                strong_move = candle_range >= atr * 0.8
+                closes_below_mid = closes[i] < acc_mid
+                
+                if is_bearish_candle and strong_move and closes_below_mid and body_ratio >= displacement_ratio:
+                    distrib_found = True
+                    distrib_idx   = i
+                    if i + 1 < len(highs):
+                        fvg_top    = lows[i-1]
+                        fvg_bottom = highs[i+1] if highs[i+1] < lows[i-1] else lows[i-1]
+                    break
+        
+        if not distrib_found:
+            continue
+        
+        # ─── Valid MMM Pattern Found ───
+        # Entry zone = FVG created during displacement, or 50 EMA ± 0.5 ATR
+        if fvg_top and fvg_bottom and fvg_top > fvg_bottom:
+            entry_zone_top    = float(fvg_top)
+            entry_zone_bottom = float(fvg_bottom)
+            entry_label = "FVG Entry Zone"
         else:
-            return None
-
-        risk = abs(entry - stop_loss)
-        if risk == 0: return None
-        rr = round(abs(take_profit - entry) / risk, 2)
-
-        return {
-            "entry":       round(entry, decimals),
-            "stop_loss":   round(stop_loss, decimals),
-            "take_profit": round(take_profit, decimals),
-            "risk_reward": rr
-        }
-    except Exception as e:
-        logger.error(f"Trade level calc error: {e}")
-        return None
-
+            entry_zone_top    = float(ema_50[distrib_idx] + atr * 0.5)
+            entry_zone_bottom = float(ema_50[distrib_idx] - atr * 0.5)
+            entry_label = "EMA Entry Zone"
+        
+        box_type = "BULL_CONS" if cycle.startswith("BULLISH") else "BEAR_CONS"
+        box_num  = len(boxes) + 1
+        
+        boxes.append({
+            "time":                 int(dates[start]),
+            "end_time":             int(dates[distrib_idx]),
+            "top":                  float(acc_high),
+            "bottom":               float(manip_low if cycle.startswith("BULLISH") else acc_low),
+            "type":                 box_type,
+            "label":                f"MMM L{box_num} ({sweep_type})",
+            "breakout_dir":         "up" if cycle.startswith("BULLISH") else "down",
+            "pullback_zone_top":    entry_zone_top,
+            "pullback_zone_bottom": entry_zone_bottom,
+            "pullback_label":       entry_label,
+            "acc_high":             float(acc_high),
+            "acc_low":              float(acc_low),
+            "manip_low":            float(manip_low),
+            "manip_high":           float(manip_high),
+        })
+        
+        # Move search start past this pattern to find next one
+        search_start = distrib_idx + 1
+        start = distrib_idx
+        
+        # Max 2 patterns per cycle
+        if len(boxes) >= 2:
+            break
+    
+    return boxes
 # ─────────────────────────────────────────────────────────────────────────────
 # API ENDPOINT (unchanged except using improved functions)
 # ─────────────────────────────────────────────────────────────────────────────
