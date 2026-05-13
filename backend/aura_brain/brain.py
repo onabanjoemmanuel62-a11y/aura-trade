@@ -510,6 +510,8 @@ def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, 
             # RS low must break below LL (structure break)
             if rs_low_price >= ll_price:
                 continue
+            if rs_low_idx - ls_idx > 300:
+                continue
 
             # Find RS_high — swing high after RS_low that is LOWER than Head
             highs_after_rs_low = swing_highs[(swing_highs > rs_low_idx)]
@@ -521,6 +523,8 @@ def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, 
             # RS high must be lower than head (failed to reach head)
             if rs_high_price >= head_price:
                 continue
+            if rs_high_idx - ls_idx > 300:
+                continue
 
             # Valid Bearish QM found
             entry_zone_top    = float(rs_high_price + atr * 0.2)
@@ -531,7 +535,7 @@ def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, 
             boxes.append({
                 "time":                   int(dates[ls_idx]),
                 "end_time":               int(dates[rs_high_idx]),
-                "pullback_zone_end_time": int(dates[min(rs_high_idx + 30, len(dates) - 1)]),
+                "pullback_zone_end_time": int(dates[min(rs_high_idx + 50, len(dates) - 1)]),
                 "top":                    float(head_price),
                 "bottom":                 float(rs_low_price),
                 "type":                   "BEAR_QM",
