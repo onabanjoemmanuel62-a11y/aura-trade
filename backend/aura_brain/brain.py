@@ -949,7 +949,7 @@ async def analyze(req: AnalysisRequest):
                 logger.warning(f"ML inference failed: {ml_e}")
 
         trade_setup = None
-        symbol_key = req.symbol
+        symbol_key = req.currency
         existing_lock = SIGNAL_LOCK.get(symbol_key)
         if existing_lock:
             sl_breached = (existing_lock['signal'] == 'BUY' and current_price < existing_lock['sl']) or \

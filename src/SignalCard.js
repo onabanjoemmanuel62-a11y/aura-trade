@@ -4,9 +4,9 @@ import axios from 'axios';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-const ENTRY_THRESHOLD = 70;
-const EXIT_THRESHOLD  = 55;
-const FLIP_THRESHOLD  = 80;
+const ENTRY_THRESHOLD = 65;
+const EXIT_THRESHOLD  = 50;
+const FLIP_THRESHOLD  = 75;
 const LOCK_EXPIRY_HOURS = 4;
 
 // ── Session detection (UTC) ──
@@ -149,12 +149,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const riskAmount = ((balance * riskPct) / 100).toFixed(2);
 
   // MTF confluence mock (replace with real API data when available)
-  const mtfData = analysis?.mtf_confluence || [
-    { tf: 'M15', bias: analysis?.signal || 'NEUTRAL', strength: displayState.confidence },
-    { tf: 'H1',  bias: analysis?.signal || 'NEUTRAL', strength: Math.min(100, displayState.confidence + 5) },
-    { tf: 'H4',  bias: 'NEUTRAL', strength: 45 },
-    { tf: 'D1',  bias: 'NEUTRAL', strength: 38 },
-  ];
+  const mtfData = analysis?.mtf_confluence || [];
 
   const tabBtnStyle = (id) => ({
     flex: 1, padding: '7px 4px', background: activeTab === id ? 'rgba(240,180,41,0.1)' : 'transparent',
