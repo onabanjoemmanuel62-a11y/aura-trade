@@ -70,10 +70,10 @@ class BoxRenderer {
         if (zone.pullbackTop !== null && zone.pullbackBottom !== null) {
           const pyTop     = zone.pullbackTop * vPR;
           const pyBottom  = zone.pullbackBottom * vPR;
-          const zoneX     = zone.x2 !== null ? zone.x2 * hPR : rightEdge;
+          const zoneX    = zone.x2 !== null ? zone.x2 * hPR : rightEdge;
           // Only extend 30 candle-widths forward, not to infinity
-          const candleWidth = 12 * hPR;
-          const zoneWidth = Math.min(rightEdge - zoneX, candleWidth * 30);
+          const zoneEnd  = zone.x3 !== null ? Math.min(zone.x3 * hPR, rightEdge) : Math.min(zoneX + 200 * hPR, rightEdge);
+          const zoneWidth = zoneEnd - zoneX;
           
           if (zoneWidth > 0) {
             ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.12)' : 'rgba(38,166,154,0.12)';
@@ -83,11 +83,11 @@ class BoxRenderer {
             ctx.setLineDash([4 * hPR, 4 * hPR]);
             ctx.beginPath();
             ctx.moveTo(zoneX, pyTop);
-            ctx.lineTo(rightEdge, pyTop);
+            ctx.lineTo(zoneEnd, pyTop);
             ctx.stroke();
             ctx.beginPath();
             ctx.moveTo(zoneX, pyBottom);
-            ctx.lineTo(rightEdge, pyBottom);
+            ctx.lineTo(zoneEnd, pyBottom);
             ctx.stroke();
             ctx.setLineDash([]);
             const lFontSize = 11 * hPR;
@@ -128,12 +128,17 @@ class BoxPrimitive {
       if (x1 === null || yTop === null || yBottom === null) return null;
 
       const isBear         = zone.type?.includes('BEAR');
+      let x3 = null;
+      try {
+        if (zone.pullback_zone_end_time) x3 = timeScale.timeToCoordinate(zone.pullback_zone_end_time);
+      } catch { x3 = null; }
       const pullbackTop    = zone.pullback_zone_top    ? series.priceToCoordinate(zone.pullback_zone_top)    : null;
       const pullbackBottom = zone.pullback_zone_bottom ? series.priceToCoordinate(zone.pullback_zone_bottom) : null;
 
       return {
         x:             x1,
         x2:            x2,
+        x3:            x3,
         yTop,
         yBottom,
         fillColor:     isBear ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)',
