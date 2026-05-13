@@ -673,7 +673,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
+    # Only keep last 2 boxes and only if they're recent (within 500 candles of current)
+    if consolidation_boxes:
+        consolidation_boxes = [
+            b for b in consolidation_boxes 
+            if int(dates[-1]) - b['end_time'] < 500 * 3600
+        ]
 
     total_boxes = len(consolidation_boxes)
     in_pullback = False

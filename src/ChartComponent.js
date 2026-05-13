@@ -71,7 +71,10 @@ class BoxRenderer {
           const pyTop     = zone.pullbackTop * vPR;
           const pyBottom  = zone.pullbackBottom * vPR;
           const zoneX     = zone.x2 !== null ? zone.x2 * hPR : rightEdge;
-          const zoneWidth = rightEdge - zoneX;
+          // Only extend 30 candle-widths forward, not to infinity
+          const candleWidth = 12 * hPR;
+          const zoneWidth = Math.min(rightEdge - zoneX, candleWidth * 30);
+          
           if (zoneWidth > 0) {
             ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.12)' : 'rgba(38,166,154,0.12)';
             ctx.fillRect(zoneX, pyTop, zoneWidth, pyBottom - pyTop);
