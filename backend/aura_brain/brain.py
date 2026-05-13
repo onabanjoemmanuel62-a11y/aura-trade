@@ -566,11 +566,11 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     breakout_dir = "up"
                     break
 
-            if breakout_idx - peak_idx >= min_box_length:
+            if breakout_idx - trough_idx >= min_box_length:
                 pullback_top    = float(ema_50[breakout_idx] + atr * 0.5)
                 pullback_bottom = float(ema_50[breakout_idx] - atr * 0.5)
                 boxes.append({
-                    "time": int(dates[peak_idx]),
+                    "time": int(dates[trough_idx]),
                     "end_time": int(dates[breakout_idx]),
                     "top": float(box_top),
                     "bottom": float(box_bottom),
