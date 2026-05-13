@@ -471,6 +471,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                 acc_end = i
         
         if acc_end == -1:
+            start += 1
             continue
         
         acc_range  = acc_high - acc_low
@@ -502,6 +503,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     break
         
         if not manip_found:
+            start += 1
             continue
         
         # ─── PHASE 3: Find Distribution (displacement candle reversing back) ───
@@ -550,6 +552,7 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
                     break
         
         if not distrib_found:
+            start += 1
             continue
         
         # ─── Valid MMM Pattern Found ───
@@ -592,8 +595,6 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
         continue
 
     # fallthrough — no pattern found at this candle, step forward
-    start += 1
-    
     return boxes
 
 
