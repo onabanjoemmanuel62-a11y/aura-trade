@@ -442,13 +442,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
           if (data.length) currentBarRef.current = data[data.length - 1];
           setTimeout(() => chartRef.current?.timeScale().fitContent(), 50);
         }
-
-        // Fetch 5M candles separately for entry trigger detection
-        const res5m = await axios.get(`${API_URL}/api/candles/5m`, {
-          params: { symbol, limit: 300, timestamp: Date.now() },
-        });
-        candles5mRef.current = processCandles(res5m.data);
-
+        
       } catch { /* silent */ }
     };
     load();

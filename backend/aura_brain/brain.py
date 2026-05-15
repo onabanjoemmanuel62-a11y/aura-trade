@@ -830,10 +830,24 @@ def calculate_trade_levels(current_price: float, signal: str,
 
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    if req.candles and len(req.candles) > 50:
-        df = process_live_candles(req.candles)
-        data_source = "LIVE_NODE_DATA"
-    else:
+    # Always fetch fresh H1 candles from Node
+    df = None
+    data_source = "CSV_FALLBACK"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r1h = await client.get(
+                f"{NODE_URL}/api/candles/1h",
+                params={"symbol": req.currency, "limit": 300}
+            )
+            if r1h.status_code == 200:
+                candles_data = r1h.json()
+                if candles_data and len(candles_data) > 50:
+                    df = process_live_candles(candles_data)
+                    data_source = "LIVE_NODE_DATA"
+    except Exception as e_fetch:
+        logger.warning(f"H1 candle fetch failed: {e_fetch}")
+
+    if df is None or df.empty:
         df = MARKET_MEMORY["df"]
         data_source = "CSV_FALLBACK"
 
