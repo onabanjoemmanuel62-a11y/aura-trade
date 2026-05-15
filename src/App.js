@@ -47,7 +47,7 @@ function App() {
   const [utcTime,         setUtcTime]        = useState(new Date());
   const [activeSessions,  setActiveSessions] = useState([]);
   const [stats,           setStats]          = useState({ winRate: 0, totalPips: 0, signals: 0, streak: 0 });
-  const candles5mRef = React.useRef([]);
+  
   
   // 1. Fixed States for responsiveness and sidebar toggling
   const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
@@ -106,31 +106,11 @@ function App() {
 
   const runAnalysis = useCallback(async (sym) => {
     setLoading(true);
-    const symbol = sym || activeSymbol;
     try {
-      // Fetch H1 candles
-      const candleRes = await axios.get(`${API_URL}/api/candles/1h`, {
-        params: { symbol, limit: 300, timestamp: Date.now() }
-      });
-
-      const htfRes = await axios.get(`${API_URL}/api/candles/4h`, {
-        params: { symbol, limit: 100, timestamp: Date.now() }
-      });
-
-      const res5m = await axios.get(`${API_URL}/api/candles/5m`, {
-        params: { symbol, limit: 250, timestamp: Date.now() }
-      });
-      candles5mRef.current = res5m.data || [];
-
-      // Run analysis with all candle data
       const res = await axios.post(`${API_URL}/api/analyze`, {
-        currency:    symbol,
-        timeframe:   '1h',
-        candles:     candles1h,
-        htf_candles: candles4h,
-        candles_5m:  candles5mRef.current,
+        currency:  sym || activeSymbol,
+        timeframe: '1h',
       });
-
       if (res.data) setAiData(res.data);
     } catch (err) {
       console.error('Analysis error:', err);

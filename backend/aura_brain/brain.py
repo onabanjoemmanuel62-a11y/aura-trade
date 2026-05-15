@@ -877,10 +877,23 @@ async def analyze(req: AnalysisRequest):
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
 
-        # 5M Entry Trigger
+        # 5M Entry Trigger — backend fetches directly from Node
         trigger_5m = {"triggered": False, "reason": "No 5M candles provided"}
-        if req.candles_5m and len(req.candles_5m) > 210:
-            trigger_5m = detect_5m_entry_trigger(req.candles_5m, cycle)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r5m = await client.get(
+                    f"{NODE_URL}/api/candles/5m",
+                    params={"symbol": req.currency, "limit": 250}
+                )
+                if r5m.status_code == 200:
+                    candles_5m_data = r5m.json()
+                    if candles_5m_data and len(candles_5m_data) >= 210:
+                        trigger_5m = detect_5m_entry_trigger(candles_5m_data, cycle)
+                    else:
+                        trigger_5m = {"triggered": False, "reason": "Not enough 5M candles from Node"}
+        except Exception as e5m:
+            logger.warning(f"5M candle fetch failed: {e5m}")
+            trigger_5m = {"triggered": False, "reason": "5M fetch error"}
 
         # ICT triggers
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
