@@ -110,19 +110,15 @@ function App() {
     try {
       // Fetch H1 candles
       const candleRes = await axios.get(`${API_URL}/api/candles/1h`, {
-        params: { symbol, limit: 1000, timestamp: Date.now() }
+        params: { symbol, limit: 300, timestamp: Date.now() }
       });
-      const candles1h = candleRes.data || [];
 
-      // Fetch 4H candles for HTF alignment
       const htfRes = await axios.get(`${API_URL}/api/candles/4h`, {
-        params: { symbol, limit: 300, timestamp: Date.now() }
+        params: { symbol, limit: 100, timestamp: Date.now() }
       });
-      const candles4h = htfRes.data || [];
 
-      // Fetch 5M candles for entry trigger
       const res5m = await axios.get(`${API_URL}/api/candles/5m`, {
-        params: { symbol, limit: 300, timestamp: Date.now() }
+        params: { symbol, limit: 250, timestamp: Date.now() }
       });
       candles5mRef.current = res5m.data || [];
 

@@ -638,7 +638,7 @@ def detect_5m_entry_trigger(candles_5m: List[Dict], cycle: str) -> Dict:
             return {"triggered": False, "reason": "Not enough 5M candles"}
 
         df5 = process_live_candles(candles_5m)
-        if df5 is None or len(df5) < 210:
+        if df5 is None or len(df5) < 50:
             return {"triggered": False, "reason": "5M data processing failed"}
 
         ema50  = df5['Close'].ewm(span=50,  adjust=False).mean().values
