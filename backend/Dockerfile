@@ -25,4 +25,7 @@ EXPOSE 10000 8000
 
 # 8. THE STARTUP SCRIPT
 # This magic line starts Python in the background (&) and then starts Node
-CMD uvicorn aura_brain.brain:app --host 0.0.0.0 --port 8000 & npm start
+EXPOSE 10000 8000
+COPY start.sh ./start.sh
+RUN chmod +x ./start.sh
+CMD ["./start.sh"]]
