@@ -78,9 +78,10 @@ def load_csv_fallback():
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        df.dropna(subset=numeric_cols, inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df if len(df) > 50 else None
+        if 'Date' in df.columns:
+    df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=False, errors='coerce')
+    df.dropna(subset=['Date'], inplace=True)
+    df['Date'] = df['Date'].astype(np.int64) // 10**9  # convert to unix seconds
     except Exception as e:
         logger.error(f"CSV load failed: {e}")
         return None
