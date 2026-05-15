@@ -724,36 +724,32 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             cross_idx = i
             break
 
-    # Search for peak from the last EMA cross point
-    # cross_idx is where the EMA crossed — that's when the new cycle started
-    # We look from cross_idx to now for the most significant high/low
-    search_start = max(0, cross_idx)
-    search_end   = len(closes)
+    search_end = len(closes)
 
-    # Safety: if cross is too far back (>500 candles), limit to 500
+    # Always search the full available data for the peak
+    # The peak is the most significant high (bearish) or low (bullish)
+    # since the EMA cross, but minimum 50 candles, maximum all data
+    search_start = max(0, cross_idx)
+
+    # If cross is too recent (less than 50 candles ago), look back further
+    # because the real peak likely formed before the cross
+    if search_end - search_start < 50:
+        search_start = max(0, search_end - 200)
+
+    # Never look back more than 500 candles
     if search_end - search_start > 500:
         search_start = search_end - 500
 
-    # Safety: if cross is too recent (<10 candles), extend back a bit
-    if search_end - search_start < 10:
-        search_start = max(0, search_end - 100)
-
     if is_bullish:
-        use_bearish = False
-        # First check last 24 candles for a fresh peak low
-        recent_start = max(0, len(closes) - 24)
-        recent_low_idx = recent_start + int(np.argmin(lows[recent_start:search_end]))
-        cycle_low_idx  = search_start + int(np.argmin(lows[search_start:search_end]))
-        # Use recent if it's a new low, otherwise use cycle low
-        best_low_idx = recent_low_idx if lows[recent_low_idx] <= lows[cycle_low_idx] else cycle_low_idx
+        use_bearish  = False
+        # For bullish: peak low is the LOWEST point in the search window
+        # This is where price reversed up from
+        best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
     else:
-        use_bearish = True
-        # First check last 24 candles for a fresh peak high
-        recent_start = max(0, len(closes) - 24)
-        recent_high_idx = recent_start + int(np.argmax(highs[recent_start:search_end]))
-        cycle_high_idx  = search_start + int(np.argmax(highs[search_start:search_end]))
-        # Use recent if it's a new high, otherwise use cycle high
-        best_high_idx = recent_high_idx if highs[recent_high_idx] >= highs[cycle_high_idx] else cycle_high_idx
+        use_bearish  = True
+        # For bearish: peak high is the HIGHEST point in the search window
+        # This is where price reversed down from
+        best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
 
     if use_bearish:
         cycle        = "BEARISH CYCLE (Peak M)"
