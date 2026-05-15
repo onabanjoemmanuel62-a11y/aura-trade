@@ -123,6 +123,7 @@ class AnalysisRequest(BaseModel):
     currency: str = "XAUUSD"
     current_price: float = 0.0
     candles: Optional[List[Dict]] = None
+    candles_5m: Optional[List[Dict]] = None
     htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
@@ -624,6 +625,53 @@ def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, 
 
     return boxes
 
+
+def detect_5m_entry_trigger(candles_5m: List[Dict], cycle: str) -> Dict:
+    """
+    Detects entry trigger on 5M timeframe using EMA 50/200 cross.
+    BULLISH PEAK → wait for 50 EMA to cross ABOVE 200 EMA on 5M
+    BEARISH PEAK → wait for 50 EMA to cross BELOW 200 EMA on 5M
+    Returns trigger dict or None.
+    """
+    try:
+        if not candles_5m or len(candles_5m) < 210:
+            return {"triggered": False, "reason": "Not enough 5M candles"}
+
+        df5 = process_live_candles(candles_5m)
+        if df5 is None or len(df5) < 210:
+            return {"triggered": False, "reason": "5M data processing failed"}
+
+        ema50  = df5['Close'].ewm(span=50,  adjust=False).mean().values
+        ema200 = df5['Close'].ewm(span=200, adjust=False).mean().values
+
+        # Check last 3 candles for a fresh cross
+        triggered = False
+        direction = None
+        for i in range(-3, 0):
+            prev = i - 1
+            if cycle.startswith("BULLISH"):
+                if ema50[prev] <= ema200[prev] and ema50[i] > ema200[i]:
+                    triggered = True
+                    direction = "BUY"
+                    break
+            else:  # BEARISH
+                if ema50[prev] >= ema200[prev] and ema50[i] < ema200[i]:
+                    triggered = True
+                    direction = "SELL"
+                    break
+
+        if triggered:
+            return {
+                "triggered": True,
+                "direction": direction,
+                "reason": f"5M EMA 50 crossed {'above' if direction == 'BUY' else 'below'} EMA 200"
+            }
+        return {"triggered": False, "reason": "No 5M EMA cross yet — waiting"}
+
+    except Exception as e:
+        logger.error(f"5M trigger detection failed: {e}")
+        return {"triggered": False, "reason": str(e)}
+
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -676,7 +724,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             cross_idx = i
             break
 
-    search_start = max(0, len(closes) - 200)
+    search_start = max(0, len(closes) - 24)
     search_end   = len(closes)
 
     if is_bullish:
@@ -700,37 +748,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    consolidation_boxes = detect_quasimodo(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
-    if consolidation_boxes:
-        consolidation_boxes = consolidation_boxes[-2:]
-    total_boxes = len(consolidation_boxes)
-    in_pullback = False
 
-    if total_boxes == 0:
-        display_level = 1
-        phase_str = "LEVEL 1 (Initial Breakaway - No Trade Zone)"
-    else:
-        last_box     = consolidation_boxes[-1]
-        breakout_dir = last_box.get('breakout_dir', 'none')
-
-        if breakout_dir == 'none' or (len(closes) - 1 - np.searchsorted(dates, last_box['end_time'])) <= 30:
-            in_pullback   = True
-            target_lvl    = total_boxes + 1
-            phase_str     = f"PULLBACK (Prep for Level {target_lvl} Trade)"
-            display_level = total_boxes
-        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
-             (cycle.startswith("BULLISH") and breakout_dir == "down"):
-            in_pullback   = False
-            display_level = total_boxes
-            phase_str     = "CYCLE FAILED (Reversal Detected)"
-        else:
-            in_pullback = False
-            if total_boxes == 2:
-                display_level = 3
-                phase_str     = "LEVEL 3 EXHAUSTION (Blowoff Active)"
-            else:
-                display_level = total_boxes + 1
-                phase_str     = f"LEVEL {display_level} (Pushing Active)"
+    consolidation_boxes = []
+    total_boxes = 0
+    in_pullback = True
+    display_level = 1
+    phase_str = "LEVEL 1 (Peak Formation Active)"
 
     all_lines = [{
         "level":      anchor_price,
@@ -853,6 +876,11 @@ async def analyze(req: AnalysisRequest):
         lines         = ms['lines']
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
+
+        # 5M Entry Trigger
+        trigger_5m = {"triggered": False, "reason": "No 5M candles provided"}
+        if req.candles_5m and len(req.candles_5m) > 210:
+            trigger_5m = detect_5m_entry_trigger(req.candles_5m, cycle)
 
         # ICT triggers
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
@@ -1003,7 +1031,7 @@ async def analyze(req: AnalysisRequest):
             },
 
             "visuals": {
-                "smc_zones":    boxes,
+                "smc_zones": [],
                 "bos_lines":    lines,
                 "fvgs":         fvgs,
                 "sweeps":       sweeps,
@@ -1017,6 +1045,7 @@ async def analyze(req: AnalysisRequest):
             ],
 
             "tradeSetup":  trade_setup,
+            "trigger_5m": trigger_5m,
             "dataSource":  data_source,
         }
 
