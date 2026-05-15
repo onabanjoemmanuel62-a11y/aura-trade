@@ -33,6 +33,7 @@ SIGNAL_LOCK = {}
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(base_dir, "aura_model.pkl")
+
 try:
     ML_MODEL = joblib.load(model_path)
     logger.info("🧠 ML Brain loaded!")
@@ -79,8 +80,6 @@ def load_csv_fallback():
 
         df.dropna(subset=numeric_cols, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        if 'Date' in df.columns:
-            df['Date'] = pd.to_datetime(df['Date']).astype(np.int64) // 10**9
         return df if len(df) > 50 else None
     except Exception as e:
         logger.error(f"CSV load failed: {e}")
@@ -123,7 +122,6 @@ class AnalysisRequest(BaseModel):
     currency: str = "XAUUSD"
     current_price: float = 0.0
     candles: Optional[List[Dict]] = None
-    candles_5m: Optional[List[Dict]] = None
     htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
@@ -136,6 +134,37 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     ratio = avg_range / atr if atr > 0 else 1.0
     order = int(np.clip(ratio * 10, 5, 20))
     return order
+
+# Optional: Simple ZigZag (uncomment if you want to try instead of argrelextrema)
+"""
+def zigzag(df: pd.DataFrame, depth_pct: float = 0.005) -> Dict:
+   highs = df['High'].values
+   lows = df['Low'].values
+   closes = df['Close'].values
+   pivot_highs = []
+   pivot_lows = []
+   last_pivot_idx = 0
+   last_pivot_price = closes[0]
+   last_pivot_type = None
+
+   for i in range(1, len(closes)):
+       if highs[i] > last_pivot_price * (1 + depth_pct):
+           if last_pivot_type == 'high':
+               pivot_highs.pop()
+           pivot_highs.append(i)
+           last_pivot_idx = i
+           last_pivot_price = highs[i]
+           last_pivot_type = 'high'
+       elif lows[i] < last_pivot_price * (1 - depth_pct):
+           if last_pivot_type == 'low':
+               pivot_lows.pop()
+           pivot_lows.append(i)
+           last_pivot_idx = i
+           last_pivot_price = lows[i]
+           last_pivot_type = 'low'
+
+   return {'highs': np.array(pivot_highs), 'lows': np.array(pivot_lows)}
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 🟢 IMPROVED: ALPHAPEAK (BEAST MARKET SENTIMENT) ENGINE
@@ -151,16 +180,18 @@ def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
         closes = df['Close']
         highs = df['High'].values
         lows = df['Low'].values
-        
+
         atr = calculate_atr(df, 14)
         base_order = adaptive_swing_order(df, atr)
-        
-        # FIXED: Removed the * 3 multiplier to allow peak detection within 24 hours.
-        order = base_order 
-        
+        order = base_order * 3          # Scale up for macro peaks (15–60 range)
         min_prominence = atr * 0.4      # Ignore very small peaks
 
         # ─── Peak Detection ───
+        # You can switch to zigzag by uncommenting below and using zz['highs']/zz['lows']
+        # zz = zigzag(df, depth_pct=0.005)
+        # recent_peak_highs = zz['highs']
+        # recent_peak_lows = zz['lows']
+
         recent_peak_highs = argrelextrema(highs, np.greater, order=order)[0]
         recent_peak_lows  = argrelextrema(lows,  np.less,    order=order)[0]
 
@@ -196,7 +227,7 @@ def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
         # 1. Moving Average Trend Filter
         sma_10 = SMAIndicator(close=closes, window=10).sma_indicator().iloc[-1]
         sma_15 = SMAIndicator(close=closes, window=15).sma_indicator().iloc[-1]
-        
+
         # 2. Stochastic
         stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=closes, window=7, smooth_window=3)
         current_stoch = stoch.stoch().iloc[-1]
@@ -206,9 +237,9 @@ def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
             return {"signal": "BUY", "reason": "AlphaPeak Buy Vector (Low Peak + Trend Up + Oversold)"}
         elif recent_bear_peak and sma_10 < sma_15 and current_stoch > 70.0:
             return {"signal": "SELL", "reason": "AlphaPeak Sell Vector (High Peak + Trend Down + Overbought)"}
-            
+
         return {"signal": "NONE", "reason": "No AlphaPeak confluence"}
-        
+
     except Exception as e:
         logger.error(f"AlphaPeak analysis failed: {e}")
         return {"signal": "NONE", "reason": "AlphaPeak Engine Error"}
@@ -249,16 +280,16 @@ def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-    
+
     obs = []
     # look at last 100 candles only — recent OBs matter most
     start = max(0, len(closes) - 100)
-    
+
     for i in range(start + 2, len(closes) - 1):
         body_size = abs(closes[i] - closes[i-1])
         if body_size < atr * 0.3:
             continue  # ignore small candles, not a real OB
-            
+
         if bias == 'BULLISH':
             # Bullish OB: last bearish candle before a strong bullish impulse
             is_bearish_candle = closes[i-1] < closes[i-2]  # candle i-1 closed down
@@ -287,7 +318,7 @@ def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
                     'label':      'Bear OB',
                     'mitigated':  float(highs[-1]) < float(highs[i-1])
                 })
-    
+
     # return only last 3 unmitigated OBs — most recent ones only
     unmitigated = [ob for ob in obs if not ob['mitigated']]
     return unmitigated[-3:] if unmitigated else obs[-2:]
@@ -297,10 +328,10 @@ def detect_fvgs(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
     highs = df['High'].values
     lows  = df['Low'].values
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
-    
+
     fvgs = []
     start = max(0, len(highs) - 100)
-    
+
     for i in range(start + 1, len(highs) - 1):
         if bias == 'BULLISH':
             gap = lows[i+1] - highs[i-1]
@@ -330,23 +361,23 @@ def detect_fvgs(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
                         'label':    'FVG',
                         'size':     float(gap)
                     })
-    
+
     return fvgs[-3:]
 
 
 def get_session_levels(df: pd.DataFrame) -> Dict:
     if len(df) < 24:
         return {}
-    
+
     try:
         prev_day    = df.iloc[-48:-24]
         weekly_open = df.iloc[-120] if len(df) >= 120 else df.iloc[0]
-        
+
         prev_day_high  = float(prev_day['High'].max())
         prev_day_low   = float(prev_day['Low'].min())
         weekly_open_px = float(weekly_open['Open']) if 'Open' in df.columns else float(weekly_open['Close'])
         current_price  = float(df['Close'].iloc[-1])
-        
+
         return {
             'prev_day_high':  prev_day_high,
             'prev_day_low':   prev_day_low,
@@ -371,7 +402,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     cutoff   = max(0, total - 200) 
 
     recent_highs = swing_highs[swing_highs >= cutoff]
-    recent_lows  = swing_lows[swing_lows   >= cutoff]
+    recent_lows  = swing_lows[swing_lows >= cutoff]
 
     for sh_idx in recent_highs:
         sh_price = highs[sh_idx]
@@ -403,241 +434,154 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
 
-def detect_quasimodo(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
+def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
 
     boxes = []
+    min_candles = 5
+    max_candles = 60
+    atr_threshold = 3.5
+    displacement_ratio = 0.65
 
-    # Use the same adaptive swing detection already in analyze_market_structure
-    swing_order = adaptive_swing_order(df, atr)
-    min_prominence = atr * 0.3
+    search_start = anchor_idx
 
-    raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
-    raw_lows_idx  = argrelextrema(lows,  np.less,    order=swing_order)[0]
+    start = search_start
+    while start < len(closes) - min_candles * 3:
 
-    # Filter by prominence — same logic as analyze_market_structure
-    swing_highs = []
-    for idx in raw_highs_idx:
-        if idx > swing_order and idx < len(highs) - swing_order:
-            neigh_min = min(np.min(highs[idx-swing_order:idx]), np.min(highs[idx+1:idx+swing_order+1]))
-            if highs[idx] - neigh_min >= min_prominence:
-                swing_highs.append(idx)
+        acc_high = highs[start]
+        acc_low  = lows[start]
+        acc_end  = -1
 
-    swing_lows = []
-    for idx in raw_lows_idx:
-        if idx > swing_order and idx < len(lows) - swing_order:
-            neigh_max = max(np.max(lows[idx-swing_order:idx]), np.max(lows[idx+1:idx+swing_order+1]))
-            if neigh_max - lows[idx] >= min_prominence:
-                swing_lows.append(idx)
+        for i in range(start + 1, min(start + max_candles, len(closes))):
+            acc_high = max(acc_high, highs[i])
+            acc_low  = min(acc_low,  lows[i])
+            acc_range = acc_high - acc_low
 
-    swing_highs = np.array(swing_highs)
-    swing_lows  = np.array(swing_lows)
-
-    # Only look at pivots after anchor
-    recent_start = max(0, len(closes) - 500)
-    swing_highs = swing_highs[swing_highs >= recent_start]
-    swing_lows  = swing_lows[swing_lows   >= recent_start]
-
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return []
-
-    if cycle.startswith("BEARISH"):
-        # Need at least: LS_high, LL_low, Head_high, RS_low, RS_high
-        for i in range(len(swing_highs) - 2):
-            ls_idx   = swing_highs[i]
-            ls_price = highs[ls_idx]
-
-            # Find LL_low between ls_idx and next high
-            lows_between = swing_lows[(swing_lows > ls_idx)]
-            if len(lows_between) == 0:
-                continue
-            ll_idx   = lows_between[0]
-            ll_price = lows[ll_idx]
-
-            # Find Head — higher high after LL
-            highs_after_ll = swing_highs[(swing_highs > ll_idx)]
-            if len(highs_after_ll) == 0:
-                continue
-            head_idx   = highs_after_ll[0]
-            head_price = highs[head_idx]
-
-            # Head must be higher than LS
-            if head_price <= ls_price:
-                continue
-
-            # Find RS_low — swing low after head that goes LOWER than LL
-            lows_after_head = swing_lows[(swing_lows > head_idx)]
-            if len(lows_after_head) == 0:
-                continue
-            rs_low_idx   = lows_after_head[0]
-            rs_low_price = lows[rs_low_idx]
-
-            # RS low must break below LL (structure break)
-            if rs_low_price >= ll_price:
-                continue
-            if rs_low_idx - ls_idx > 300:
-                continue
-
-            # Find RS_high — swing high after RS_low that is LOWER than Head
-            highs_after_rs_low = swing_highs[(swing_highs > rs_low_idx)]
-            if len(highs_after_rs_low) == 0:
-                continue
-            rs_high_idx   = highs_after_rs_low[0]
-            rs_high_price = highs[rs_high_idx]
-
-            # RS high must be lower than head (failed to reach head)
-            if rs_high_price >= head_price:
-                continue
-            if rs_high_idx - ls_idx > 300:
-                continue
-
-            # Valid Bearish QM found
-            entry_zone_top    = float(rs_high_price + atr * 0.2)
-            entry_zone_bottom = float(rs_low_price)
-            sl_price          = float(head_price + atr * 0.5)
-            tp_price          = float(ll_price)
-
-            boxes.append({
-                "time":                   int(dates[ls_idx]),
-                "end_time":               int(dates[rs_high_idx]),
-                "pullback_zone_end_time": int(dates[min(rs_high_idx + 50, len(dates) - 1)]),
-                "top":                    float(head_price),
-                "bottom":                 float(rs_low_price),
-                "type":                   "BEAR_QM",
-                "label":                  f"QM Bear (RS @ {rs_high_price:.5f})",
-                "breakout_dir":           "down",
-                "pullback_zone_top":      entry_zone_top,
-                "pullback_zone_bottom":   entry_zone_bottom,
-                "pullback_label":         "QM Right Shoulder Zone",
-                "sl_price":               sl_price,
-                "tp_price":               tp_price,
-                "head_price":             float(head_price),
-                "rs_high_price":          float(rs_high_price),
-                "rs_low_price":           float(rs_low_price),
-            })
-
-            if len(boxes) >= 2:
+            if acc_range > atr * atr_threshold:
                 break
 
-    else:  # BULLISH
-        for i in range(len(swing_lows) - 2):
-            ls_idx   = swing_lows[i]
-            ls_price = lows[ls_idx]
+            if i - start >= min_candles:
+                acc_end = i
 
-            highs_between = swing_highs[(swing_highs > ls_idx)]
-            if len(highs_between) == 0:
-                continue
-            hh_idx   = highs_between[0]
-            hh_price = highs[hh_idx]
+        if acc_end == -1:
+            start += 1
+            continue
 
-            lows_after_hh = swing_lows[(swing_lows > hh_idx)]
-            if len(lows_after_hh) == 0:
-                continue
-            head_idx   = lows_after_hh[0]
-            head_price = lows[head_idx]
+        acc_range  = acc_high - acc_low
+        acc_mid    = (acc_high + acc_low) / 2
 
-            # Head must be lower than LS
-            if head_price >= ls_price:
-                continue
+        manip_found = False
+        manip_idx   = -1
+        manip_low   = acc_low
+        manip_high  = acc_high
+        sweep_type  = None
 
-            highs_after_head = swing_highs[(swing_highs > head_idx)]
-            if len(highs_after_head) == 0:
-                continue
-            rs_high_idx   = highs_after_head[0]
-            rs_high_price = highs[rs_high_idx]
+        for i in range(acc_end + 1, min(acc_end + 20, len(closes))):
+            if cycle.startswith("BULLISH"):
+                if lows[i] < acc_low - (atr * 0.1):
+                    manip_found = True
+                    manip_idx   = i
+                    manip_low   = lows[i]
+                    sweep_type  = "SSL_SWEEP"
+                    break
+            else:
+                if highs[i] > acc_high + (atr * 0.1):
+                    manip_found = True
+                    manip_idx   = i
+                    manip_high  = highs[i]
+                    sweep_type  = "BSL_SWEEP"
+                    break
 
-            # RS high must break above HH (structure break up)
-            if rs_high_price <= hh_price:
-                continue
+        if not manip_found:
+            start += 1
+            continue
 
-            lows_after_rs_high = swing_lows[(swing_lows > rs_high_idx)]
-            if len(lows_after_rs_high) == 0:
-                continue
-            rs_low_idx   = lows_after_rs_high[0]
-            rs_low_price = lows[rs_low_idx]
+        distrib_found = False
+        distrib_idx   = -1
+        fvg_top       = None
+        fvg_bottom    = None
 
-            # RS low must be higher than head (failed to reach head)
-            if rs_low_price <= head_price:
-                continue
+        for i in range(manip_idx + 1, min(manip_idx + 15, len(closes))):
+            candle_range = highs[i] - lows[i]
 
-            entry_zone_top    = float(rs_high_price)
-            entry_zone_bottom = float(rs_low_price - atr * 0.2)
-            sl_price          = float(head_price - atr * 0.5)
-            tp_price          = float(hh_price)
+            if 'Open' in df.columns:
+                candle_body = abs(closes[i] - df['Open'].values[i])
+            else:
+                candle_body = abs(closes[i] - closes[i-1])
 
-            boxes.append({
-                "time":                   int(dates[ls_idx]),
-                "end_time":               int(dates[rs_low_idx]),
-                "pullback_zone_end_time": int(dates[min(rs_low_idx + 30, len(dates) - 1)]),
-                "top":                    float(rs_high_price),
-                "bottom":                 float(head_price),
-                "type":                   "BULL_QM",
-                "label":                  f"QM Bull (RS @ {rs_low_price:.5f})",
-                "breakout_dir":           "up",
-                "pullback_zone_top":      entry_zone_top,
-                "pullback_zone_bottom":   entry_zone_bottom,
-                "pullback_label":         "QM Right Shoulder Zone",
-                "sl_price":               sl_price,
-                "tp_price":               tp_price,
-                "head_price":             float(head_price),
-                "rs_high_price":          float(rs_high_price),
-                "rs_low_price":           float(rs_low_price),
-            })
+            body_ratio = candle_body / candle_range if candle_range > 0 else 0
 
-            if len(boxes) >= 2:
-                break
+            if cycle.startswith("BULLISH"):
+                is_bullish_candle = closes[i] > closes[i-1]
+                strong_move = candle_range >= atr * 0.8
+                closes_above_mid = closes[i] > acc_mid
 
+                if is_bullish_candle and strong_move and closes_above_mid and body_ratio >= displacement_ratio:
+                    distrib_found = True
+                    distrib_idx   = i
+                    if i + 1 < len(lows):
+                        fvg_top    = lows[i+1] if lows[i+1] > highs[i-1] else highs[i-1]
+                        fvg_bottom = highs[i-1]
+                    break
+            else:
+                is_bearish_candle = closes[i] < closes[i-1]
+                strong_move = candle_range >= atr * 0.8
+                closes_below_mid = closes[i] < acc_mid
+
+                if is_bearish_candle and strong_move and closes_below_mid and body_ratio >= displacement_ratio:
+                    distrib_found = True
+                    distrib_idx   = i
+                    if i + 1 < len(highs):
+                        fvg_top    = lows[i-1]
+                        fvg_bottom = highs[i+1] if highs[i+1] < lows[i-1] else lows[i-1]
+                    break
+
+        if not distrib_found:
+            start += 1
+            continue
+
+        if fvg_top and fvg_bottom and fvg_top > fvg_bottom:
+            entry_zone_top    = float(fvg_top)
+            entry_zone_bottom = float(fvg_bottom)
+            entry_label = "FVG Entry Zone"
+        else:
+            entry_zone_top    = float(ema_50[distrib_idx] + atr * 0.5)
+            entry_zone_bottom = float(ema_50[distrib_idx] - atr * 0.5)
+            entry_label = "EMA Entry Zone"
+
+        box_type = "BULL_CONS" if cycle.startswith("BULLISH") else "BEAR_CONS"
+        box_num  = len(boxes) + 1
+
+        boxes.append({
+            "time":                 int(dates[start]),
+            "end_time":             int(dates[distrib_idx]),
+            "pullback_zone_end_time": int(dates[min(distrib_idx + 30, len(dates) - 1)]),
+            "top":                  float(acc_high),
+            "bottom":               float(manip_low if cycle.startswith("BULLISH") else acc_low),
+            "type":                 box_type,
+            "label":                f"MMM L{box_num} ({sweep_type})",
+            "breakout_dir":         "up" if cycle.startswith("BULLISH") else "down",
+            "pullback_zone_top":    entry_zone_top,
+            "pullback_zone_bottom": entry_zone_bottom,
+            "pullback_label":       entry_label,
+            "acc_high":             float(acc_high),
+            "acc_low":              float(acc_low),
+            "manip_low":            float(manip_low),
+            "manip_high":           float(manip_high),
+        })
+
+        start = distrib_idx + 1
+        if len(boxes) >= 2:
+            break
+        continue
+
+        start += 1
+        
     return boxes
 
-
-def detect_5m_entry_trigger(candles_5m: List[Dict], cycle: str) -> Dict:
-    """
-    Detects entry trigger on 5M timeframe using EMA 50/200 cross.
-    BULLISH PEAK → wait for 50 EMA to cross ABOVE 200 EMA on 5M
-    BEARISH PEAK → wait for 50 EMA to cross BELOW 200 EMA on 5M
-    Returns trigger dict or None.
-    """
-    try:
-        if not candles_5m or len(candles_5m) < 210:
-            return {"triggered": False, "reason": "Not enough 5M candles"}
-
-        df5 = process_live_candles(candles_5m)
-        if df5 is None or len(df5) < 50:
-            return {"triggered": False, "reason": "5M data processing failed"}
-
-        ema50  = df5['Close'].ewm(span=50,  adjust=False).mean().values
-        ema200 = df5['Close'].ewm(span=200, adjust=False).mean().values
-
-        # Check last 3 candles for a fresh cross
-        triggered = False
-        direction = None
-        for i in range(-3, 0):
-            prev = i - 1
-            if cycle.startswith("BULLISH"):
-                if ema50[prev] <= ema200[prev] and ema50[i] > ema200[i]:
-                    triggered = True
-                    direction = "BUY"
-                    break
-            else:  # BEARISH
-                if ema50[prev] >= ema200[prev] and ema50[i] < ema200[i]:
-                    triggered = True
-                    direction = "SELL"
-                    break
-
-        if triggered:
-            return {
-                "triggered": True,
-                "direction": direction,
-                "reason": f"5M EMA 50 crossed {'above' if direction == 'BUY' else 'below'} EMA 200"
-            }
-        return {"triggered": False, "reason": "No 5M EMA cross yet — waiting"}
-
-    except Exception as e:
-        logger.error(f"5M trigger detection failed: {e}")
-        return {"triggered": False, "reason": str(e)}
 
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
@@ -682,7 +626,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
 
     is_bullish = ema_50_array[-1] > ema_200_array[-1]
     cross_idx = 0
-
     for i in range(len(closes) - 2, 0, -1):
         if is_bullish and ema_50_array[i] <= ema_200_array[i]:
             cross_idx = i
@@ -691,31 +634,14 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             cross_idx = i
             break
 
-    search_end = len(closes)
-
-    # Always search the full available data for the peak
-    # The peak is the most significant high (bearish) or low (bullish)
-    # since the EMA cross, but minimum 50 candles, maximum all data
-    search_start = max(0, cross_idx)
-
-    # If cross is too recent (less than 50 candles ago), look back further
-    # because the real peak likely formed before the cross
-    if search_end - search_start < 50:
-        search_start = max(0, search_end - 200)
-
-    # Never look back more than 500 candles
-    if search_end - search_start > 500:
-        search_start = search_end - 500
+    search_start = max(0, len(closes) - 200)
+    search_end   = len(closes)
 
     if is_bullish:
         use_bearish  = False
-        # For bullish: peak low is the LOWEST point in the search window
-        # This is where price reversed up from
         best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
     else:
-        use_bearish  = True
-        # For bearish: peak high is the HIGHEST point in the search window
-        # This is where price reversed down from
+        use_bearish   = True
         best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
 
     if use_bearish:
@@ -732,12 +658,37 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
+    if consolidation_boxes:
+        consolidation_boxes = consolidation_boxes[-2:]
+    total_boxes = len(consolidation_boxes)
+    in_pullback = False
 
-    consolidation_boxes = []
-    total_boxes = 0
-    in_pullback = True
-    display_level = 1
-    phase_str = "LEVEL 1 (Peak Formation Active)"
+    if total_boxes == 0:
+        display_level = 1
+        phase_str = "LEVEL 1 (Initial Breakaway - No Trade Zone)"
+    else:
+        last_box     = consolidation_boxes[-1]
+        breakout_dir = last_box.get('breakout_dir', 'none')
+
+        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
+            in_pullback   = True
+            target_lvl    = total_boxes + 1
+            phase_str     = f"PULLBACK (Prep for Level {target_lvl} Trade)"
+            display_level = total_boxes
+        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
+             (cycle.startswith("BULLISH") and breakout_dir == "down"):
+            in_pullback   = False
+            display_level = total_boxes
+            phase_str     = "CYCLE FAILED (Reversal Detected)"
+        else:
+            in_pullback = False
+            if total_boxes == 2:
+                display_level = 3
+                phase_str     = "LEVEL 3 EXHAUSTION (Blowoff Active)"
+            else:
+                display_level = total_boxes + 1
+                phase_str     = f"LEVEL {display_level} (Pushing Active)"
 
     all_lines = [{
         "level":      anchor_price,
@@ -808,30 +759,17 @@ def calculate_trade_levels(current_price: float, signal: str,
     except Exception as e:
         logger.error(f"Trade level calc error: {e}")
         return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # API ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze(req: AnalysisRequest):
-    # Always fetch fresh H1 candles from Node
-    df = None
-    data_source = "CSV_FALLBACK"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r1h = await client.get(
-                f"{NODE_URL}/api/candles/1h",
-                params={"symbol": req.currency, "limit": 300}
-            )
-            if r1h.status_code == 200:
-                candles_data = r1h.json()
-                if candles_data and len(candles_data) > 50:
-                    df = process_live_candles(candles_data)
-                    data_source = "LIVE_NODE_DATA"
-    except Exception as e_fetch:
-        logger.warning(f"H1 candle fetch failed: {e_fetch}")
-
-    if df is None or df.empty:
+    if req.candles and len(req.candles) > 50:
+        df = process_live_candles(req.candles)
+        data_source = "LIVE_NODE_DATA"
+    else:
         df = MARKET_MEMORY["df"]
         data_source = "CSV_FALLBACK"
 
@@ -849,7 +787,7 @@ async def analyze(req: AnalysisRequest):
         ema_50  = safe_float(EMAIndicator(close=df['Close'], window=50).ema_indicator().iloc[-1], current_price)
         rsi     = safe_float(RSIIndicator(close=df['Close'], window=14).rsi().iloc[-1], 50.0)
         atr     = calculate_atr(df, 14)
-        
+
         ema_bias = "ABOVE 200 EMA" if current_price > ema_200 else "BELOW 200 EMA"
 
         news_val    = 0
@@ -866,7 +804,6 @@ async def analyze(req: AnalysisRequest):
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
         ms = analyze_market_structure(df, profile)
-        logger.info(f"Anchor idx: {ms['anchor_idx']}, Total candles: {len(df)}, Cycle: {ms['cycle']}")
         cycle         = ms['cycle']
         current_level = ms['level']
         phase_str     = ms['phase_str']
@@ -874,24 +811,6 @@ async def analyze(req: AnalysisRequest):
         lines         = ms['lines']
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
-
-        # 5M Entry Trigger — backend fetches directly from Node
-        trigger_5m = {"triggered": False, "reason": "No 5M candles provided"}
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r5m = await client.get(
-                    f"{NODE_URL}/api/candles/5m",
-                    params={"symbol": req.currency, "limit": 250}
-                )
-                if r5m.status_code == 200:
-                    candles_5m_data = r5m.json()
-                    if candles_5m_data and len(candles_5m_data) >= 210:
-                        trigger_5m = detect_5m_entry_trigger(candles_5m_data, cycle)
-                    else:
-                        trigger_5m = {"triggered": False, "reason": "Not enough 5M candles from Node"}
-        except Exception as e5m:
-            logger.warning(f"5M candle fetch failed: {e5m}")
-            trigger_5m = {"triggered": False, "reason": "5M fetch error"}
 
         # ICT triggers
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
@@ -923,7 +842,7 @@ async def analyze(req: AnalysisRequest):
         from datetime import datetime, timezone
         current_utc_hour = datetime.now(timezone.utc).hour
         session_aligned = (8 <= current_utc_hour < 17) or (13 <= current_utc_hour < 22)
-        
+
         alpha_data = analyze_alpha_peak(df)
         alpha_signal = alpha_data["signal"]
         alpha_reason = alpha_data["reason"]
@@ -950,7 +869,7 @@ async def analyze(req: AnalysisRequest):
         if sweep_str: reasoning.append(sweep_str)
 
         dist = abs(current_price - ema_50)
-        
+
         if "FAILED" in phase_str:
             reasoning.append("⚠️ Trend structure broken. Awaiting 200 EMA crossover to reset Anchor.")
         elif "No Trade Zone" in phase_str:
@@ -983,7 +902,7 @@ async def analyze(req: AnalysisRequest):
                 confidence = max(confidence - 20, 10)
                 reasoning.append(f"⚠️ CONFLICT: AlphaPeak suggests {alpha_signal}. Reducing confidence.")
 
-        if signal != "NEUTRAL" and ML_MODEL and False:  # retrain needed for QM
+        if signal != "NEUTRAL" and ML_MODEL:
             try:
                 features = pd.DataFrame([{
                     'type':          1 if signal == "BUY" else 0,
@@ -1026,7 +945,6 @@ async def analyze(req: AnalysisRequest):
                 reasoning.append(
                     f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"
                 )
-              
 
         return {
             "signal":     signal,
@@ -1042,7 +960,7 @@ async def analyze(req: AnalysisRequest):
             },
 
             "visuals": {
-                "smc_zones": [],
+                "smc_zones":    boxes,
                 "bos_lines":    lines,
                 "fvgs":         fvgs,
                 "sweeps":       sweeps,
@@ -1056,7 +974,6 @@ async def analyze(req: AnalysisRequest):
             ],
 
             "tradeSetup":  trade_setup,
-            "trigger_5m": trigger_5m,
             "dataSource":  data_source,
         }
 
@@ -1119,10 +1036,11 @@ async def proxy_to_node(path: str, request: Request):
                          if k.lower() not in ['host', 'content-length']},
                 content=body
             )
-            return Response(
-                content=response.content,
-                status_code=response.status_code,
-                headers=dict(response.headers)
-            )
-    except Exception:
-        raise HTTPException(status_code=503, detail="Node proxy unavailable")
+        return Response(
+            content=response.content,
+            status_code=response.status_code,
+            headers=dict(response.headers)
+        )
+    except Exception as e:
+        logger.error(f"Proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Node backend unreachable")
