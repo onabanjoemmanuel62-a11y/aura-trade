@@ -137,37 +137,6 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     order = int(np.clip(ratio * 10, 5, 20))
     return order
 
-# Optional: Simple ZigZag (uncomment if you want to try instead of argrelextrema)
-"""
-def zigzag(df: pd.DataFrame, depth_pct: float = 0.005) -> Dict:
-    highs = df['High'].values
-    lows = df['Low'].values
-    closes = df['Close'].values
-    pivot_highs = []
-    pivot_lows = []
-    last_pivot_idx = 0
-    last_pivot_price = closes[0]
-    last_pivot_type = None
-
-    for i in range(1, len(closes)):
-        if highs[i] > last_pivot_price * (1 + depth_pct):
-            if last_pivot_type == 'high':
-                pivot_highs.pop()
-            pivot_highs.append(i)
-            last_pivot_idx = i
-            last_pivot_price = highs[i]
-            last_pivot_type = 'high'
-        elif lows[i] < last_pivot_price * (1 - depth_pct):
-            if last_pivot_type == 'low':
-                pivot_lows.pop()
-            pivot_lows.append(i)
-            last_pivot_idx = i
-            last_pivot_price = lows[i]
-            last_pivot_type = 'low'
-
-    return {'highs': np.array(pivot_highs), 'lows': np.array(pivot_lows)}
-"""
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 🟢 IMPROVED: ALPHAPEAK (BEAST MARKET SENTIMENT) ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,15 +154,13 @@ def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
         
         atr = calculate_atr(df, 14)
         base_order = adaptive_swing_order(df, atr)
-        order = base_order * 3          # Scale up for macro peaks (15–60 range)
+        
+        # FIXED: Removed the * 3 multiplier to allow peak detection within 24 hours.
+        order = base_order 
+        
         min_prominence = atr * 0.4      # Ignore very small peaks
 
         # ─── Peak Detection ───
-        # You can switch to zigzag by uncommenting below and using zz['highs']/zz['lows']
-        # zz = zigzag(df, depth_pct=0.005)
-        # recent_peak_highs = zz['highs']
-        # recent_peak_lows = zz['lows']
-
         recent_peak_highs = argrelextrema(highs, np.greater, order=order)[0]
         recent_peak_lows  = argrelextrema(lows,  np.less,    order=order)[0]
 
@@ -816,7 +783,7 @@ def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cyc
 
 
 def calculate_trade_levels(current_price: float, signal: str,
-                            atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
+                           atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
     try:
         entry = current_price
         if signal == "BUY":
@@ -842,7 +809,7 @@ def calculate_trade_levels(current_price: float, signal: str,
         logger.error(f"Trade level calc error: {e}")
         return None
 # ─────────────────────────────────────────────────────────────────────────────
-# API ENDPOINT (unchanged except using improved functions)
+# API ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
@@ -1098,7 +1065,7 @@ async def analyze(req: AnalysisRequest):
         return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEBUG ENDPOINT (enhanced with peak info)
+# DEBUG ENDPOINT
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/debug")
