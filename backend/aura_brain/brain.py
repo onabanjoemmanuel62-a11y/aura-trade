@@ -79,9 +79,13 @@ def load_csv_fallback():
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
         if 'Date' in df.columns:
-    df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=False, errors='coerce')
-    df.dropna(subset=['Date'], inplace=True)
-    df['Date'] = df['Date'].astype(np.int64) // 10**9  # convert to unix seconds
+            df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=False, errors='coerce')
+            df.dropna(subset=['Date'], inplace=True)
+            df['Date'] = df['Date'].astype(np.int64) // 10**9
+
+        df.dropna(subset=numeric_cols, inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        return df if len(df) > 50 else None
     except Exception as e:
         logger.error(f"CSV load failed: {e}")
         return None
@@ -1045,3 +1049,8 @@ async def proxy_to_node(path: str, request: Request):
     except Exception as e:
         logger.error(f"Proxy error: {e}")
         raise HTTPException(status_code=502, detail="Node backend unreachable")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
