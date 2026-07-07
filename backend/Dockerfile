@@ -7,15 +7,15 @@ RUN apt-get install -y nodejs
 WORKDIR /app
 
 # Python deps
-COPY backend/aura_brain/requirements.txt ./requirements.txt
+COPY aura_brain/requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Node deps — copy from backend folder
-COPY backend/package*.json ./
+# Node deps
+COPY package*.json ./
 RUN npm install
 
-# Copy backend code
-COPY backend/ .
+# Copy backend code (everything in the Root Directory, i.e. the backend folder itself)
+COPY . .
 
 EXPOSE 10000 8000
 
