@@ -7,7 +7,7 @@ RUN apt-get install -y nodejs
 WORKDIR /app
 
 # Python deps
-COPY aura_brain/requirements.txt ./requirements.txt
+COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Node deps
