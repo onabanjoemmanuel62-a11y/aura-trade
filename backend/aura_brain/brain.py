@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import math
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -22,6 +23,90 @@ import joblib
 
 CSV_FILENAME = "1h.csv"
 NODE_URL = "http://127.0.0.1:10000"
+
+# Backtest evidence (48 historical Level-1/2 trades): BUY signals won 38.7% (above the
+# 33.3% breakeven line for 2:1 R:R), while SELL signals won only 23.5% (well below it).
+# Toggle this off while SELL logic is investigated/improved separately.
+ALLOW_SELL_SIGNALS = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NEWS REACTION PATTERNS
+# From a historical event-study (news_impact_analysis.py) measuring how gold
+# actually moved after each USD high-impact news event type, across ~4,000
+# events (2007-2024). This ONLY includes patterns that passed a statistical
+# significance check (z-score vs a 50/50 coin flip) on large sample sizes
+# (100+ occurrences) — most event types showed no reliable bias and are
+# deliberately left out. These are unconditional directional tendencies
+# (which way gold tends to drift after this event fires), not a beat/miss
+# theory — use as a CONFIRMING factor for the existing MMM strategy, not a
+# standalone signal.
+# ─────────────────────────────────────────────────────────────────────────────
+NEWS_REACTION_PATTERNS = {
+    "ISM Manufacturing PMI":     {"bias": "UP",   "window_hours": 24},  # 56-57% UP, n=205, consistent at +1h and +24h
+    "PPI m/m":                   {"bias": "UP",   "window_hours": 24},  # 58-60% UP, n=164, consistent at +4h and +24h
+    "Non-Farm Employment Change": {"bias": "DOWN", "window_hours": 1},   # 57.1% DOWN, n=210, at +1h
+    "Retail Sales m/m":          {"bias": "DOWN", "window_hours": 1},   # 56.2% DOWN, n=194, at +1h
+    "Core Retail Sales m/m":     {"bias": "DOWN", "window_hours": 1},   # 56.0% DOWN, n=191, at +1h
+}
+
+# Backtest evidence so far is too thin to trust (only 7 trades total touched by
+# alignment: 4 aligned, 3 conflicted) and overall performance regressed when this
+# was first turned on (40.0% win rate -> 33.9%). Set to True only once a much
+# larger backtest sample shows the alignment bonus/penalty actually helps.
+# While False, news_aligned/news_conflicted are still computed and logged for
+# every trade (for future analysis) — they just don't affect confidence yet.
+APPLY_NEWS_ALIGNMENT_ADJUSTMENT = False
+
+
+def check_news_alignment(news_data: Optional[Dict], signal_direction: str, reference_time_epoch: Optional[float] = None) -> Dict:
+    """
+    Checks whether the most recent relevant news event matches a known,
+    statistically-validated directional pattern (NEWS_REACTION_PATTERNS),
+    and whether that pattern agrees or conflicts with the trade direction
+    the MMM engine is about to take. Used to nudge confidence up/down —
+    NOT to generate a signal on its own.
+
+    reference_time_epoch: what "now" means for the recency check. Live calls
+    should leave this as None (uses actual current time). Backtest calls
+    MUST pass the simulated candle's epoch here — otherwise every historical
+    event would incorrectly look infinitely old compared to today's real date.
+
+    Returns {"aligned": bool, "conflicted": bool, "event": str|None}.
+    """
+    result = {"aligned": False, "conflicted": False, "event": None}
+    if not news_data:
+        return result
+
+    event_name = news_data.get('event')
+    if not event_name or event_name not in NEWS_REACTION_PATTERNS:
+        return result
+
+    pattern = NEWS_REACTION_PATTERNS[event_name]
+
+    # Optional recency check — only applies if a usable timestamp is present.
+    # If the event happened longer ago than the pattern's measured window,
+    # it's stale and shouldn't influence the current signal.
+    event_time = news_data.get('time') or news_data.get('datetime')
+    if event_time is not None:
+        try:
+            if isinstance(event_time, (int, float)):
+                event_epoch = float(event_time)
+            else:
+                event_epoch = pd.to_datetime(event_time).timestamp()
+            now_epoch = reference_time_epoch if reference_time_epoch is not None else datetime.now(timezone.utc).timestamp()
+            hours_since = (now_epoch - event_epoch) / 3600
+            if hours_since > pattern["window_hours"] or hours_since < 0:
+                return result  # too old, or timestamp parsing gave something nonsensical
+        except Exception:
+            pass  # couldn't parse the timestamp — fall back to applying the pattern anyway
+
+    expected_signal = "BUY" if pattern["bias"] == "UP" else "SELL"
+    result["event"] = event_name
+    if signal_direction == expected_signal:
+        result["aligned"] = True
+    else:
+        result["conflicted"] = True
+    return result
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
@@ -588,6 +673,79 @@ def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr
     return boxes
 
 
+def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float, lookback: int = 150) -> Dict:
+    """
+    Confirms genuine W (double-bottom / Peak Formation Low) and M (double-top /
+    Peak Formation High) chart patterns from real swing points, rather than
+    relying purely on EMA trend direction (which only tells you the current
+    bias, not whether an actual reversal shape has formed).
+
+    W pattern: two swing lows at a similar price level, separated by a swing
+    high that's meaningfully higher than both (the "middle peak" of the W),
+    with price having since reclaimed above the second low.
+
+    M pattern: mirror of the above — two swing highs at a similar level,
+    separated by a swing low meaningfully lower than both, with price having
+    since dropped back below the second high.
+    """
+    closes = df['Close'].values
+    highs = df['High'].values
+    lows = df['Low'].values
+    total = len(closes)
+    cutoff = max(0, total - lookback)
+
+    price_tolerance = atr * 1.0      # how close the two lows/highs must be to count as "similar"
+    middle_prominence = atr * 0.5    # how much higher/lower the middle swing point must be
+
+    result = {
+        "w_confirmed": False, "w_low1": None, "w_low2": None, "w_middle": None,
+        "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None,
+    }
+
+    recent_lows = sorted([int(i) for i in swing_lows if i >= cutoff])
+    recent_highs = sorted([int(i) for i in swing_highs if i >= cutoff])
+
+    # --- W pattern (double bottom) ---
+    if len(recent_lows) >= 2:
+        low2_idx = recent_lows[-1]
+        low1_idx = recent_lows[-2]
+        low1_price = lows[low1_idx]
+        low2_price = lows[low2_idx]
+
+        if abs(low1_price - low2_price) <= price_tolerance:
+            between_highs = [h for h in swing_highs if low1_idx < h < low2_idx]
+            if between_highs:
+                middle_idx = max(between_highs, key=lambda h: highs[int(h)])
+                middle_price = highs[int(middle_idx)]
+                if middle_price - max(low1_price, low2_price) >= middle_prominence:
+                    if closes[-1] > low2_price:  # confirmation: price reclaimed above the second low
+                        result["w_confirmed"] = True
+                        result["w_low1"] = float(low1_price)
+                        result["w_low2"] = float(low2_price)
+                        result["w_middle"] = float(middle_price)
+
+    # --- M pattern (double top) ---
+    if len(recent_highs) >= 2:
+        high2_idx = recent_highs[-1]
+        high1_idx = recent_highs[-2]
+        high1_price = highs[high1_idx]
+        high2_price = highs[high2_idx]
+
+        if abs(high1_price - high2_price) <= price_tolerance:
+            between_lows = [l for l in swing_lows if high1_idx < l < high2_idx]
+            if between_lows:
+                middle_idx = min(between_lows, key=lambda l: lows[int(l)])
+                middle_price = lows[int(middle_idx)]
+                if min(high1_price, high2_price) - middle_price >= middle_prominence:
+                    if closes[-1] < high2_price:  # confirmation: price dropped back below the second high
+                        result["m_confirmed"] = True
+                        result["m_high1"] = float(high1_price)
+                        result["m_high2"] = float(high2_price)
+                        result["m_middle"] = float(middle_price)
+
+    return result
+
+
 def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -663,6 +821,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         anchor_color = "rgba(59, 255, 130, 1)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr)
     consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
     if consolidation_boxes:
         consolidation_boxes = consolidation_boxes[-2:]
@@ -714,11 +873,14 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "anchor_idx":          int(anchor_idx),
         "atr":                 atr,
         "sweeps":              sweeps,
-        "consolidation_boxes": consolidation_boxes
+        "consolidation_boxes": consolidation_boxes,
+        "w_confirmed":         pattern_info["w_confirmed"],
+        "m_confirmed":         pattern_info["m_confirmed"],
+        "pattern_info":        pattern_info,
     }
 
 
-def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False) -> int:
+def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False, pattern_confirmed=False) -> int:
     if "FAILED" in phase_str: return 0
     if not in_pullback: return 0
 
@@ -733,6 +895,7 @@ def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cyc
     if fvg_present: score += 10
     if sweep_nearby: score += 10
     if session_aligned: score += 5
+    if pattern_confirmed: score += 15  # confirmed W (BUY) or M (SELL) double-pattern, tested via backtest confidence-bucket analysis
     if cycle.startswith("BULLISH") and rsi < 50: score += 5
     elif cycle.startswith("BEARISH") and rsi > 50: score += 5
     return min(max(score, 0), 99)
@@ -816,6 +979,8 @@ async def analyze(req: AnalysisRequest):
         lines         = ms['lines']
         sweeps        = ms['sweeps']
         boxes         = ms.get('consolidation_boxes', [])
+        w_confirmed   = ms.get('w_confirmed', False)
+        m_confirmed   = ms.get('m_confirmed', False)
 
         # ICT triggers
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
@@ -844,7 +1009,6 @@ async def analyze(req: AnalysisRequest):
             htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
                           (cycle.startswith('BEARISH') and ema_50 < ema_200)
 
-        from datetime import datetime, timezone
         current_utc_hour = datetime.now(timezone.utc).hour
         session_aligned = (8 <= current_utc_hour < 17) or (13 <= current_utc_hour < 22)
 
@@ -883,21 +1047,33 @@ async def analyze(req: AnalysisRequest):
             reasoning.append("⏳ Level 3 Exhaustion. Anticipating macro reversal or reset.")
         elif not in_pullback:
             reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
+        elif current_level >= 2:
+            # Backtest evidence (83 historical trades): Level 3 setups (current_level == 2,
+            # i.e. targeting the 3rd consolidation) won only 17.1% of the time vs 33.3% for
+            # Level 2 setups. Blocking these removes the system's worst-performing trade class.
+            reasoning.append("🚫 Level 3 setup detected — historically low win rate (17.1%). Skipping entry.")
         else:
             if cycle.startswith("BULLISH"):
                 if current_price >= ema_50 * 0.998 and dist <= (atr * 1.5):
                     signal = "BUY"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
-                    reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned, pattern_confirmed=w_confirmed)
+                    pattern_note = " (W pattern confirmed)" if w_confirmed else ""
+                    reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}{pattern_note}.")
                 else:
                     reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
             else:
-                if current_price <= ema_50 * 1.002 and dist <= (atr * 1.5):
+                if not ALLOW_SELL_SIGNALS:
+                    reasoning.append("🚫 SELL signals currently disabled.")
+                elif not m_confirmed:
+                    # Backtest evidence: M-pattern-confirmed SELLs won 57.1% vs 23.5% for
+                    # trend-only SELLs. Unlike BUY, this stays a hard requirement for SELL.
+                    reasoning.append("⏳ Bearish trend active, but no confirmed M (double-top) pattern yet. Waiting.")
+                elif current_price <= ema_50 * 1.002 and dist <= (atr * 1.5):
                     signal = "SELL"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned)
-                    reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
+                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned, pattern_confirmed=True)
+                    reasoning.append(f"🔥 KILLZONE: M pattern confirmed. Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
                 else:
-                    reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
+                    reasoning.append(f"📍 M pattern confirmed. Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
 
         if signal != "NEUTRAL":
             if alpha_signal == signal:
@@ -907,14 +1083,49 @@ async def analyze(req: AnalysisRequest):
                 confidence = max(confidence - 20, 10)
                 reasoning.append(f"⚠️ CONFLICT: AlphaPeak suggests {alpha_signal}. Reducing confidence.")
 
+        if signal != "NEUTRAL":
+            news_check = check_news_alignment(req.news_data, signal)
+            if news_check["aligned"]:
+                if APPLY_NEWS_ALIGNMENT_ADJUSTMENT:
+                    confidence = min(confidence + 10, 99)
+                    reasoning.append(f"📰 NEWS ALIGNMENT: {news_check['event']} historically supports this direction. (+10% Confidence)")
+                else:
+                    reasoning.append(f"📰 NEWS ALIGNMENT (observe-only, not yet affecting confidence): {news_check['event']} historically supports this direction.")
+            elif news_check["conflicted"]:
+                if APPLY_NEWS_ALIGNMENT_ADJUSTMENT:
+                    confidence = max(confidence - 10, 10)
+                    reasoning.append(f"⚠️ NEWS CONFLICT: {news_check['event']} historically favors the opposite direction. (-10% Confidence)")
+                else:
+                    reasoning.append(f"⚠️ NEWS CONFLICT (observe-only, not yet affecting confidence): {news_check['event']} historically favors the opposite direction.")
+
         if signal != "NEUTRAL" and ML_MODEL:
             try:
+                # Real fvg_size_pips: use the FVG nearest to current price (same 'size'
+                # definition as build_dataset.py: abs(gap between candle wicks))
+                live_fvg_size = 0.0
+                if fvgs:
+                    nearest_fvg = min(
+                        fvgs,
+                        key=lambda f: abs(((f['top'] + f['bottom']) / 2) - current_price)
+                    )
+                    live_fvg_size = float(nearest_fvg.get('size', 0.0))
+
+                # Real momentum_ratio: 3-candle displacement vs ATR, mirroring
+                # build_dataset.py's `abs(closes[ob_idx+2] - opens[ob_idx]) / atr`
+                opens_arr = df['Open'].values if 'Open' in df.columns else df['Close'].values
+                closes_arr = df['Close'].values
+                if len(closes_arr) >= 3:
+                    live_momentum = abs(closes_arr[-1] - opens_arr[-3])
+                else:
+                    live_momentum = 0.0
+                live_momentum_ratio = round(live_momentum / atr, 2) if atr > 0 else 1.0
+
                 features = pd.DataFrame([{
                     'type':          1 if signal == "BUY" else 0,
-                    'fvg_size_pips':  0.0,
+                    'fvg_size_pips':  live_fvg_size,
                     'rsi_at_entry':   rsi,
                     'atr_at_entry':   atr,
-                    'momentum_ratio': 1.0, 
+                    'momentum_ratio': live_momentum_ratio,
                     'news_bias':      news_val
                 }])
                 prob = ML_MODEL.predict_proba(features)[0][1]

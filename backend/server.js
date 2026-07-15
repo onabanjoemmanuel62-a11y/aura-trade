@@ -21,6 +21,9 @@ const newsRoutes = require('./routes/newsRoutes');
 // 👈 CRITICAL FIX: Import the midfield controller that gathers candle data
 const analysisController = require('./controllers/analysisController'); 
 
+// 👈 NEW: paper trade monitoring — closes OPEN trades when price hits their SL/TP
+const { evaluateOpenTrades } = require('./controllers/tradeController');
+
 // 🤖 NEW: Import the Telegram Sniper Bot
 const { startTelegramBot } = require('./scripts/telegramBot');
 
@@ -153,6 +156,12 @@ const handleNewTick = async (data, symbol) => {
     });
 
     await Promise.all(updatePromises);
+
+    // 👈 NEW: Check open paper trades on this symbol against the fresh tick's
+    // high/low, closing any that just hit their SL or TP. Reuses this existing
+    // 30-second live feed instead of running a separate polling loop.
+    await evaluateOpenTrades(symbol, data);
+
     io.emit('price-update', { symbol, ...data });
 
   } catch (err) {

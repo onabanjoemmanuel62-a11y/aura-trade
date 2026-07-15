@@ -1,0 +1,59 @@
+index,signal,confidence,entry,sl,tp,rr,phase,pattern_confirmed,news_bias,news_aligned,news_conflicted,news_alignment_event,outcome,sample
+3478,BUY,69,425.3,424.06,427.79,2.0,PULLBACK (Prep for Level 2 Trade),False,0,False,False,,LOSS,in-sample
+7177,BUY,65,463.0,461.39,466.21,2.0,PULLBACK (Prep for Level 2 Trade),False,0,False,False,,WIN,in-sample
+9407,BUY,72,551.1,548.52,556.26,2.0,PULLBACK (Prep for Level 2 Trade),False,0,False,False,,WIN,in-sample
+9794,BUY,80,552.2,549.22,558.16,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,LOSS,in-sample
+13530,BUY,76,621.6,618.32,628.16,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,LOSS,in-sample
+15635,BUY,71,662.7,660.03,668.04,2.0,PULLBACK (Prep for Level 2 Trade),False,1,True,False,ISM Manufacturing PMI,WIN,in-sample
+18298,BUY,74,707.8,704.63,714.14,2.0,PULLBACK (Prep for Level 2 Trade),False,0,False,False,,LOSS,in-sample
+18854,BUY,79,759.8,755.0,769.4,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,WIN,in-sample
+21092,BUY,72,973.3,966.1,987.7,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+23004,BUY,71,927.7,920.43,942.25,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+23412,SELL,66,913.8,919.81,901.78,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,WIN,in-sample
+23415,SELL,65,913.4,920.26,899.69,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,WIN,in-sample
+24847,SELL,69,730.7,744.29,703.53,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,in-sample
+25836,BUY,81,866.8,860.75,878.91,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,WIN,in-sample
+25890,BUY,70,857.3,848.42,875.06,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+28177,BUY,69,950.54,946.31,959.0,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,WIN,in-sample
+34457,BUY,65,1242.84,1235.65,1257.22,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+37431,SELL,82,1374.59,1379.59,1364.6,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,in-sample
+39575,BUY,77,1537.0,1532.41,1546.18,2.0,PULLBACK (Prep for Level 2 Trade),True,1,True,False,ISM Manufacturing PMI,WIN,in-sample
+44288,SELL,75,1648.77,1656.48,1633.34,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,WIN,in-sample
+47248,BUY,75,1765.59,1760.2,1776.37,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+47943,SELL,65,1713.75,1719.41,1702.44,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,True,ISM Manufacturing PMI,WIN,in-sample
+50194,BUY,67,1612.42,1607.29,1622.68,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,in-sample
+51366,BUY,65,1406.81,1400.11,1420.22,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,in-sample
+52231,BUY,66,1333.01,1323.74,1351.55,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+58109,SELL,72,1301.83,1306.14,1293.2,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,WIN,in-sample
+58230,SELL,74,1287.56,1291.76,1279.16,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,LOSS,in-sample
+60370,BUY,71,1216.12,1210.52,1227.32,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+66396,BUY,74,1073.05,1070.5,1078.15,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+67175,BUY,71,1215.77,1206.03,1235.26,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+69330,BUY,65,1318.13,1312.08,1330.24,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,WIN,in-sample
+74043,BUY,71,1287.95,1283.24,1297.36,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,LOSS,in-sample
+80582,BUY,67,1302.41,1296.98,1313.27,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+82132,BUY,65,1204.66,1201.72,1210.54,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+83231,BUY,66,1233.47,1228.48,1243.46,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+87851,BUY,71,1502.47,1497.68,1512.06,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,False,,LOSS,in-sample
+87965,BUY,71,1542.71,1536.08,1555.97,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,LOSS,in-sample
+89231,SELL,78,1466.96,1471.36,1458.17,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,True,PPI m/m,WIN,in-sample
+90254,BUY,82,1558.54,1551.83,1571.97,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,True,Retail Sales m/m,LOSS,in-sample
+90841,BUY,66,1651.4,1639.89,1674.42,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,LOSS,in-sample
+92604,BUY,80,1726.27,1716.09,1746.63,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,LOSS,in-sample
+92808,BUY,65,1766.64,1759.23,1781.47,2.0,PULLBACK (Prep for Level 2 Trade),False,0,False,False,,WIN,in-sample
+92963,BUY,71,1784.89,1777.65,1799.38,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,WIN,in-sample
+93079,BUY,70,1807.72,1799.82,1823.52,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,LOSS,in-sample
+97125,BUY,73,1737.99,1730.58,1752.81,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,LOSS,in-sample
+99046,BUY,75,1815.19,1807.78,1830.02,2.0,PULLBACK (Prep for Level 2 Trade),False,-1,False,True,Retail Sales m/m,LOSS,in-sample
+99279,BUY,74,1817.8,1811.73,1829.94,2.0,PULLBACK (Prep for Level 2 Trade),True,1,True,False,ISM Manufacturing PMI,LOSS,in-sample
+100191,SELL,69,1749.12,1757.23,1732.89,2.0,PULLBACK (Prep for Level 2 Trade),True,0,False,False,,WIN,out-of-sample
+105853,SELL,72,1716.49,1723.79,1701.89,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,LOSS,out-of-sample
+109149,BUY,71,1972.51,1964.08,1989.38,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,WIN,out-of-sample
+111446,SELL,67,1890.36,1896.68,1877.73,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,LOSS,out-of-sample
+114435,BUY,79,2026.9,2021.82,2037.06,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,out-of-sample
+116907,SELL,84,2409.1,2419.68,2387.93,2.0,PULLBACK (Prep for Level 2 Trade),True,-1,False,False,,WIN,out-of-sample
+117273,BUY,68,2458.32,2446.76,2481.45,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,False,,WIN,out-of-sample
+117719,BUY,67,2515.77,2509.03,2529.26,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,True,Retail Sales m/m,WIN,out-of-sample
+117838,BUY,69,2584.29,2564.56,2623.76,2.0,PULLBACK (Prep for Level 2 Trade),False,1,False,True,Retail Sales m/m,WIN,out-of-sample
+121006,BUY,68,3128.77,3099.19,3187.93,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,out-of-sample
+123272,SELL,70,3334.1,3343.17,3315.95,2.0,PULLBACK (Prep for Level 2 Trade),True,1,False,False,,LOSS,out-of-sample
