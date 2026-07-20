@@ -166,7 +166,7 @@ def load_csv_fallback():
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=False, errors='coerce')
             df.dropna(subset=['Date'], inplace=True)
-            df['Date'] = df['Date'].astype(np.int64) // 10**9
+            df['Date'] = (df['Date'] - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
 
         df.dropna(subset=numeric_cols, inplace=True)
         df.reset_index(drop=True, inplace=True)
@@ -225,37 +225,6 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     order = int(np.clip(ratio * 10, 5, 20))
     return order
 
-# Optional: Simple ZigZag (uncomment if you want to try instead of argrelextrema)
-"""
-def zigzag(df: pd.DataFrame, depth_pct: float = 0.005) -> Dict:
-   highs = df['High'].values
-   lows = df['Low'].values
-   closes = df['Close'].values
-   pivot_highs = []
-   pivot_lows = []
-   last_pivot_idx = 0
-   last_pivot_price = closes[0]
-   last_pivot_type = None
-
-   for i in range(1, len(closes)):
-       if highs[i] > last_pivot_price * (1 + depth_pct):
-           if last_pivot_type == 'high':
-               pivot_highs.pop()
-           pivot_highs.append(i)
-           last_pivot_idx = i
-           last_pivot_price = highs[i]
-           last_pivot_type = 'high'
-       elif lows[i] < last_pivot_price * (1 - depth_pct):
-           if last_pivot_type == 'low':
-               pivot_lows.pop()
-           pivot_lows.append(i)
-           last_pivot_idx = i
-           last_pivot_price = lows[i]
-           last_pivot_type = 'low'
-
-   return {'highs': np.array(pivot_highs), 'lows': np.array(pivot_lows)}
-"""
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 🟢 IMPROVED: ALPHAPEAK (BEAST MARKET SENTIMENT) ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,12 +244,6 @@ def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
         base_order = adaptive_swing_order(df, atr)
         order = base_order * 3          # Scale up for macro peaks (15–60 range)
         min_prominence = atr * 0.4      # Ignore very small peaks
-
-        # ─── Peak Detection ───
-        # You can switch to zigzag by uncommenting below and using zz['highs']/zz['lows']
-        # zz = zigzag(df, depth_pct=0.005)
-        # recent_peak_highs = zz['highs']
-        # recent_peak_lows = zz['lows']
 
         recent_peak_highs = argrelextrema(highs, np.greater, order=order)[0]
         recent_peak_lows  = argrelextrema(lows,  np.less,    order=order)[0]
@@ -679,14 +642,6 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
     Peak Formation High) chart patterns from real swing points, rather than
     relying purely on EMA trend direction (which only tells you the current
     bias, not whether an actual reversal shape has formed).
-
-    W pattern: two swing lows at a similar price level, separated by a swing
-    high that's meaningfully higher than both (the "middle peak" of the W),
-    with price having since reclaimed above the second low.
-
-    M pattern: mirror of the above — two swing highs at a similar level,
-    separated by a swing low meaningfully lower than both, with price having
-    since dropped back below the second high.
     """
     closes = df['Close'].values
     highs = df['High'].values
@@ -698,8 +653,8 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
     middle_prominence = atr * 0.5    # how much higher/lower the middle swing point must be
 
     result = {
-        "w_confirmed": False, "w_low1": None, "w_low2": None, "w_middle": None,
-        "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None,
+        "w_confirmed": False, "w_low1": None, "w_low2": None, "w_middle": None, "w_low2_idx": None,
+        "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None, "m_high2_idx": None,
     }
 
     recent_lows = sorted([int(i) for i in swing_lows if i >= cutoff])
@@ -723,6 +678,7 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
                         result["w_low1"] = float(low1_price)
                         result["w_low2"] = float(low2_price)
                         result["w_middle"] = float(middle_price)
+                        result["w_low2_idx"] = low2_idx
 
     # --- M pattern (double top) ---
     if len(recent_highs) >= 2:
@@ -742,11 +698,12 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
                         result["m_high1"] = float(high1_price)
                         result["m_high2"] = float(high2_price)
                         result["m_middle"] = float(middle_price)
+                        result["m_high2_idx"] = high2_idx
 
     return result
 
 
-def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
+def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_override: Optional[int] = None) -> Dict:
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -755,7 +712,10 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
     atr = calculate_atr(df, 14)
     if atr == 0: atr = float(df['Close'].mean()) * 0.001
 
-    swing_order = adaptive_swing_order(df, atr)
+    # swing_order_override exists ONLY for backtesting experiments (see
+    # peak_speed_experiment.py) — it's never set by the live /api/analyze
+    # endpoint, so live behavior is completely unchanged by this parameter.
+    swing_order = swing_order_override if swing_order_override is not None else adaptive_swing_order(df, atr)
     min_prominence = atr * 0.3
 
     raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
@@ -797,7 +757,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
             cross_idx = i
             break
 
-    search_start = max(0, len(closes) - 200)
+    # Anchor search must cover the WHOLE current cycle, not a fixed recent
+    # window — otherwise the true Peak Formation High/Low gets missed
+    # whenever the cycle is older than the window, and a lesser local
+    # extreme gets mislabeled as the peak. cross_idx (computed above) is
+    # exactly where this cycle began, so it's the correct bound.
+    search_start = cross_idx
     search_end   = len(closes)
 
     if is_bullish:
@@ -877,6 +842,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict) -> Dict:
         "w_confirmed":         pattern_info["w_confirmed"],
         "m_confirmed":         pattern_info["m_confirmed"],
         "pattern_info":        pattern_info,
+        "swing_order":         swing_order,
     }
 
 

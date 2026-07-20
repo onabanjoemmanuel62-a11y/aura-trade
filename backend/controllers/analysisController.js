@@ -79,8 +79,15 @@ exports.analyzePattern = async (req, res) => {
     try {
         const { timeframe, eventName, currency, symbol } = req.body;
 
-        // 👈 NEW: Safely grab the symbol, default to Gold if the frontend forgets to send it
-        const targetSymbol = symbol || 'GC=F';
+        // 👈 FIX: the frontend (App.js) sends the selected pair as `currency`
+        // (e.g. "EURUSD=X"), not `symbol`. This used to read ONLY `symbol`,
+        // which is never sent by the current frontend, so targetSymbol fell
+        // back to 'GC=F' (gold) on EVERY request regardless of which tab was
+        // active — every non-gold pair was silently being analyzed as gold.
+        // Accepting either field name fixes it without requiring a frontend
+        // change, and stays backward-compatible with any caller that DOES
+        // send `symbol` explicitly.
+        const targetSymbol = symbol || currency || 'GC=F';
 
         // ------------------------------------
         // PATH A: NEWS EVENT ANALYSIS (Legacy Logic)
@@ -105,7 +112,7 @@ exports.analyzePattern = async (req, res) => {
 
         console.log(`⏱️ Fetching 1H and 4H Data Matrix for ${targetSymbol}...`);
 
-        // 👈 NEW: Both queries strictly filter by the selected targetSymbol!
+        // Both queries strictly filter by the selected targetSymbol!
         const [raw1HCandles, raw4HCandles] = await Promise.all([
              Candle.find({ timeframe: '1h', symbol: targetSymbol }).sort({ time: -1 }).limit(3000).lean(),
              Candle.find({ timeframe: '4h', symbol: targetSymbol }).sort({ time: -1 }).limit(1000).lean()
@@ -149,7 +156,7 @@ exports.analyzePattern = async (req, res) => {
                 news_data: latestNews
             });
 
-            // 👈 NEW: Automatically open a paper trade if this signal qualifies.
+            // 👈 Automatically open a paper trade if this signal qualifies.
             // Fire this before responding, but never let it block or break the
             // actual analysis response — openPaperTradeIfEligible has its own
             // internal try/catch and resolves to null on any failure.

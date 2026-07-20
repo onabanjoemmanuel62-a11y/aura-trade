@@ -91,7 +91,7 @@ def load_csv(path):
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], format='mixed', dayfirst=False, errors='coerce')
         df.dropna(subset=['Date'], inplace=True)
-        df['Date'] = df['Date'].astype(np.int64) // 10 ** 9
+        df['Date'] = (df['Date'] - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
 
     df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
     df.reset_index(drop=True, inplace=True)
@@ -130,7 +130,7 @@ def load_news_events(path):
 
     df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
     df.dropna(subset=['datetime'], inplace=True)
-    df['epoch'] = df['datetime'].astype(np.int64) // 10 ** 9
+    df['epoch'] = (df['datetime'] - pd.Timestamp("1970-01-01")) // pd.Timedelta(seconds=1)
     df.sort_values('epoch', inplace=True)
     df.reset_index(drop=True, inplace=True)
 
@@ -210,12 +210,16 @@ def simulate_outcome(full_df, entry_idx, signal, sl, tp):
     return "NO_RESULT", None
 
 
-def generate_signal_at(full_df, i):
+def generate_signal_at(full_df, i, swing_order_override=None):
     """
     Reproduces brain.py's analyze() decision logic for a single point
     in time, using only data up to and including candle i (no lookahead).
     Returns a dict describing the signal, or None if no trade-eligible
     signal was generated at this candle.
+
+    swing_order_override: passed straight through to brain.analyze_market_structure.
+    None (default) = exact current behavior, unchanged. Only used by
+    peak_speed_experiment.py to test faster/slower pattern detection sensitivity.
     """
     window = full_df.iloc[max(0, i - ROLLING_WINDOW + 1):i + 1].reset_index(drop=True)
     if len(window) < 100:
@@ -231,7 +235,7 @@ def generate_signal_at(full_df, i):
     if atr == 0:
         return None
 
-    ms = brain.analyze_market_structure(window, profile)
+    ms = brain.analyze_market_structure(window, profile, swing_order_override=swing_order_override)
     cycle = ms['cycle']
     current_level = ms['level']
     phase_str = ms['phase_str']
@@ -239,6 +243,16 @@ def generate_signal_at(full_df, i):
     sweeps = ms['sweeps']
     w_confirmed = ms.get('w_confirmed', False)
     m_confirmed = ms.get('m_confirmed', False)
+
+    # Detection lag: how many candles ago the actual reversal point (the
+    # confirming second swing point of the W/M pattern) happened, vs right now.
+    # This is the real-world "we would have entered this many candles late" cost.
+    detection_lag_candles = None
+    pattern_info = ms.get('pattern_info', {})
+    if w_confirmed and pattern_info.get('w_low2_idx') is not None:
+        detection_lag_candles = (len(window) - 1) - pattern_info['w_low2_idx']
+    elif m_confirmed and pattern_info.get('m_high2_idx') is not None:
+        detection_lag_candles = (len(window) - 1) - pattern_info['m_high2_idx']
 
     bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
     order_blocks = brain.detect_order_blocks(window, ms['atr'], bias_str)
@@ -361,6 +375,7 @@ def generate_signal_at(full_df, i):
         "news_aligned": news_aligned,
         "news_conflicted": news_conflicted,
         "news_alignment_event": news_alignment_event,
+        "detection_lag_candles": detection_lag_candles,
     }
 
 
