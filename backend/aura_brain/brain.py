@@ -748,29 +748,54 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
     ema_200_array  = ema_200_series.values
 
     is_bullish = ema_50_array[-1] > ema_200_array[-1]
-    cross_idx = 0
-    for i in range(len(closes) - 2, 0, -1):
-        if is_bullish and ema_50_array[i] <= ema_200_array[i]:
-            cross_idx = i
-            break
-        elif not is_bullish and ema_50_array[i] >= ema_200_array[i]:
-            cross_idx = i
-            break
 
-    # Anchor search must cover the WHOLE current cycle, not a fixed recent
-    # window — otherwise the true Peak Formation High/Low gets missed
-    # whenever the cycle is older than the window, and a lesser local
-    # extreme gets mislabeled as the peak. cross_idx (computed above) is
-    # exactly where this cycle began, so it's the correct bound.
-    search_start = cross_idx
-    search_end   = len(closes)
+    def find_cross_idx(before_idx, target_bullish):
+        """Most recent index at or before before_idx where the EMA
+        relationship differs from target_bullish — i.e. the crossover
+        that started the regime target_bullish is currently in."""
+        for j in range(before_idx - 1, 0, -1):
+            eb = ema_50_array[j] > ema_200_array[j]
+            if eb != target_bullish:
+                return j
+        return 0
+
+    def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10):
+        """
+        Finds the true origin (highest high / lowest low) of the current
+        cycle. A naive search bounded to [most-recent-crossover, now] is
+        wrong most of the time: EMA crossovers are lagging by construction,
+        so by the time EMA50 actually crosses EMA200, price has usually
+        already turned — the real peak/trough sits BEFORE the crossover,
+        not after it. That produces a degenerate anchor sitting right on
+        the crossover candle itself instead of the actual swing extreme.
+
+        Fix: walk backward through crossovers, extending the search window
+        further back each time, until the found extreme is NOT sitting
+        right at the search boundary (i.e. it's a real interior extreme,
+        not an artifact of where the window happened to start).
+        """
+        boundary = current_idx
+        extreme_idx = current_idx
+        cross_idx_local = 0
+        for _ in range(max_lookback_crossings):
+            cross_idx_local = find_cross_idx(boundary, is_bullish_now)
+            if is_bullish_now:
+                extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:current_idx + 1]))
+            else:
+                extreme_idx = cross_idx_local + int(np.argmax(highs[cross_idx_local:current_idx + 1]))
+            if extreme_idx - cross_idx_local > 2 or cross_idx_local == 0:
+                break
+            boundary = cross_idx_local  # degenerate — extend the search further back
+        return extreme_idx
+
+    anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
 
     if is_bullish:
         use_bearish  = False
-        best_low_idx = search_start + int(np.argmin(lows[search_start:search_end]))
+        best_low_idx = anchor_idx_found
     else:
         use_bearish   = True
-        best_high_idx = search_start + int(np.argmax(highs[search_start:search_end]))
+        best_high_idx = anchor_idx_found
 
     if use_bearish:
         cycle        = "BEARISH CYCLE (Peak M)"
