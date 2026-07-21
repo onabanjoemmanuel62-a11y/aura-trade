@@ -759,20 +759,32 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
                 return j
         return 0
 
-    def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10):
+    def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
         """
         Finds the true origin (highest high / lowest low) of the current
         cycle. A naive search bounded to [most-recent-crossover, now] is
         wrong most of the time: EMA crossovers are lagging by construction,
         so by the time EMA50 actually crosses EMA200, price has usually
         already turned — the real peak/trough sits BEFORE the crossover,
-        not after it. That produces a degenerate anchor sitting right on
-        the crossover candle itself instead of the actual swing extreme.
+        not after it.
+
+        Two distinct failure modes get corrected here, both confirmed
+        against real production data:
+          1. Degenerate: the found extreme sits right on the crossover
+             candle itself (an artifact of where the window started, not
+             a real peak).
+          2. Edge-adjacent: the found extreme is a real interior point
+             (not degenerate), but a materially bigger extreme sits just
+             outside the window, in the edge_buffer candles immediately
+             before the crossover — e.g. a real swing high forms a day or
+             two before EMA50/EMA200 actually cross, and a boundary drawn
+             exactly at the crossover silently excludes it. This was
+             verified directly against live MongoDB candle data: the
+             backend anchored to 4129 while the true high just before the
+             crossover boundary was 4148.40, a real, meaningful miss.
 
         Fix: walk backward through crossovers, extending the search window
-        further back each time, until the found extreme is NOT sitting
-        right at the search boundary (i.e. it's a real interior extreme,
-        not an artifact of where the window happened to start).
+        further back each time, until neither failure mode applies.
         """
         boundary = current_idx
         extreme_idx = current_idx
@@ -783,9 +795,22 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
                 extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:current_idx + 1]))
             else:
                 extreme_idx = cross_idx_local + int(np.argmax(highs[cross_idx_local:current_idx + 1]))
-            if extreme_idx - cross_idx_local > 2 or cross_idx_local == 0:
+
+            degenerate = (extreme_idx - cross_idx_local) <= 2
+
+            edge_start = max(0, cross_idx_local - edge_buffer)
+            bigger_nearby = False
+            if edge_start < cross_idx_local:
+                if is_bullish_now:
+                    bigger_nearby = lows[edge_start:cross_idx_local].min() < lows[extreme_idx]
+                else:
+                    bigger_nearby = highs[edge_start:cross_idx_local].max() > highs[extreme_idx]
+
+            if (not degenerate) and (not bigger_nearby):
                 break
-            boundary = cross_idx_local  # degenerate — extend the search further back
+            if cross_idx_local == 0:
+                break
+            boundary = cross_idx_local  # extend the search further back
         return extreme_idx
 
     anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
