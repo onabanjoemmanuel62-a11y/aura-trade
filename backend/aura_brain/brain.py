@@ -759,6 +759,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
                 return j
         return 0
 
+    anchor_trace = []  # TEMPORARY debug instrumentation — remove once the live discrepancy is resolved
+
     def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
         """
         Finds the true origin (highest high / lowest low) of the current
@@ -789,7 +791,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         boundary = current_idx
         extreme_idx = current_idx
         cross_idx_local = 0
-        for _ in range(max_lookback_crossings):
+        for step in range(max_lookback_crossings):
             cross_idx_local = find_cross_idx(boundary, is_bullish_now)
             if is_bullish_now:
                 extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:current_idx + 1]))
@@ -800,11 +802,31 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
             edge_start = max(0, cross_idx_local - edge_buffer)
             bigger_nearby = False
+            edge_extreme_val = None
             if edge_start < cross_idx_local:
                 if is_bullish_now:
-                    bigger_nearby = lows[edge_start:cross_idx_local].min() < lows[extreme_idx]
+                    edge_extreme_val = float(lows[edge_start:cross_idx_local].min())
+                    bigger_nearby = edge_extreme_val < lows[extreme_idx]
                 else:
-                    bigger_nearby = highs[edge_start:cross_idx_local].max() > highs[extreme_idx]
+                    edge_extreme_val = float(highs[edge_start:cross_idx_local].max())
+                    bigger_nearby = edge_extreme_val > highs[extreme_idx]
+
+            anchor_trace.append({
+                "step": step,
+                "boundary_idx": int(boundary),
+                "boundary_time": int(dates[boundary]) if boundary < len(dates) else None,
+                "cross_idx": int(cross_idx_local),
+                "cross_time": int(dates[cross_idx_local]) if cross_idx_local < len(dates) else None,
+                "extreme_idx": int(extreme_idx),
+                "extreme_time": int(dates[extreme_idx]) if extreme_idx < len(dates) else None,
+                "extreme_price": float(highs[extreme_idx]) if not is_bullish_now else float(lows[extreme_idx]),
+                "degenerate": bool(degenerate),
+                "edge_start_idx": int(edge_start),
+                "edge_start_time": int(dates[edge_start]) if edge_start < len(dates) else None,
+                "edge_extreme_val": edge_extreme_val,
+                "bigger_nearby": bool(bigger_nearby),
+                "will_extend": bool((degenerate or bigger_nearby) and cross_idx_local != 0),
+            })
 
             if (not degenerate) and (not bigger_nearby):
                 break
@@ -814,6 +836,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         return extreme_idx
 
     anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
+
 
     if is_bullish:
         use_bearish  = False
@@ -893,6 +916,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         "m_confirmed":         pattern_info["m_confirmed"],
         "pattern_info":        pattern_info,
         "swing_order":         swing_order,
+        "anchor_trace":        anchor_trace,  # TEMPORARY — remove once the live discrepancy is resolved
     }
 
 
@@ -1206,6 +1230,7 @@ async def analyze(req: AnalysisRequest):
             ],
 
             "tradeSetup":  trade_setup,
+            "anchorTrace": ms.get('anchor_trace', []),  # TEMPORARY debug field — remove once resolved
             "dataSource":  data_source,
         }
 
@@ -1248,6 +1273,8 @@ async def debug_analysis(req: AnalysisRequest):
             "AlphaPeak Reason":   alpha['reason'],
             "Core Swings Highs":  ms.get('raw_highs', []),   # won't exist — for future
             "Core Swings Lows":   ms.get('raw_lows', []),    # won't exist — for future
+            "─── ANCHOR TRACE (TEMP) ───": "──────────────────────────────────────",
+            "Anchor Trace":       ms.get('anchor_trace', []),
         }
     except Exception as e:
         import traceback
