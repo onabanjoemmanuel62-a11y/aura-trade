@@ -749,17 +749,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
     is_bullish = ema_50_array[-1] > ema_200_array[-1]
 
-    def find_cross_idx(before_idx, target_bullish):
-        """Most recent index at or before before_idx where the EMA
-        relationship differs from target_bullish — i.e. the crossover
-        that started the regime target_bullish is currently in."""
-        for j in range(before_idx - 1, 0, -1):
-            eb = ema_50_array[j] > ema_200_array[j]
-            if eb != target_bullish:
-                return j
-        return 0
-
-    anchor_trace = []  # TEMPORARY debug instrumentation — remove once the live discrepancy is resolved
+    anchor_trace = []  # TEMPORARY debug instrumentation — remove once fully confirmed stable
 
     def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
         """
@@ -770,29 +760,38 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         already turned — the real peak/trough sits BEFORE the crossover,
         not after it.
 
-        Two distinct failure modes get corrected here, both confirmed
-        against real production data:
-          1. Degenerate: the found extreme sits right on the crossover
-             candle itself (an artifact of where the window started, not
-             a real peak).
-          2. Edge-adjacent: the found extreme is a real interior point
-             (not degenerate), but a materially bigger extreme sits just
-             outside the window, in the edge_buffer candles immediately
-             before the crossover — e.g. a real swing high forms a day or
-             two before EMA50/EMA200 actually cross, and a boundary drawn
-             exactly at the crossover silently excludes it. This was
-             verified directly against live MongoDB candle data: the
-             backend anchored to 4129 while the true high just before the
-             crossover boundary was 4148.40, a real, meaningful miss.
+        Precomputes every crossover index in one backward pass (most
+        recent first), then steps through that list directly. This
+        replaces an earlier version that re-derived the boundary on each
+        iteration by searching for "the most recent index where the EMA
+        state differs" starting FROM the previous boundary — but that
+        boundary point itself already satisfies that condition, so each
+        call just found itself one candle earlier instead of skipping to
+        the next REAL regime change. Confirmed live via anchor_trace: it
+        crawled back exactly 1 candle per step for all 10 iterations,
+        never escaping the noisy edge of the current regime, even though
+        it correctly detected (bigger_nearby=true) that a much larger
+        peak existed nearby the whole time.
 
-        Fix: walk backward through crossovers, extending the search window
-        further back each time, until neither failure mode applies.
+        Two failure modes are corrected once boundaries jump properly:
+          1. Degenerate: the found extreme sits right on the crossover
+             candle itself (an artifact of where the window started).
+          2. Edge-adjacent: a materially bigger extreme sits just outside
+             the window, in the edge_buffer candles immediately before
+             the crossover.
         """
-        boundary = current_idx
+        crossovers = []
+        prev_bullish = is_bullish_now
+        for j in range(current_idx - 1, 0, -1):
+            eb = ema_50_array[j] > ema_200_array[j]
+            if eb != prev_bullish:
+                crossovers.append(j)
+                prev_bullish = eb
+        crossovers.append(0)  # always allow searching back to the start of available data
+
         extreme_idx = current_idx
-        cross_idx_local = 0
-        for step in range(max_lookback_crossings):
-            cross_idx_local = find_cross_idx(boundary, is_bullish_now)
+        for step in range(min(max_lookback_crossings, len(crossovers))):
+            cross_idx_local = crossovers[step]
             if is_bullish_now:
                 extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:current_idx + 1]))
             else:
@@ -813,16 +812,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
             anchor_trace.append({
                 "step": step,
-                "boundary_idx": int(boundary),
-                "boundary_time": int(dates[boundary]) if boundary < len(dates) else None,
                 "cross_idx": int(cross_idx_local),
                 "cross_time": int(dates[cross_idx_local]) if cross_idx_local < len(dates) else None,
                 "extreme_idx": int(extreme_idx),
                 "extreme_time": int(dates[extreme_idx]) if extreme_idx < len(dates) else None,
                 "extreme_price": float(highs[extreme_idx]) if not is_bullish_now else float(lows[extreme_idx]),
                 "degenerate": bool(degenerate),
-                "edge_start_idx": int(edge_start),
-                "edge_start_time": int(dates[edge_start]) if edge_start < len(dates) else None,
                 "edge_extreme_val": edge_extreme_val,
                 "bigger_nearby": bool(bigger_nearby),
                 "will_extend": bool((degenerate or bigger_nearby) and cross_idx_local != 0),
@@ -832,7 +827,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
                 break
             if cross_idx_local == 0:
                 break
-            boundary = cross_idx_local  # extend the search further back
         return extreme_idx
 
     anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
