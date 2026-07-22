@@ -16,115 +16,18 @@ from starlette.responses import Response
 # ─────────────────────────────────────────────────────────────────────────────
 # Indicators
 # ─────────────────────────────────────────────────────────────────────────────
-from ta.trend import EMAIndicator, SMAIndicator
-from ta.momentum import RSIIndicator, StochasticOscillator
-
-import joblib
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
 
 CSV_FILENAME = "1h.csv"
 NODE_URL = "http://127.0.0.1:10000"
-
-# Backtest evidence (48 historical Level-1/2 trades): BUY signals won 38.7% (above the
-# 33.3% breakeven line for 2:1 R:R), while SELL signals won only 23.5% (well below it).
-# Toggle this off while SELL logic is investigated/improved separately.
-ALLOW_SELL_SIGNALS = True
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NEWS REACTION PATTERNS
-# From a historical event-study (news_impact_analysis.py) measuring how gold
-# actually moved after each USD high-impact news event type, across ~4,000
-# events (2007-2024). This ONLY includes patterns that passed a statistical
-# significance check (z-score vs a 50/50 coin flip) on large sample sizes
-# (100+ occurrences) — most event types showed no reliable bias and are
-# deliberately left out. These are unconditional directional tendencies
-# (which way gold tends to drift after this event fires), not a beat/miss
-# theory — use as a CONFIRMING factor for the existing MMM strategy, not a
-# standalone signal.
-# ─────────────────────────────────────────────────────────────────────────────
-NEWS_REACTION_PATTERNS = {
-    "ISM Manufacturing PMI":     {"bias": "UP",   "window_hours": 24},  # 56-57% UP, n=205, consistent at +1h and +24h
-    "PPI m/m":                   {"bias": "UP",   "window_hours": 24},  # 58-60% UP, n=164, consistent at +4h and +24h
-    "Non-Farm Employment Change": {"bias": "DOWN", "window_hours": 1},   # 57.1% DOWN, n=210, at +1h
-    "Retail Sales m/m":          {"bias": "DOWN", "window_hours": 1},   # 56.2% DOWN, n=194, at +1h
-    "Core Retail Sales m/m":     {"bias": "DOWN", "window_hours": 1},   # 56.0% DOWN, n=191, at +1h
-}
-
-# Backtest evidence so far is too thin to trust (only 7 trades total touched by
-# alignment: 4 aligned, 3 conflicted) and overall performance regressed when this
-# was first turned on (40.0% win rate -> 33.9%). Set to True only once a much
-# larger backtest sample shows the alignment bonus/penalty actually helps.
-# While False, news_aligned/news_conflicted are still computed and logged for
-# every trade (for future analysis) — they just don't affect confidence yet.
-APPLY_NEWS_ALIGNMENT_ADJUSTMENT = False
-
-
-def check_news_alignment(news_data: Optional[Dict], signal_direction: str, reference_time_epoch: Optional[float] = None) -> Dict:
-    """
-    Checks whether the most recent relevant news event matches a known,
-    statistically-validated directional pattern (NEWS_REACTION_PATTERNS),
-    and whether that pattern agrees or conflicts with the trade direction
-    the MMM engine is about to take. Used to nudge confidence up/down —
-    NOT to generate a signal on its own.
-
-    reference_time_epoch: what "now" means for the recency check. Live calls
-    should leave this as None (uses actual current time). Backtest calls
-    MUST pass the simulated candle's epoch here — otherwise every historical
-    event would incorrectly look infinitely old compared to today's real date.
-
-    Returns {"aligned": bool, "conflicted": bool, "event": str|None}.
-    """
-    result = {"aligned": False, "conflicted": False, "event": None}
-    if not news_data:
-        return result
-
-    event_name = news_data.get('event')
-    if not event_name or event_name not in NEWS_REACTION_PATTERNS:
-        return result
-
-    pattern = NEWS_REACTION_PATTERNS[event_name]
-
-    # Optional recency check — only applies if a usable timestamp is present.
-    # If the event happened longer ago than the pattern's measured window,
-    # it's stale and shouldn't influence the current signal.
-    event_time = news_data.get('time') or news_data.get('datetime')
-    if event_time is not None:
-        try:
-            if isinstance(event_time, (int, float)):
-                event_epoch = float(event_time)
-            else:
-                event_epoch = pd.to_datetime(event_time).timestamp()
-            now_epoch = reference_time_epoch if reference_time_epoch is not None else datetime.now(timezone.utc).timestamp()
-            hours_since = (now_epoch - event_epoch) / 3600
-            if hours_since > pattern["window_hours"] or hours_since < 0:
-                return result  # too old, or timestamp parsing gave something nonsensical
-        except Exception:
-            pass  # couldn't parse the timestamp — fall back to applying the pattern anyway
-
-    expected_signal = "BUY" if pattern["bias"] == "UP" else "SELL"
-    result["event"] = event_name
-    if signal_direction == expected_signal:
-        result["aligned"] = True
-    else:
-        result["conflicted"] = True
-    return result
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
-# Signal lock — prevents signal flipping on every refresh
-SIGNAL_LOCK = {}  
-
 base_dir = os.path.dirname(os.path.abspath(__file__))
-model_path = os.path.join(base_dir, "aura_model.pkl")
-
-try:
-    ML_MODEL = joblib.load(model_path)
-    logger.info("🧠 ML Brain loaded!")
-except Exception as e:
-    ML_MODEL = None
-    logger.warning("⚠️ ML Brain not found. Rule-based confidence active.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
@@ -226,79 +129,7 @@ def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
     return order
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🟢 IMPROVED: ALPHAPEAK (BEAST MARKET SENTIMENT) ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
-def analyze_alpha_peak(df: pd.DataFrame) -> Dict:
-    """
-    Improved AlphaPeak with adaptive order + prominence filter
-    """
-    try:
-        if len(df) < 100:
-            return {"signal": "NONE", "reason": "Not enough data for AlphaPeak"}
-
-        closes = df['Close']
-        highs = df['High'].values
-        lows = df['Low'].values
-
-        atr = calculate_atr(df, 14)
-        base_order = adaptive_swing_order(df, atr)
-        order = base_order * 3          # Scale up for macro peaks (15–60 range)
-        min_prominence = atr * 0.4      # Ignore very small peaks
-
-        recent_peak_highs = argrelextrema(highs, np.greater, order=order)[0]
-        recent_peak_lows  = argrelextrema(lows,  np.less,    order=order)[0]
-
-        # Simple prominence filter (difference from neighbors)
-        filtered_highs = []
-        for idx in recent_peak_highs:
-            if idx > order and idx < len(highs) - order:
-                left_min  = np.min(highs[idx-order:idx])
-                right_min = np.min(highs[idx+1:idx+order+1])
-                if highs[idx] - max(left_min, right_min) >= min_prominence:
-                    filtered_highs.append(idx)
-
-        filtered_lows = []
-        for idx in recent_peak_lows:
-            if idx > order and idx < len(lows) - order:
-                left_max  = np.max(lows[idx-order:idx])
-                right_max = np.max(lows[idx+1:idx+order+1])
-                if min(left_max, right_max) - lows[idx] >= min_prominence:
-                    filtered_lows.append(idx)
-
-        recent_peak_highs = np.array(filtered_highs)
-        recent_peak_lows  = np.array(filtered_lows)
-
-        # Debug logging — remove or comment out in production
-        logger.info(f"AlphaPeak: order={order}, prominence={min_prominence:.5f}")
-        logger.info(f"AlphaPeak detected highs: {recent_peak_highs.tolist()}")
-        logger.info(f"AlphaPeak detected lows : {recent_peak_lows.tolist()}")
-
-        last_index = len(df) - 1
-        recent_bull_peak = any((last_index - idx) <= 5 for idx in recent_peak_lows)
-        recent_bear_peak = any((last_index - idx) <= 5 for idx in recent_peak_highs)
-
-        # 1. Moving Average Trend Filter
-        sma_10 = SMAIndicator(close=closes, window=10).sma_indicator().iloc[-1]
-        sma_15 = SMAIndicator(close=closes, window=15).sma_indicator().iloc[-1]
-
-        # 2. Stochastic
-        stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=closes, window=7, smooth_window=3)
-        current_stoch = stoch.stoch().iloc[-1]
-
-        # 3. Rules
-        if recent_bull_peak and sma_10 > sma_15 and current_stoch < 30.0:
-            return {"signal": "BUY", "reason": "AlphaPeak Buy Vector (Low Peak + Trend Up + Oversold)"}
-        elif recent_bear_peak and sma_10 < sma_15 and current_stoch > 70.0:
-            return {"signal": "SELL", "reason": "AlphaPeak Sell Vector (High Peak + Trend Down + Overbought)"}
-
-        return {"signal": "NONE", "reason": "No AlphaPeak confluence"}
-
-    except Exception as e:
-        logger.error(f"AlphaPeak analysis failed: {e}")
-        return {"signal": "NONE", "reason": "AlphaPeak Engine Error"}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE  — "Aura MMM v2.1 → v2.3 (improved peaks)"
+# CORE ENGINE — Peak Formation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -327,122 +158,6 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
         tr_list.append(tr)
     tr_series = pd.Series(tr_list)
     return float(tr_series.rolling(period).mean().iloc[-1]) if len(tr_list) >= period else float(tr_series.mean())
-
-def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
-    closes = df['Close'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    obs = []
-    # look at last 100 candles only — recent OBs matter most
-    start = max(0, len(closes) - 100)
-
-    for i in range(start + 2, len(closes) - 1):
-        body_size = abs(closes[i] - closes[i-1])
-        if body_size < atr * 0.3:
-            continue  # ignore small candles, not a real OB
-
-        if bias == 'BULLISH':
-            # Bullish OB: last bearish candle before a strong bullish impulse
-            is_bearish_candle = closes[i-1] < closes[i-2]  # candle i-1 closed down
-            strong_up_move    = closes[i] > highs[i-1] and (closes[i] - closes[i-1]) > atr * 0.8
-            if is_bearish_candle and strong_up_move:
-                obs.append({
-                    'type':       'BULL_OB',
-                    'top':        float(highs[i-1]),
-                    'bottom':     float(lows[i-1]),
-                    'time':       int(dates[i-1]),
-                    'end_time':   int(dates[-1]),
-                    'label':      'Bull OB',
-                    'mitigated':  float(lows[-1]) > float(lows[i-1])  # price hasn't returned yet
-                })
-        else:
-            # Bearish OB: last bullish candle before a strong bearish impulse
-            is_bullish_candle = closes[i-1] > closes[i-2]
-            strong_down_move  = closes[i] < lows[i-1] and (closes[i-1] - closes[i]) > atr * 0.8
-            if is_bullish_candle and strong_down_move:
-                obs.append({
-                    'type':       'BEAR_OB',
-                    'top':        float(highs[i-1]),
-                    'bottom':     float(lows[i-1]),
-                    'time':       int(dates[i-1]),
-                    'end_time':   int(dates[-1]),
-                    'label':      'Bear OB',
-                    'mitigated':  float(highs[-1]) < float(highs[i-1])
-                })
-
-    # return only last 3 unmitigated OBs — most recent ones only
-    unmitigated = [ob for ob in obs if not ob['mitigated']]
-    return unmitigated[-3:] if unmitigated else obs[-2:]
-
-
-def detect_fvgs(df: pd.DataFrame, atr: float, bias: str) -> List[Dict]:
-    highs = df['High'].values
-    lows  = df['Low'].values
-    dates = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    fvgs = []
-    start = max(0, len(highs) - 100)
-
-    for i in range(start + 1, len(highs) - 1):
-        if bias == 'BULLISH':
-            gap = lows[i+1] - highs[i-1]
-            if gap > atr * 0.3:
-                filled = any(lows[j] <= highs[i-1] for j in range(i+2, len(lows)))
-                if not filled:
-                    fvgs.append({
-                        'type':     'BULL_FVG',
-                        'top':      float(lows[i+1]),
-                        'bottom':   float(highs[i-1]),
-                        'time':     int(dates[i]),
-                        'end_time': int(dates[-1]),
-                        'label':    'FVG',
-                        'size':     float(gap)
-                    })
-        else:
-            gap = lows[i-1] - highs[i+1]
-            if gap > atr * 0.3:
-                filled = any(highs[j] >= lows[i-1] for j in range(i+2, len(highs)))
-                if not filled:
-                    fvgs.append({
-                        'type':     'BEAR_FVG',
-                        'top':      float(lows[i-1]),
-                        'bottom':   float(highs[i+1]),
-                        'time':     int(dates[i]),
-                        'end_time': int(dates[-1]),
-                        'label':    'FVG',
-                        'size':     float(gap)
-                    })
-
-    return fvgs[-3:]
-
-
-def get_session_levels(df: pd.DataFrame) -> Dict:
-    if len(df) < 24:
-        return {}
-
-    try:
-        prev_day    = df.iloc[-48:-24]
-        weekly_open = df.iloc[-120] if len(df) >= 120 else df.iloc[0]
-
-        prev_day_high  = float(prev_day['High'].max())
-        prev_day_low   = float(prev_day['Low'].min())
-        weekly_open_px = float(weekly_open['Open']) if 'Open' in df.columns else float(weekly_open['Close'])
-        current_price  = float(df['Close'].iloc[-1])
-
-        return {
-            'prev_day_high':  prev_day_high,
-            'prev_day_low':   prev_day_low,
-            'weekly_open':    weekly_open_px,
-            'price_vs_pdh':   current_price > prev_day_high,
-            'price_vs_pdl':   current_price < prev_day_low,
-            'price_vs_wopen': current_price > weekly_open_px,
-        }
-    except Exception as e:
-        logger.error(f"Session levels error: {e}")
-        return {}
-
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
     sweeps = []
@@ -486,154 +201,6 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
                 break
     sweeps.sort(key=lambda x: x['sweep_idx'])
     return sweeps[-5:]
-
-def detect_mmm_consolidations(df: pd.DataFrame, anchor_idx: int, cycle: str, atr: float, ema_50: np.ndarray, ema_200: np.ndarray) -> List[Dict]:
-    closes = df['Close'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-
-    boxes = []
-    min_candles = 5
-    max_candles = 60
-    atr_threshold = 3.5
-    displacement_ratio = 0.65
-
-    search_start = anchor_idx
-
-    start = search_start
-    while start < len(closes) - min_candles * 3:
-
-        acc_high = highs[start]
-        acc_low  = lows[start]
-        acc_end  = -1
-
-        for i in range(start + 1, min(start + max_candles, len(closes))):
-            acc_high = max(acc_high, highs[i])
-            acc_low  = min(acc_low,  lows[i])
-            acc_range = acc_high - acc_low
-
-            if acc_range > atr * atr_threshold:
-                break
-
-            if i - start >= min_candles:
-                acc_end = i
-
-        if acc_end == -1:
-            start += 1
-            continue
-
-        acc_range  = acc_high - acc_low
-        acc_mid    = (acc_high + acc_low) / 2
-
-        manip_found = False
-        manip_idx   = -1
-        manip_low   = acc_low
-        manip_high  = acc_high
-        sweep_type  = None
-
-        for i in range(acc_end + 1, min(acc_end + 20, len(closes))):
-            if cycle.startswith("BULLISH"):
-                if lows[i] < acc_low - (atr * 0.1):
-                    manip_found = True
-                    manip_idx   = i
-                    manip_low   = lows[i]
-                    sweep_type  = "SSL_SWEEP"
-                    break
-            else:
-                if highs[i] > acc_high + (atr * 0.1):
-                    manip_found = True
-                    manip_idx   = i
-                    manip_high  = highs[i]
-                    sweep_type  = "BSL_SWEEP"
-                    break
-
-        if not manip_found:
-            start += 1
-            continue
-
-        distrib_found = False
-        distrib_idx   = -1
-        fvg_top       = None
-        fvg_bottom    = None
-
-        for i in range(manip_idx + 1, min(manip_idx + 15, len(closes))):
-            candle_range = highs[i] - lows[i]
-
-            if 'Open' in df.columns:
-                candle_body = abs(closes[i] - df['Open'].values[i])
-            else:
-                candle_body = abs(closes[i] - closes[i-1])
-
-            body_ratio = candle_body / candle_range if candle_range > 0 else 0
-
-            if cycle.startswith("BULLISH"):
-                is_bullish_candle = closes[i] > closes[i-1]
-                strong_move = candle_range >= atr * 0.8
-                closes_above_mid = closes[i] > acc_mid
-
-                if is_bullish_candle and strong_move and closes_above_mid and body_ratio >= displacement_ratio:
-                    distrib_found = True
-                    distrib_idx   = i
-                    if i + 1 < len(lows):
-                        fvg_top    = lows[i+1] if lows[i+1] > highs[i-1] else highs[i-1]
-                        fvg_bottom = highs[i-1]
-                    break
-            else:
-                is_bearish_candle = closes[i] < closes[i-1]
-                strong_move = candle_range >= atr * 0.8
-                closes_below_mid = closes[i] < acc_mid
-
-                if is_bearish_candle and strong_move and closes_below_mid and body_ratio >= displacement_ratio:
-                    distrib_found = True
-                    distrib_idx   = i
-                    if i + 1 < len(highs):
-                        fvg_top    = lows[i-1]
-                        fvg_bottom = highs[i+1] if highs[i+1] < lows[i-1] else lows[i-1]
-                    break
-
-        if not distrib_found:
-            start += 1
-            continue
-
-        if fvg_top and fvg_bottom and fvg_top > fvg_bottom:
-            entry_zone_top    = float(fvg_top)
-            entry_zone_bottom = float(fvg_bottom)
-            entry_label = "FVG Entry Zone"
-        else:
-            entry_zone_top    = float(ema_50[distrib_idx] + atr * 0.5)
-            entry_zone_bottom = float(ema_50[distrib_idx] - atr * 0.5)
-            entry_label = "EMA Entry Zone"
-
-        box_type = "BULL_CONS" if cycle.startswith("BULLISH") else "BEAR_CONS"
-        box_num  = len(boxes) + 1
-
-        boxes.append({
-            "time":                 int(dates[start]),
-            "end_time":             int(dates[distrib_idx]),
-            "pullback_zone_end_time": int(dates[min(distrib_idx + 30, len(dates) - 1)]),
-            "top":                  float(acc_high),
-            "bottom":               float(manip_low if cycle.startswith("BULLISH") else acc_low),
-            "type":                 box_type,
-            "label":                f"MMM L{box_num} ({sweep_type})",
-            "breakout_dir":         "up" if cycle.startswith("BULLISH") else "down",
-            "pullback_zone_top":    entry_zone_top,
-            "pullback_zone_bottom": entry_zone_bottom,
-            "pullback_label":       entry_label,
-            "acc_high":             float(acc_high),
-            "acc_low":              float(acc_low),
-            "manip_low":            float(manip_low),
-            "manip_high":           float(manip_high),
-        })
-
-        start = distrib_idx + 1
-        if len(boxes) >= 2:
-            break
-        continue
-
-        start += 1
-        
-    return boxes
 
 
 def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float, lookback: int = 150) -> Dict:
@@ -749,8 +316,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
     is_bullish = ema_50_array[-1] > ema_200_array[-1]
 
-    anchor_trace = []  # TEMPORARY debug instrumentation — remove once fully confirmed stable
-
     def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
         """
         Finds the true origin (highest high / lowest low) of the current
@@ -761,17 +326,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         not after it.
 
         Precomputes every crossover index in one backward pass (most
-        recent first), then steps through that list directly. This
-        replaces an earlier version that re-derived the boundary on each
-        iteration by searching for "the most recent index where the EMA
-        state differs" starting FROM the previous boundary — but that
-        boundary point itself already satisfies that condition, so each
-        call just found itself one candle earlier instead of skipping to
-        the next REAL regime change. Confirmed live via anchor_trace: it
-        crawled back exactly 1 candle per step for all 10 iterations,
-        never escaping the noisy edge of the current regime, even though
-        it correctly detected (bigger_nearby=true) that a much larger
-        peak existed nearby the whole time.
+        recent first), then steps through that list directly — each step
+        jumps a whole regime rather than crawling one candle at a time.
 
         Two failure modes are corrected once boundaries jump properly:
           1. Degenerate: the found extreme sits right on the crossover
@@ -801,27 +357,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
             edge_start = max(0, cross_idx_local - edge_buffer)
             bigger_nearby = False
-            edge_extreme_val = None
             if edge_start < cross_idx_local:
                 if is_bullish_now:
-                    edge_extreme_val = float(lows[edge_start:cross_idx_local].min())
-                    bigger_nearby = edge_extreme_val < lows[extreme_idx]
+                    bigger_nearby = lows[edge_start:cross_idx_local].min() < lows[extreme_idx]
                 else:
-                    edge_extreme_val = float(highs[edge_start:cross_idx_local].max())
-                    bigger_nearby = edge_extreme_val > highs[extreme_idx]
-
-            anchor_trace.append({
-                "step": step,
-                "cross_idx": int(cross_idx_local),
-                "cross_time": int(dates[cross_idx_local]) if cross_idx_local < len(dates) else None,
-                "extreme_idx": int(extreme_idx),
-                "extreme_time": int(dates[extreme_idx]) if extreme_idx < len(dates) else None,
-                "extreme_price": float(highs[extreme_idx]) if not is_bullish_now else float(lows[extreme_idx]),
-                "degenerate": bool(degenerate),
-                "edge_extreme_val": edge_extreme_val,
-                "bigger_nearby": bool(bigger_nearby),
-                "will_extend": bool((degenerate or bigger_nearby) and cross_idx_local != 0),
-            })
+                    bigger_nearby = highs[edge_start:cross_idx_local].max() > highs[extreme_idx]
 
             if (not degenerate) and (not bigger_nearby):
                 break
@@ -830,7 +370,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         return extreme_idx
 
     anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
-
 
     if is_bullish:
         use_bearish  = False
@@ -854,37 +393,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr)
-    consolidation_boxes = detect_mmm_consolidations(df, anchor_idx, cycle, atr, ema_50_array, ema_200_array)
-    if consolidation_boxes:
-        consolidation_boxes = consolidation_boxes[-2:]
-    total_boxes = len(consolidation_boxes)
-    in_pullback = False
-
-    if total_boxes == 0:
-        display_level = 1
-        phase_str = "LEVEL 1 (Initial Breakaway - No Trade Zone)"
-    else:
-        last_box     = consolidation_boxes[-1]
-        breakout_dir = last_box.get('breakout_dir', 'none')
-
-        if breakout_dir == 'none' or last_box['end_time'] == int(dates[-1]):
-            in_pullback   = True
-            target_lvl    = total_boxes + 1
-            phase_str     = f"PULLBACK (Prep for Level {target_lvl} Trade)"
-            display_level = total_boxes
-        elif (cycle.startswith("BEARISH") and breakout_dir == "up") or \
-             (cycle.startswith("BULLISH") and breakout_dir == "down"):
-            in_pullback   = False
-            display_level = total_boxes
-            phase_str     = "CYCLE FAILED (Reversal Detected)"
-        else:
-            in_pullback = False
-            if total_boxes == 2:
-                display_level = 3
-                phase_str     = "LEVEL 3 EXHAUSTION (Blowoff Active)"
-            else:
-                display_level = total_boxes + 1
-                phase_str     = f"LEVEL {display_level} (Pushing Active)"
 
     all_lines = [{
         "level":      anchor_price,
@@ -896,43 +404,19 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
     }]
 
     return {
-        "cycle":               cycle,
-        "level":               display_level,
-        "phase_str":           phase_str,
-        "in_pullback":         in_pullback,
-        "lines":               all_lines,
-        "anchor":              anchor_price,
-        "anchor_idx":          int(anchor_idx),
-        "atr":                 atr,
-        "sweeps":              sweeps,
-        "consolidation_boxes": consolidation_boxes,
-        "w_confirmed":         pattern_info["w_confirmed"],
-        "m_confirmed":         pattern_info["m_confirmed"],
-        "pattern_info":        pattern_info,
-        "swing_order":         swing_order,
-        "anchor_trace":        anchor_trace,  # TEMPORARY — remove once the live discrepancy is resolved
+        "cycle":         cycle,
+        "lines":         all_lines,
+        "anchor":        anchor_price,
+        "anchor_idx":    int(anchor_idx),
+        "atr":           atr,
+        "sweeps":        sweeps,
+        "w_confirmed":   pattern_info["w_confirmed"],
+        "m_confirmed":   pattern_info["m_confirmed"],
+        "pattern_info":  pattern_info,
+        "swing_order":   swing_order,
+        "raw_highs":     raw_highs.tolist(),  # swing-high indices since the anchor — exposed for the upcoming trendline fit
+        "raw_lows":      raw_lows.tolist(),   # swing-low indices — same purpose
     }
-
-
-def score_mmm_setup(current_price, ema_50, ema_200, rsi, level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present=False, fvg_present=False, session_aligned=False, htf_aligned=False, pattern_confirmed=False) -> int:
-    if "FAILED" in phase_str: return 0
-    if not in_pullback: return 0
-
-    score = 0
-    if htf_aligned: score += 20
-    if level in [1, 2]: score += 15
-    elif level >= 3: score -= 10
-    dist = abs(current_price - ema_50)
-    if dist <= atr * 0.5: score += 15
-    elif dist <= atr * 1.0: score += 8
-    if ob_present: score += 15
-    if fvg_present: score += 10
-    if sweep_nearby: score += 10
-    if session_aligned: score += 5
-    if pattern_confirmed: score += 15  # confirmed W (BUY) or M (SELL) double-pattern, tested via backtest confidence-bucket analysis
-    if cycle.startswith("BULLISH") and rsi < 50: score += 5
-    elif cycle.startswith("BEARISH") and rsi > 50: score += 5
-    return min(max(score, 0), 99)
 
 
 def calculate_trade_levels(current_price: float, signal: str,
@@ -992,44 +476,46 @@ async def analyze(req: AnalysisRequest):
 
         ema_bias = "ABOVE 200 EMA" if current_price > ema_200 else "BELOW 200 EMA"
 
-        news_val    = 0
         news_string = "No recent impactful news."
         if req.news_data:
             actual   = safe_float(req.news_data.get('actual', 0))
             forecast = safe_float(req.news_data.get('forecast', 0))
             event    = req.news_data.get('event', 'News Event')
             if actual > forecast:
-                news_val    = -1   
                 news_string = f"📰 {event}: Beat forecast ({actual} vs {forecast}). USD bullish."
             elif actual < forecast:
-                news_val    = 1
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
         ms = analyze_market_structure(df, profile)
-        cycle         = ms['cycle']
-        current_level = ms['level']
-        phase_str     = ms['phase_str']
-        in_pullback   = ms['in_pullback']
-        lines         = ms['lines']
-        sweeps        = ms['sweeps']
-        boxes         = ms.get('consolidation_boxes', [])
-        w_confirmed   = ms.get('w_confirmed', False)
-        m_confirmed   = ms.get('m_confirmed', False)
+        cycle       = ms['cycle']
+        lines       = ms['lines']
+        sweeps      = ms['sweeps']
+        w_confirmed = ms.get('w_confirmed', False)
+        m_confirmed = ms.get('m_confirmed', False)
 
-        # ICT triggers
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
-        order_blocks = detect_order_blocks(df, ms['atr'], bias_str)
-        fvgs         = detect_fvgs(df, ms['atr'], bias_str)
-        session_lvls = get_session_levels(df)
 
-        ob_present = any(
-            (ob['bottom'] - ms['atr']) <= current_price <= (ob['top'] + ms['atr'])
-            for ob in order_blocks
-        )
-        fvg_present = any(
-            (fvg['bottom'] - ms['atr']) <= current_price <= (fvg['top'] + ms['atr'])
-            for fvg in fvgs
-        )
+        sweep_nearby = False
+        sweep_str = ""
+        if sweeps:
+            last_sweep = sweeps[-1]
+            candle_age = len(df) - 1 - last_sweep['sweep_idx']
+            if candle_age <= 15:
+                sweep_nearby = True
+                sweep_str = f"🎯 Stop Hunt / Pin detected at {last_sweep['level']:.{decimals}f}."
+
+        reasoning = [
+            f"🧭 Market Maker Bias: {cycle}",
+            f"📈 Price vs Macro Trend: {ema_bias}",
+            news_string,
+        ]
+        if sweep_str:
+            reasoning.append(sweep_str)
+        if cycle.startswith("BEARISH"):
+            reasoning.append("✅ M pattern (double-top) confirmed." if m_confirmed else "⏳ No confirmed M (double-top) pattern yet.")
+        else:
+            reasoning.append("✅ W pattern (double-bottom) confirmed." if w_confirmed else "⏳ No confirmed W (double-bottom) pattern yet.")
+        reasoning.append("🚧 Trendline reversal signal in development — no trade signal generated yet.")
 
         htf_aligned = False
         if req.htf_candles and len(req.htf_candles) > 50:
@@ -1043,164 +529,11 @@ async def analyze(req: AnalysisRequest):
             htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
                           (cycle.startswith('BEARISH') and ema_50 < ema_200)
 
-        current_utc_hour = datetime.now(timezone.utc).hour
-        session_aligned = (8 <= current_utc_hour < 17) or (13 <= current_utc_hour < 22)
-
-        alpha_data = analyze_alpha_peak(df)
-        alpha_signal = alpha_data["signal"]
-        alpha_reason = alpha_data["reason"]
-
-        sweep_nearby = False
-        sweep_str = ""
-        if sweeps:
-            last_sweep = sweeps[-1]
-            candle_age = len(df) - 1 - last_sweep['sweep_idx']
-            if candle_age <= 15:
-                sweep_nearby = True
-                sweep_str = f"🎯 Stop Hunt / Pin detected at {last_sweep['level']:.{decimals}f}."
-
-        signal     = "NEUTRAL"
-        confidence = 0
-
-        reasoning = [
-            f"🧭 Market Maker Bias: {cycle}",
-            f"📊 Phase: {phase_str}",
-            f"📈 Price vs Macro Trend: {ema_bias}",
-            news_string,
-        ]
-
-        if sweep_str: reasoning.append(sweep_str)
-
-        dist = abs(current_price - ema_50)
-
-        if "FAILED" in phase_str:
-            reasoning.append("⚠️ Trend structure broken. Awaiting 200 EMA crossover to reset Anchor.")
-        elif "No Trade Zone" in phase_str:
-            reasoning.append("🚫 Level 1 Breakaway active. Waiting for first consolidation pullback to trade.")
-        elif "EXHAUSTION" in phase_str and not in_pullback:
-            reasoning.append("⏳ Level 3 Exhaustion. Anticipating macro reversal or reset.")
-        elif not in_pullback:
-            reasoning.append("🔄 Expansion phase active. Waiting for pullback to 50 EMA before entering.")
-        elif current_level >= 2:
-            # Backtest evidence (83 historical trades): Level 3 setups (current_level == 2,
-            # i.e. targeting the 3rd consolidation) won only 17.1% of the time vs 33.3% for
-            # Level 2 setups. Blocking these removes the system's worst-performing trade class.
-            reasoning.append("🚫 Level 3 setup detected — historically low win rate (17.1%). Skipping entry.")
-        else:
-            if cycle.startswith("BULLISH"):
-                if current_price >= ema_50 * 0.998 and dist <= (atr * 1.5):
-                    signal = "BUY"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned, pattern_confirmed=w_confirmed)
-                    pattern_note = " (W pattern confirmed)" if w_confirmed else ""
-                    reasoning.append(f"🔥 KILLZONE: Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}{pattern_note}.")
-                else:
-                    reasoning.append(f"📍 Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
-            else:
-                if not ALLOW_SELL_SIGNALS:
-                    reasoning.append("🚫 SELL signals currently disabled.")
-                elif not m_confirmed:
-                    # Backtest evidence: M-pattern-confirmed SELLs won 57.1% vs 23.5% for
-                    # trend-only SELLs. Unlike BUY, this stays a hard requirement for SELL.
-                    reasoning.append("⏳ Bearish trend active, but no confirmed M (double-top) pattern yet. Waiting.")
-                elif current_price <= ema_50 * 1.002 and dist <= (atr * 1.5):
-                    signal = "SELL"
-                    confidence = score_mmm_setup(current_price, ema_50, ema_200, rsi, current_level, in_pullback, cycle, sweep_nearby, atr, phase_str, ob_present, fvg_present, session_aligned, htf_aligned, pattern_confirmed=True)
-                    reasoning.append(f"🔥 KILLZONE: M pattern confirmed. Entering on 50 EMA for {phase_str.split('(')[-1].strip(')')}.")
-                else:
-                    reasoning.append(f"📍 M pattern confirmed. Pulling back. Waiting for tap on 50 EMA ({ema_50:.{decimals}f}).")
-
-        if signal != "NEUTRAL":
-            if alpha_signal == signal:
-                confidence = min(confidence + 15, 99)
-                reasoning.append(f"🐺 BEAST SENTIMENT CONFLUENCE: {alpha_reason} (+15% Confidence)")
-            elif alpha_signal != "NONE":
-                confidence = max(confidence - 20, 10)
-                reasoning.append(f"⚠️ CONFLICT: AlphaPeak suggests {alpha_signal}. Reducing confidence.")
-
-        if signal != "NEUTRAL":
-            news_check = check_news_alignment(req.news_data, signal)
-            if news_check["aligned"]:
-                if APPLY_NEWS_ALIGNMENT_ADJUSTMENT:
-                    confidence = min(confidence + 10, 99)
-                    reasoning.append(f"📰 NEWS ALIGNMENT: {news_check['event']} historically supports this direction. (+10% Confidence)")
-                else:
-                    reasoning.append(f"📰 NEWS ALIGNMENT (observe-only, not yet affecting confidence): {news_check['event']} historically supports this direction.")
-            elif news_check["conflicted"]:
-                if APPLY_NEWS_ALIGNMENT_ADJUSTMENT:
-                    confidence = max(confidence - 10, 10)
-                    reasoning.append(f"⚠️ NEWS CONFLICT: {news_check['event']} historically favors the opposite direction. (-10% Confidence)")
-                else:
-                    reasoning.append(f"⚠️ NEWS CONFLICT (observe-only, not yet affecting confidence): {news_check['event']} historically favors the opposite direction.")
-
-        if signal != "NEUTRAL" and ML_MODEL:
-            try:
-                # Real fvg_size_pips: use the FVG nearest to current price (same 'size'
-                # definition as build_dataset.py: abs(gap between candle wicks))
-                live_fvg_size = 0.0
-                if fvgs:
-                    nearest_fvg = min(
-                        fvgs,
-                        key=lambda f: abs(((f['top'] + f['bottom']) / 2) - current_price)
-                    )
-                    live_fvg_size = float(nearest_fvg.get('size', 0.0))
-
-                # Real momentum_ratio: 3-candle displacement vs ATR, mirroring
-                # build_dataset.py's `abs(closes[ob_idx+2] - opens[ob_idx]) / atr`
-                opens_arr = df['Open'].values if 'Open' in df.columns else df['Close'].values
-                closes_arr = df['Close'].values
-                if len(closes_arr) >= 3:
-                    live_momentum = abs(closes_arr[-1] - opens_arr[-3])
-                else:
-                    live_momentum = 0.0
-                live_momentum_ratio = round(live_momentum / atr, 2) if atr > 0 else 1.0
-
-                features = pd.DataFrame([{
-                    'type':          1 if signal == "BUY" else 0,
-                    'fvg_size_pips':  live_fvg_size,
-                    'rsi_at_entry':   rsi,
-                    'atr_at_entry':   atr,
-                    'momentum_ratio': live_momentum_ratio,
-                    'news_bias':      news_val
-                }])
-                prob = ML_MODEL.predict_proba(features)[0][1]
-                ml_conf = int(prob * 100)
-                confidence = int((confidence * 0.7) + (ml_conf * 0.3))
-                reasoning.append(f"🧠 ML Prediction: {ml_conf}% win probability.")
-            except Exception as ml_e:
-                logger.warning(f"ML inference failed: {ml_e}")
-
-        trade_setup = None
-        symbol_key = req.currency
-        existing_lock = SIGNAL_LOCK.get(symbol_key)
-        if existing_lock:
-            sl_breached = (existing_lock['signal'] == 'BUY' and current_price < existing_lock['sl']) or \
-                          (existing_lock['signal'] == 'SELL' and current_price > existing_lock['sl'])
-            bias_flipped = existing_lock['signal'] == 'BUY' and not cycle.startswith('BULLISH') or \
-                           existing_lock['signal'] == 'SELL' and not cycle.startswith('BEARISH')
-            if sl_breached or bias_flipped:
-                del SIGNAL_LOCK[symbol_key]
-            else:
-                signal = existing_lock['signal']
-                confidence = existing_lock['confidence']
-
-        if signal in ("BUY", "SELL") and confidence >= 65:
-            trade_setup = calculate_trade_levels(current_price, signal, atr, decimals, ema_50)
-            if trade_setup and symbol_key not in SIGNAL_LOCK:
-                SIGNAL_LOCK[symbol_key] = {
-                    'signal': signal,
-                    'confidence': confidence,
-                    'sl': trade_setup['stop_loss']
-                }
-            if trade_setup:
-                reasoning.append(
-                    f"📐 Setup: Entry {trade_setup['entry']} | SL {trade_setup['stop_loss']} | TP {trade_setup['take_profit']} | RR 1:{trade_setup['risk_reward']}"
-                )
-
         return {
-            "signal":     signal,
-            "confidence": int(confidence),
+            "signal":     "NEUTRAL",
+            "confidence": 0,
             "trend":      cycle,
-            "pattern":    "MMM Level Pullback to EMA",
+            "pattern":    "Peak Formation",
             "reasoning":  reasoning,
             "keyLevels": {
                 "resistance": round(current_price + (atr * 2), decimals),
@@ -1208,24 +541,16 @@ async def analyze(req: AnalysisRequest):
                 "ema200":     round(ema_200, decimals),
                 "ema50":      round(ema_50, decimals),
             },
-
             "visuals": {
-                "smc_zones":    boxes,
-                "bos_lines":    lines,
-                "fvgs":         fvgs,
-                "sweeps":       sweeps,
-                "order_blocks": order_blocks,
+                "bos_lines": lines,
+                "sweeps":    sweeps,
             },
             "mtf_confluence": [
-                {"tf": "4H",  "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 40},
-                {"tf": "1H", "bias": bias_str, "strength": 75 if bias_str == "BULLISH" else 65 if bias_str == "BEARISH" else 20},
-                {"tf": "OB",  "bias": bias_str if len(order_blocks) > 0 else "NEUTRAL",  "strength": 80 if len(order_blocks) > 0 else 30},
-                {"tf": "FVG", "bias": bias_str if len(fvgs) > 0 else "NEUTRAL", "strength": 75 if len(fvgs) > 0 else 25},
+                {"tf": "4H", "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 40},
+                {"tf": "1H", "bias": bias_str, "strength": 75 if bias_str == "BULLISH" else 65},
             ],
-
-            "tradeSetup":  trade_setup,
-            "anchorTrace": ms.get('anchor_trace', []),  # TEMPORARY debug field — remove once resolved
-            "dataSource":  data_source,
+            "tradeSetup": None,
+            "dataSource": data_source,
         }
 
     except Exception as e:
@@ -1252,23 +577,20 @@ async def debug_analysis(req: AnalysisRequest):
         atr = calculate_atr(df, 14)
 
         ms = analyze_market_structure(df, profile)
-        alpha = analyze_alpha_peak(df)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain MMM v2.3 (improved peaks 2026)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.0 (MMM logic removed)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",
             "🎯 CYCLE":            ms['cycle'],
-            "📊 PHASE":            ms['phase_str'],
-            "📦 CONSOLIDATIONS":   ms.get('consolidation_boxes', []),
+            "⚓ ANCHOR":            ms['anchor'],
             "─── PEAK INFO ───": "──────────────────────────────────────",
-            "AlphaPeak Signal":   alpha['signal'],
-            "AlphaPeak Reason":   alpha['reason'],
-            "Core Swings Highs":  ms.get('raw_highs', []),   # won't exist — for future
-            "Core Swings Lows":   ms.get('raw_lows', []),    # won't exist — for future
-            "─── ANCHOR TRACE (TEMP) ───": "──────────────────────────────────────",
-            "Anchor Trace":       ms.get('anchor_trace', []),
+            "W (double-bottom) confirmed": ms.get('w_confirmed', False),
+            "M (double-top) confirmed":    ms.get('m_confirmed', False),
+            "Core Swing Highs":  ms.get('raw_highs', []),
+            "Core Swing Lows":   ms.get('raw_lows', []),
+            "Sweeps":            ms.get('sweeps', []),
         }
     except Exception as e:
         import traceback

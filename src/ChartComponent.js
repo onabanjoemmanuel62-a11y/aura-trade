@@ -19,144 +19,7 @@ const calculateEMA = (data, period) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟥 PLUGIN 1: MMM LEVEL CONSOLIDATION BOXES
-// ─────────────────────────────────────────────────────────────────────────────
-class BoxRenderer {
-  constructor(data) { this._data = data; }
-
-  draw(target) {
-    target.useBitmapCoordinateSpace((scope) => {
-      if (!this._data || this._data.length === 0) return;
-      const ctx  = scope.context;
-      const hPR  = scope.horizontalPixelRatio;
-      const vPR  = scope.verticalPixelRatio;
-      const rightEdge = scope.mediaSize.width * hPR;
-
-      this._data.forEach((zone) => {
-        if (zone.x === null || isNaN(zone.x)) return;
-
-        const x1 = zone.x * hPR;
-        const x2 = (zone.x2 !== null && !isNaN(zone.x2)) ? Math.min(zone.x2 * hPR, rightEdge) : rightEdge;
-
-        if (x1 >= rightEdge) return;
-        const width = x2 - x1;
-        if (width <= 0) return;
-
-        const yTop    = Math.min(zone.yTop, zone.yBottom) * vPR;
-        const yBottom = Math.max(zone.yTop, zone.yBottom) * vPR;
-        const height  = yBottom - yTop;
-        if (height <= 0) return;
-
-        // Fill Consolidation Box
-        ctx.fillStyle = zone.fillColor;
-        ctx.fillRect(x1, yTop, width, height);
-
-        // Border
-        ctx.strokeStyle = zone.borderColor;
-        ctx.lineWidth   = 1.5 * hPR;
-        ctx.setLineDash([]);
-        ctx.strokeRect(x1, yTop, width, height);
-
-        // Level Label
-        if (zone.label) {
-          const fontSize = Math.max(11, Math.min(14, height / vPR * 0.30)) * hPR;
-          const pad      = 6 * hPR;
-          ctx.font       = `bold ${fontSize}px monospace`;
-          ctx.fillStyle  = zone.borderColor;
-          ctx.fillText(zone.label, x1 + pad, yTop + fontSize * 1.2);
-        }
-
-        // Pullback entry zone — drawn to the right of the box
-        if (zone.pullbackTop !== null && zone.pullbackBottom !== null) {
-          const pyTop     = zone.pullbackTop * vPR;
-          const pyBottom  = zone.pullbackBottom * vPR;
-          const zoneX    = zone.x2 !== null ? zone.x2 * hPR : rightEdge;
-          // Only extend 30 candle-widths forward, not to infinity
-          const zoneEnd  = zone.x3 !== null ? Math.min(zone.x3 * hPR, rightEdge) : Math.min(zoneX + 200 * hPR, rightEdge);
-          const zoneWidth = zoneEnd - zoneX;
-          
-          if (zoneWidth > 0) {
-            ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.12)' : 'rgba(38,166,154,0.12)';
-            ctx.fillRect(zoneX, pyTop, zoneWidth, pyBottom - pyTop);
-            ctx.strokeStyle = zone.isBear ? 'rgba(239,83,80,0.6)' : 'rgba(38,166,154,0.6)';
-            ctx.lineWidth = 1 * hPR;
-            ctx.setLineDash([4 * hPR, 4 * hPR]);
-            ctx.beginPath();
-            ctx.moveTo(zoneX, pyTop);
-            ctx.lineTo(zoneEnd, pyTop);
-            ctx.stroke();
-            ctx.beginPath();
-            ctx.moveTo(zoneX, pyBottom);
-            ctx.lineTo(zoneEnd, pyBottom);
-            ctx.stroke();
-            ctx.setLineDash([]);
-            const lFontSize = 11 * hPR;
-            ctx.font      = `bold ${lFontSize}px monospace`;
-            ctx.fillStyle = zone.isBear ? 'rgba(239,83,80,0.9)' : 'rgba(38,166,154,0.9)';
-            ctx.fillText(zone.pullbackLabel || 'ENTRY ZONE', zoneX + 6 * hPR, pyTop + lFontSize * 1.4);
-          }
-        }
-
-      });
-    });
-  }
-}
-
-class BoxPaneView {
-  constructor(source) { this._source = source; }
-  renderer() { return new BoxRenderer(this._source._rendererData); }
-}
-
-class BoxPrimitive {
-  constructor() {
-    this._rendererData = [];
-    this._paneViews    = [new BoxPaneView(this)];
-  }
-
-  setData(zones, series, timeScale) {
-    if (!zones || !Array.isArray(zones)) { this._rendererData = []; return; }
-    this._rendererData = zones.map((zone) => {
-      if (!zone.time || zone.top == null || zone.bottom == null) return null;
-      let x1 = null, x2 = null;
-      try {
-        x1 = timeScale.timeToCoordinate(zone.time);
-        if (zone.end_time) x2 = timeScale.timeToCoordinate(zone.end_time);
-      } catch { return null; }
-
-      const yTop    = series.priceToCoordinate(zone.top);
-      const yBottom = series.priceToCoordinate(zone.bottom);
-      if (x1 === null || yTop === null || yBottom === null) return null;
-
-      const isBear         = zone.type?.includes('BEAR');
-      let x3 = null;
-      try {
-        if (zone.pullback_zone_end_time) x3 = timeScale.timeToCoordinate(zone.pullback_zone_end_time);
-      } catch { x3 = null; }
-      const pullbackTop    = zone.pullback_zone_top    ? series.priceToCoordinate(zone.pullback_zone_top)    : null;
-      const pullbackBottom = zone.pullback_zone_bottom ? series.priceToCoordinate(zone.pullback_zone_bottom) : null;
-
-      return {
-        x:             x1,
-        x2:            x2,
-        x3:            x3,
-        yTop,
-        yBottom,
-        fillColor:     isBear ? 'rgba(239,83,80,0.08)' : 'rgba(38,166,154,0.08)',
-        borderColor:   isBear ? 'rgba(239,83,80,0.8)'  : 'rgba(38,166,154,0.8)',
-        label:         zone.label || 'CONSOLIDATION',
-        isBear,
-        pullbackTop,
-        pullbackBottom,
-        pullbackLabel: zone.pullback_label || 'ENTRY ZONE',
-      };
-    }).filter(Boolean);
-  }
-
-  paneViews() { return this._paneViews; }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 🔵 PLUGIN 2: PEAK ANCHORS & STOP HUNT PINS
+// 🔵 PEAK FORMATION LINE (Peak Formation High/Low)
 // ─────────────────────────────────────────────────────────────────────────────
 class LineRenderer {
   constructor(data) { this._data = data; }
@@ -238,7 +101,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const ema50SeriesRef     = useRef(null);
   const ema200SeriesRef    = useRef(null);
   
-  const boxPrimitiveRef    = useRef(null);
   const linePrimitiveRef   = useRef(null);
   const activeLinesRef     = useRef([]);
   const isChartReady       = useRef(false);
@@ -376,10 +238,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   });
 };
 
-    const boxP = new BoxPrimitive();
-    series.attachPrimitive(boxP);
-    boxPrimitiveRef.current = boxP;
-    
     const lineP = new LinePrimitive();
     series.attachPrimitive(lineP);
     linePrimitiveRef.current = lineP;
@@ -467,10 +325,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       
       if (chartRef.current && candleSeriesRef.current) {
         const ts = chartRef.current.timeScale();
-        
-        if (visuals?.smc_zones && boxPrimitiveRef.current) {
-          boxPrimitiveRef.current.setData(visuals.smc_zones, candleSeriesRef.current, ts);
-        }
         
         if (visuals?.bos_lines && linePrimitiveRef.current) {
            linePrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
