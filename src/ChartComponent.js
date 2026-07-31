@@ -92,6 +92,137 @@ class LinePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 🟩 DEMAND/SUPPLY TRENDLINE (sloped — separate from the horizontal peak line)
+// ─────────────────────────────────────────────────────────────────────────────
+class TrendlineRenderer {
+  constructor(data) { this._data = data; }
+
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (!this._data) return;
+      const ctx  = scope.context;
+      const hPR  = scope.horizontalPixelRatio;
+      const vPR  = scope.verticalPixelRatio;
+      const rightEdge = scope.mediaSize.width * hPR;
+
+      const { x1, y1, x2, y2, color, label } = this._data;
+      if (x1 === null || y1 === null || x2 === null || y2 === null) return;
+
+      const px1 = x1 * hPR, py1 = y1 * vPR;
+      const px2 = Math.min(x2, rightEdge / hPR) * hPR, py2 = y2 * vPR;
+      if (px1 >= rightEdge) return;
+
+      ctx.beginPath();
+      ctx.moveTo(px1, py1);
+      ctx.lineTo(px2, py2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2 * hPR;
+      ctx.stroke();
+
+      ctx.font = `bold ${11 * hPR}px monospace`;
+      ctx.fillStyle = color;
+      ctx.fillText(label, Math.min(px2 + 6 * hPR, rightEdge - 100 * hPR), py2 - 6 * vPR);
+    });
+  }
+}
+
+class TrendlinePaneView {
+  constructor(source) { this._source = source; }
+  renderer() { return new TrendlineRenderer(this._source._rendererData); }
+}
+
+class TrendlinePrimitive {
+  constructor() {
+    this._rendererData = null;
+    this._paneViews = [new TrendlinePaneView(this)];
+  }
+
+  setData(tl, series, timeScale) {
+    if (!tl || !tl.start_time || !tl.end_time || tl.start_level == null || tl.end_level == null) {
+      this._rendererData = null;
+      return;
+    }
+    try {
+      const x1 = timeScale.timeToCoordinate(tl.start_time);
+      const x2 = timeScale.timeToCoordinate(tl.end_time);
+      const y1 = series.priceToCoordinate(tl.start_level);
+      const y2 = series.priceToCoordinate(tl.end_level);
+      if (x1 === null || x2 === null || y1 === null || y2 === null) {
+        this._rendererData = null;
+        return;
+      }
+      this._rendererData = { x1, y1, x2, y2, color: tl.color || 'rgba(255,215,0,0.8)', label: tl.type || 'Trendline' };
+    } catch { this._rendererData = null; }
+  }
+
+  paneViews() { return this._paneViews; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 🟨 ORDER BLOCK ZONE (simple box — the real demand/supply reaction zone)
+// ─────────────────────────────────────────────────────────────────────────────
+class OBZoneRenderer {
+  constructor(data) { this._data = data; }
+
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (!this._data || this._data.length === 0) return;
+      const ctx  = scope.context;
+      const hPR  = scope.horizontalPixelRatio;
+      const vPR  = scope.verticalPixelRatio;
+      const rightEdge = scope.mediaSize.width * hPR;
+
+      this._data.forEach((zone) => {
+        if (zone.x1 === null || zone.yTop === null) return;
+        const x1 = zone.x1 * hPR;
+        const x2 = rightEdge; // extend to the right edge — it's a live reaction zone
+        const yTop = zone.yTop * vPR;
+        const yBottom = zone.yBottom * vPR;
+        if (x1 >= rightEdge) return;
+
+        ctx.fillStyle = zone.isBullish ? 'rgba(38,166,154,0.10)' : 'rgba(239,83,80,0.10)';
+        ctx.fillRect(x1, yTop, x2 - x1, yBottom - yTop);
+        ctx.strokeStyle = zone.isBullish ? 'rgba(38,166,154,0.7)' : 'rgba(239,83,80,0.7)';
+        ctx.lineWidth = 1 * hPR;
+        ctx.strokeRect(x1, yTop, x2 - x1, yBottom - yTop);
+
+        ctx.font = `bold ${11 * hPR}px monospace`;
+        ctx.fillStyle = zone.isBullish ? 'rgba(38,166,154,0.9)' : 'rgba(239,83,80,0.9)';
+        ctx.fillText('ORDER BLOCK', x1 + 6 * hPR, yTop + 14 * vPR);
+      });
+    });
+  }
+}
+
+class OBZonePaneView {
+  constructor(source) { this._source = source; }
+  renderer() { return new OBZoneRenderer(this._source._rendererData); }
+}
+
+class OBZonePrimitive {
+  constructor() {
+    this._rendererData = [];
+    this._paneViews = [new OBZonePaneView(this)];
+  }
+
+  setData(obs, series, timeScale) {
+    if (!obs || !Array.isArray(obs)) { this._rendererData = []; return; }
+    this._rendererData = obs.map((ob) => {
+      if (!ob.time || ob.top == null || ob.bottom == null) return null;
+      try {
+        const x1 = timeScale.timeToCoordinate(ob.time);
+        const yTop = series.priceToCoordinate(ob.top);
+        const yBottom = series.priceToCoordinate(ob.bottom);
+        if (x1 === null || yTop === null || yBottom === null) return null;
+        return { x1, yTop, yBottom, isBullish: ob.type?.includes('BULL') };
+      } catch { return null; }
+    }).filter(Boolean);
+  }
+
+  paneViews() { return this._paneViews; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 🚀 MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
 const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
@@ -102,6 +233,8 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const ema200SeriesRef    = useRef(null);
   
   const linePrimitiveRef   = useRef(null);
+  const trendlinePrimitiveRef = useRef(null);
+  const obZonePrimitiveRef    = useRef(null);
   const activeLinesRef     = useRef([]);
   const isChartReady       = useRef(false);
   const currentBarRef      = useRef(null);
@@ -241,6 +374,14 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const lineP = new LinePrimitive();
     series.attachPrimitive(lineP);
     linePrimitiveRef.current = lineP;
+
+    const trendlineP = new TrendlinePrimitive();
+    series.attachPrimitive(trendlineP);
+    trendlinePrimitiveRef.current = trendlineP;
+
+    const obZoneP = new OBZonePrimitive();
+    series.attachPrimitive(obZoneP);
+    obZonePrimitiveRef.current = obZoneP;
     
     chartRef.current = chart;
     candleSeriesRef.current = series;
@@ -328,6 +469,12 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         
         if (visuals?.bos_lines && linePrimitiveRef.current) {
            linePrimitiveRef.current.setData(visuals.bos_lines, candleSeriesRef.current, ts);
+        }
+        if (trendlinePrimitiveRef.current) {
+           trendlinePrimitiveRef.current.setData(visuals?.trendline, candleSeriesRef.current, ts);
+        }
+        if (obZonePrimitiveRef.current) {
+           obZonePrimitiveRef.current.setData(visuals?.order_blocks, candleSeriesRef.current, ts);
         }
       }
       rafId = requestAnimationFrame(loop);
