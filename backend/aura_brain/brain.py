@@ -22,10 +22,21 @@ from ta.momentum import RSIIndicator
 CSV_FILENAME = "1h.csv"
 NODE_URL = "http://127.0.0.1:10000"
 
+# If True, the last live candle is treated as still forming and ignored, so a
+# break only counts once a candle has actually CLOSED beyond the swing.
+# Set to False ONLY if your node sends closed candles exclusively.
+DROP_FORMING_CANDLE = True
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
+
+# Anti-flicker memory (per "currency:timeframe"):
+#   CYCLE_STATE[key] = {"bullish": bool, "flip_time": int}
+#   ORDER_CACHE[key] = swing order currently in use (changes only on a real shift)
+CYCLE_STATE: Dict[str, Dict] = {}
+ORDER_CACHE: Dict[str, int] = {}
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -220,7 +231,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     min_wick = atr * 0.3
     total    = len(closes)
-    cutoff   = max(0, total - 200) 
+    cutoff   = max(0, total - 200)
 
     recent_highs = swing_highs[swing_highs >= cutoff]
     recent_lows  = swing_lows[swing_lows >= cutoff]
@@ -231,7 +242,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
             wick_above = highs[i] - sh_price
             if wick_above >= min_wick and closes[i] < sh_price:
                 sweeps.append({
-                    "type":      "BULL_SWEEP", 
+                    "type":      "BULL_SWEEP",
                     "level":     float(sh_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]) if len(dates) > i else 0,
@@ -245,7 +256,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
             wick_below = sl_price - lows[i]
             if wick_below >= min_wick and closes[i] > sl_price:
                 sweeps.append({
-                    "type":      "BEAR_SWEEP", 
+                    "type":      "BEAR_SWEEP",
                     "level":     float(sl_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]) if len(dates) > i else 0,
@@ -323,7 +334,14 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
     return result
 
 
-def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_override: Optional[int] = None) -> Dict:
+def analyze_market_structure(df: pd.DataFrame, profile: Dict,
+                             swing_order_override: Optional[int] = None,
+                             state_key: Optional[str] = None,
+                             drop_forming: bool = False) -> Dict:
+    # Ignore the still-forming candle so a break only counts on a CLOSED candle.
+    if drop_forming and len(df) > 60:
+        df = df.iloc[:-1].reset_index(drop=True)
+
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -335,7 +353,21 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
     # swing_order_override exists ONLY for backtesting experiments (see
     # peak_speed_experiment.py) — it's never set by the live /api/analyze
     # endpoint, so live behavior is completely unchanged by this parameter.
-    swing_order = swing_order_override if swing_order_override is not None else adaptive_swing_order(df, atr)
+    #
+    # With a state_key (live), the order only changes when the adaptive value
+    # has moved by 3+ — a shift of 1 candle in the order rewrites swing points
+    # and was a source of flicker.
+    fresh_order = adaptive_swing_order(df, atr)
+    if swing_order_override is not None:
+        swing_order = swing_order_override
+    elif state_key:
+        cached = ORDER_CACHE.get(state_key)
+        if cached is None or abs(fresh_order - cached) >= 3:
+            ORDER_CACHE[state_key] = fresh_order
+            cached = fresh_order
+        swing_order = cached
+    else:
+        swing_order = fresh_order
     min_prominence = atr * 0.3
 
     raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
@@ -355,8 +387,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
             if neigh_max - lows[idx] >= min_prominence:
                 filtered_lows.append(idx)
 
-    raw_highs = np.array(filtered_highs)
-    raw_lows  = np.array(filtered_lows)
+    raw_highs = np.array(filtered_highs, dtype=int)
+    raw_lows  = np.array(filtered_lows, dtype=int)
 
     logger.info(f"Core MMM swings: order={swing_order}, prominence={min_prominence:.5f}")
     logger.info(f"Detected swing highs: {raw_highs.tolist()}")
@@ -373,22 +405,19 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         recent CONFIRMED swing high/low, and records every index where a
         candle CLOSES beyond the opposing swing level — a Market
         Structure Break (MSB). This replaces EMA50/EMA200 as the cycle
-        signal: EMA crossovers are a lagging indicator by construction
-        (a 200-period average needs a sustained move to catch up), which
-        was the direct cause of the multi-day detection delay. Measured
-        against real gold history: MSB detects the same regime changes a
-        median of 34 candles (1.4 days) earlier than the EMA crossover
-        (mean 2.5 days), at a 7.1% false-break rate (a flip that reverses
-        again within 20 candles).
+        signal: EMA crossovers are a lagging indicator by construction.
+
+        CAUSAL: a swing at index k only becomes usable at candle
+        k + swing_order, because that is the earliest a live tool could have
+        known it (it needs swing_order candles on its right). Using it any
+        earlier is hindsight, and it makes past flips get rewritten when the
+        swing is confirmed — the cause of the PFH/PFL flip-back.
 
         Confirmation requires a candle CLOSE beyond the swing level, not
         just a wick — a wick that pierces and retraces is a liquidity
-        sweep, not a real structure break; counting wicks is the most
-        common source of false breaks in this kind of detection.
+        sweep, not a real structure break.
 
-        Returns (flips, final_is_bullish) — flips is every break index in
-        ascending order, final_is_bullish is the resulting direction after
-        processing the whole series (i.e. the CURRENT cycle).
+        Returns (flips, final_is_bullish).
         """
         highs_set = set(raw_highs.tolist())
         lows_set = set(raw_lows.tolist())
@@ -397,10 +426,10 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
         last_high_idx = None
         last_low_idx = None
         for i in range(len(closes)):
-            if i in highs_set:
-                last_high_idx = i
-            if i in lows_set:
-                last_low_idx = i
+            if (i - swing_order) in highs_set:
+                last_high_idx = i - swing_order
+            if (i - swing_order) in lows_set:
+                last_low_idx = i - swing_order
             if is_bull and last_low_idx is not None and closes[i] < lows[last_low_idx]:
                 is_bull = False
                 flips.append(i)
@@ -412,6 +441,24 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict, swing_order_overri
     seed_idx = min(300, len(closes) - 1)
     seed_bullish = ema_50_array[seed_idx] > ema_200_array[seed_idx]
     structural_flips, is_bullish = compute_structural_flips(seed_bullish)
+
+    # ── Cycle lock ──────────────────────────────────────────────────────────
+    # Only change the displayed cycle when there is a genuinely NEW break
+    # (a flip later than the one already shown). If a recompute merely
+    # disagrees with what was shown but has no newer break, it rewrote
+    # history — keep the shown cycle.
+    fresh_bullish = is_bullish
+    last_flip_time = int(dates[structural_flips[-1]]) if structural_flips else 0
+    if state_key:
+        st = CYCLE_STATE.get(state_key)
+        if st is None:
+            CYCLE_STATE[state_key] = {"bullish": fresh_bullish, "flip_time": last_flip_time}
+        elif fresh_bullish == st["bullish"]:
+            st["flip_time"] = last_flip_time
+        elif last_flip_time > st["flip_time"]:
+            CYCLE_STATE[state_key] = {"bullish": fresh_bullish, "flip_time": last_flip_time}
+        else:
+            is_bullish = st["bullish"]
 
     def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
         """
@@ -638,7 +685,11 @@ async def analyze(req: AnalysisRequest):
             elif actual < forecast:
                 news_string = f"📰 {event}: Missed forecast ({actual} vs {forecast}). USD bearish."
 
-        ms = analyze_market_structure(df, profile)
+        ms = analyze_market_structure(
+            df, profile,
+            state_key=f"{req.currency}:{req.timeframe}",
+            drop_forming=(DROP_FORMING_CANDLE and data_source == "LIVE_NODE_DATA"),
+        )
         cycle       = ms['cycle']
         lines       = ms['lines']
         sweeps      = ms['sweeps']
@@ -718,7 +769,7 @@ async def analyze(req: AnalysisRequest):
         return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEBUG ENDPOINT
+# DEBUG ENDPOINT (stateless — never touches the cycle lock)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/api/debug")
@@ -739,7 +790,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.0 (MMM logic removed)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.1 (causal flips + cycle lock)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",

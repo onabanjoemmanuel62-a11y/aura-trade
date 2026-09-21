@@ -1,9 +1,9 @@
 const axios = require('axios');
-const xml2js = require('xml2js');
+const cheerio = require('cheerio');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const path = require('path');
-const NewsEvent = require('../models/NewsEvent'); 
+const NewsEvent = require('../models/NewsEvent');
 
 // --- 🛠️ CONFIG & SETUP ---
 if (require.main === module) {
@@ -18,124 +18,153 @@ if (require.main === module) {
     connectDB();
 }
 
-const FEED_URL = 'https://nfs.faireconomy.media/ff_calendar_thisweek.xml';
+// The XML feed (nfs.faireconomy.media/ff_calendar_thisweek.xml) never carries
+// actual/outcome values — confirmed by inspecting the feed directly, every
+// single <event> tag lacks an <actual> field entirely, even for events days
+// in the past. The calendar WEBPAGE does show real actual values once
+// released, so this scrapes that page's HTML table instead.
+const CALENDAR_URL = 'https://www.forexfactory.com/calendar?week=this';
 
-// 🛡️ Helper: Generate ID
+// 🛡️ Helper: Generate ID — same approach as the old scraper, so re-running
+// this against the same event (same country+title+time) upserts the
+// existing record rather than creating a duplicate.
 const generateHashId = (str) => {
     let hash = 0;
     for (let i = 0; i < str.length; i++) {
         const char = str.charCodeAt(i);
         hash = ((hash << 5) - hash) + char;
-        hash = hash & hash; 
+        hash = hash & hash;
     }
     return Math.abs(hash);
 };
 
+const parseNum = (val) => {
+    if (!val) return null;
+    const cleaned = val.trim().replace(/[%KMBT]/gi, '').replace(/,/g, '');
+    if (cleaned === '' || cleaned === '-') return null;
+    const num = parseFloat(cleaned);
+    return isNaN(num) ? null : num;
+};
+
+// Country flag/name -> currency code. ForexFactory's calendar table shows
+// the currency directly (USD, EUR, GBP, etc.) as the row's "currency" cell,
+// so this is mostly a passthrough — kept as a map in case some rows show
+// a country name instead in edge cases.
+const CURRENCY_MAP = {
+    USD: 'USD', EUR: 'EUR', GBP: 'GBP', JPY: 'JPY', AUD: 'AUD',
+    NZD: 'NZD', CAD: 'CAD', CHF: 'CHF', CNY: 'CNY',
+};
+
 const fetchLiveNews = async () => {
-    console.log('📡 Fetching Live ForexFactory Calendar...');
+    console.log('📡 Fetching Live ForexFactory Calendar (webpage scrape)...');
 
     try {
-        // --- 🕵️ STEALTH MODE ---
-        const response = await axios.get(FEED_URL, {
+        const response = await axios.get(CALENDAR_URL, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-            }
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            },
+            timeout: 15000,
         });
 
-        const parser = new xml2js.Parser({ explicitArray: false });
-        const result = await parser.parseStringPromise(response.data);
+        const $ = cheerio.load(response.data);
+        const rows = $('tr.calendar__row');
 
-        if (!result || !result.weeklyevents || !result.weeklyevents.event) {
-            console.log('⚠️ Feed format unexpected or empty.');
+        if (rows.length === 0) {
+            console.log('⚠️ No calendar rows found — the page likely needs JS rendering (Puppeteer) rather than a static HTML fetch.');
+            console.log('   Saving the raw response length for debugging:', response.data.length, 'chars.');
             return;
         }
-        
-        const events = result.weeklyevents.event;
-        const eventList = Array.isArray(events) ? events : [events];
+
+        let currentDateLabel = null;
         let count = 0;
         let skipped = 0;
 
-        // --- 🛡️ THE SMART FILTER STRATEGY ---
-        for (const item of eventList) {
-            try {
-                // 1. FILTER: USD ONLY (Gold/Crypto is priced in USD)
-                if (item.country !== 'USD') {
-                    skipped++;
-                    continue;
-                }
+        rows.each((_, el) => {
+            const $row = $(el);
 
-                // 2. FILTER: IMPACT (High & Medium Only)
-                if (item.impact !== 'High' && item.impact !== 'Medium') {
-                    skipped++;
-                    continue;
-                }
+            // Each day starts a new row with a date label; subsequent rows
+            // for that day leave the date cell blank, so carry it forward.
+            const dateCell = $row.find('.calendar__date').text().trim();
+            if (dateCell) currentDateLabel = dateCell;
+            if (!currentDateLabel) { skipped++; return; }
 
-                // --- DATE PARSING LOGIC ---
-                // Format: "MM-DD-YYYY" and "3:30pm"
-                const [monthStr, dayStr, yearStr] = item.date.split('-');
-                const timeMatch = item.time.match(/(\d+):(\d+)(am|pm)/i);
-                
-                if (!timeMatch) continue; 
+            const currency = $row.find('.calendar__currency').text().trim();
+            if (!currency || !CURRENCY_MAP[currency]) { skipped++; return; }
 
-                let [_, hours, minutes, modifier] = timeMatch;
+            const impactTitle = $row.find('.calendar__impact span').attr('title') || '';
+            let impact = 'Low';
+            if (/High/i.test(impactTitle)) impact = 'High';
+            else if (/Medium|Med /i.test(impactTitle)) impact = 'Medium';
+            else if (/Non-Economic/i.test(impactTitle)) impact = 'Non-Economic';
+
+            const event = $row.find('.calendar__event').text().trim();
+            if (!event) { skipped++; return; }
+
+            const timeText = $row.find('.calendar__time').text().trim();
+            const actualText = $row.find('.calendar__actual').text().trim();
+            const forecastText = $row.find('.calendar__forecast').text().trim();
+            const previousText = $row.find('.calendar__previous').text().trim();
+
+            // Date parsing: currentDateLabel is like "Mon Aug 3", timeText is
+            // like "10:00am" (or "All Day" / "Tentative" for non-timed events).
+            const timeMatch = timeText.match(/(\d+):(\d+)(am|pm)/i);
+            const now = new Date();
+            const yearGuess = now.getFullYear();
+            const parsedDate = new Date(`${currentDateLabel} ${yearGuess}`);
+            if (isNaN(parsedDate.getTime())) { skipped++; return; }
+
+            // If the guessed date is more than ~6 months in the past, the
+            // calendar has likely rolled into a new year — bump forward.
+            if (parsedDate.getTime() < now.getTime() - (180 * 24 * 60 * 60 * 1000)) {
+                parsedDate.setFullYear(yearGuess + 1);
+            }
+
+            if (timeMatch) {
+                let [, hours, minutes, modifier] = timeMatch;
                 let h = parseInt(hours);
-                let m = parseInt(minutes);
-
+                const m = parseInt(minutes);
                 if (modifier.toLowerCase() === 'pm' && h < 12) h += 12;
                 if (modifier.toLowerCase() === 'am' && h === 12) h = 0;
-
-                const dateObj = new Date(parseInt(yearStr), parseInt(monthStr) - 1, parseInt(dayStr), h, m, 0);
-                const timeInSeconds = Math.floor(dateObj.getTime() / 1000);
-
-                if (isNaN(timeInSeconds)) continue;
-
-                // 3. FILTER: TIME LOCK (Don't save ancient history)
-                // We keep events from the last 24 hours + all future events
-                // This prevents your DB from filling up with last week's news if the feed drifts
-                const nowSeconds = Math.floor(Date.now() / 1000);
-                const oneDayAgo = nowSeconds - (24 * 60 * 60);
-
-                if (timeInSeconds < oneDayAgo) {
-                    skipped++;
-                    continue;
-                }
-
-                // --- SAVE TO DATABASE ---
-                const uniqueSignature = `${item.country}-${item.title}-${timeInSeconds}`;
-                const syntheticId = generateHashId(uniqueSignature);
-                const parseNum = (val) => (val && val.trim() !== '' ? parseFloat(val) : null);
-
-                const newsPayload = {
-                    originalId: syntheticId,
-                    time: timeInSeconds,
-                    currency: item.country,
-                    event: item.title,
-                    impact: item.impact, 
-                    forecast: parseNum(item.forecast),
-                    previous: parseNum(item.previous),
-                    actual: parseNum(item.actual) 
-                };
-
-                await NewsEvent.findOneAndUpdate(
-                    { originalId: syntheticId },
-                    { $set: newsPayload },
-                    { upsert: true, new: true }
-                );
-
-                count++;
-            } catch (err) {
-                console.log(`⚠️ Parsing Error for ${item.date}:`, err.message);
+                parsedDate.setHours(h, m, 0, 0);
+            } else {
+                parsedDate.setHours(0, 0, 0, 0);
             }
-        }
 
-        console.log(`✅ Smart Sync Complete. Saved ${count} USD Events. (Filtered out ${skipped} noise)`);
+            const timeInSeconds = Math.floor(parsedDate.getTime() / 1000);
+            if (isNaN(timeInSeconds)) { skipped++; return; }
 
+            const uniqueSignature = `${currency}-${event}-${currentDateLabel}`;
+            const syntheticId = generateHashId(uniqueSignature);
+
+            const newsPayload = {
+                originalId: syntheticId,
+                time: timeInSeconds,
+                currency,
+                event,
+                impact,
+                actual: parseNum(actualText),
+                forecast: parseNum(forecastText),
+                previous: parseNum(previousText),
+            };
+
+            NewsEvent.findOneAndUpdate(
+                { originalId: syntheticId },
+                { $set: newsPayload },
+                { upsert: true, new: true }
+            ).catch(err => console.log(`⚠️ DB write error for ${event}:`, err.message));
+
+            count++;
+        });
+
+        console.log(`✅ Scrape complete. Processed ${count} events (skipped ${skipped} non-currency/header rows).`);
     } catch (error) {
         if (error.response && error.response.status === 429) {
-            console.error('❌ Blocked (429). Please wait 5 minutes before running again.');
+            console.error('❌ Blocked (429). Please wait before running again.');
+        } else if (error.response && error.response.status === 403) {
+            console.error('❌ Blocked (403) — ForexFactory may be detecting this as a bot. May need different headers or Puppeteer.');
         } else {
-            console.error('❌ Error fetching news feed:', error.message);
+            console.error('❌ Error scraping calendar:', error.message);
         }
     }
 };
