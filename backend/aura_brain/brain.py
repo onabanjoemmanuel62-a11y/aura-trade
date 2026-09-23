@@ -32,6 +32,12 @@ logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
+# Order blocks are computed but not requested/used downstream — the impulse
+# threshold in detect_order_blocks() fires on ordinary volatility, not real
+# institutional zones, and produces boxes that look arbitrary on chart.
+# Off by default; flip to True only if you actually want them back.
+SHOW_ORDER_BLOCKS = False
+
 # Anti-flicker memory (per "currency:timeframe"):
 #   CYCLE_STATE[key] = {"bullish": bool, "flip_time": int}
 #   ORDER_CACHE[key] = swing order currently in use (changes only on a real shift)
@@ -599,19 +605,20 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     # broken level, but the last opposite-colored candle before the
     # impulsive move — where real order flow originated.
     nearest_ob = None
-    ob_bias = 'BULLISH' if is_bullish else 'BEARISH'
-    obs_found = detect_order_blocks(df, atr, ob_bias)
-    current_price = float(closes[-1])
-    unmitigated = [ob for ob in obs_found if not ob['mitigated']]
-    if unmitigated:
-        if is_bullish:
-            below = [ob for ob in unmitigated if ob['top'] <= current_price]
-            if below:
-                nearest_ob = max(below, key=lambda ob: ob['top'])
-        else:
-            above = [ob for ob in unmitigated if ob['bottom'] >= current_price]
-            if above:
-                nearest_ob = min(above, key=lambda ob: ob['bottom'])
+    if SHOW_ORDER_BLOCKS:
+        ob_bias = 'BULLISH' if is_bullish else 'BEARISH'
+        obs_found = detect_order_blocks(df, atr, ob_bias)
+        current_price = float(closes[-1])
+        unmitigated = [ob for ob in obs_found if not ob['mitigated']]
+        if unmitigated:
+            if is_bullish:
+                below = [ob for ob in unmitigated if ob['top'] <= current_price]
+                if below:
+                    nearest_ob = max(below, key=lambda ob: ob['top'])
+            else:
+                above = [ob for ob in unmitigated if ob['bottom'] >= current_price]
+                if above:
+                    nearest_ob = min(above, key=lambda ob: ob['bottom'])
 
     return {
         "cycle":         cycle,
