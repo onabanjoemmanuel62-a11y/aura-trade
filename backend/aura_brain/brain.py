@@ -475,17 +475,30 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
           2. Edge-adjacent: a materially bigger extreme sits just outside
              the window, in the edge_buffer candles immediately before
              the flip.
+
+        CONFIRMATION CAP (fixes early/premature Peak confirmation): the
+        search window is never allowed to reach the last `swing_order`
+        candles before the live edge. A brand-new low/high sitting right at
+        the live edge hasn't proven anything yet — price could still be
+        mid-move through it. Only once a bar has "survived" swing_order
+        candles without being taken out is it eligible to be shown as the
+        Peak. This uses the exact same confirmation window that already
+        governs swing points and structural flips, so the whole engine is
+        consistent about what counts as "confirmed."
         """
+        confirmed_limit = max(0, current_idx - swing_order)
+
         candidate_boundaries = [f for f in reversed(structural_flips) if f <= current_idx]
         candidate_boundaries.append(0)  # always allow searching back to the start of available data
 
-        extreme_idx = current_idx
+        extreme_idx = confirmed_limit
         for step in range(min(max_lookback_crossings, len(candidate_boundaries))):
             cross_idx_local = candidate_boundaries[step]
+            search_end = max(cross_idx_local, confirmed_limit)
             if is_bullish_now:
-                extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:current_idx + 1]))
+                extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:search_end + 1]))
             else:
-                extreme_idx = cross_idx_local + int(np.argmax(highs[cross_idx_local:current_idx + 1]))
+                extreme_idx = cross_idx_local + int(np.argmax(highs[cross_idx_local:search_end + 1]))
 
             degenerate = (extreme_idx - cross_idx_local) <= 2
 
@@ -790,7 +803,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.1 (causal flips + cycle lock)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.2 (causal flips + cycle lock + anchor confirmation cap)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",
