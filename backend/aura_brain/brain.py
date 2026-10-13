@@ -22,12 +22,11 @@ CSV_FILENAME = "1h.csv"
 NODE_URL = "http://127.0.0.1:10000"
 
 # If True, the last live candle is treated as still forming and ignored, so a
-# break only counts once a candle has actually CLOSED beyond the swing.
-# Set to False ONLY if your node sends closed candles exclusively.
+# break or entry signal only counts once a candle has actually CLOSED.
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PEAK CONFIRMATION TUNING
+# PEAK CONFIRMATION & ENTRY TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 # Causal fractal confirmation bars on the right side of a swing (3 to 6 bars)
 BASE_SWING_ORDER             = 4
@@ -35,21 +34,23 @@ BASE_SWING_ORDER             = 4
 # by this many ATRs, and does so for FLIP_CONFIRM_BARS closes in a row.
 FLIP_BUFFER_ATR              = 0.25
 FLIP_CONFIRM_BARS            = 2
-# A peak is only shown as CONFIRMED once price has travelled at least this many
+# A peak is shown as CONFIRMED once price has travelled at least this many
 # ATRs away from it AND has not taken the extreme out since.
 ANCHOR_MIN_MOVE_ATR          = 1.5
 # A swing point must stand out by this many ATRs to count as structural.
 SWING_PROMINENCE_ATR         = 0.90
 # How close two lows/highs must be (in ATR) to count as a W / M (includes stop-hunts).
 DOUBLE_PATTERN_TOLERANCE_ATR = 0.65
+# Default Risk-to-Reward ratio for generated BUY / SELL setups
+DEFAULT_RR_RATIO             = 2.2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
-# Off by default; flip to True only if you want order blocks displayed.
-SHOW_ORDER_BLOCKS = False
+# Enabled so the Entry Engine can use institutional Order Blocks for confluence
+SHOW_ORDER_BLOCKS = True
 
 # Anti-flicker & Anchor-Lock memory (per "currency:timeframe"):
 #   CYCLE_STATE[key] = {
@@ -59,7 +60,6 @@ SHOW_ORDER_BLOCKS = False
 #       "anchor_price": float,
 #       "confirmed": bool
 #   }
-#   ORDER_CACHE[key] = swing order currently in use (changes only on a real shift)
 CYCLE_STATE: Dict[str, Dict] = {}
 ORDER_CACHE: Dict[str, int] = {}
 
@@ -75,8 +75,9 @@ def safe_float(value, default=0.0):
             return default
         num = float(value)
         return default if (math.isnan(num) or math.isinf(num)) else num
-    except:
+    except Exception:
         return default
+
 
 def load_csv_fallback():
     try:
@@ -87,7 +88,7 @@ def load_csv_fallback():
             df = pd.read_csv(file_path, sep=';')
             if len(df.columns) < 2:
                 df = pd.read_csv(file_path, sep=',')
-        except:
+        except Exception:
             df = pd.read_csv(file_path, sep=',')
 
         df.columns = [c.lower().strip() for c in df.columns]
@@ -114,6 +115,7 @@ def load_csv_fallback():
         logger.error(f"CSV load failed: {e}")
         return None
 
+
 def process_live_candles(candles_data: List[Dict]):
     try:
         df = pd.DataFrame(candles_data)
@@ -131,11 +133,13 @@ def process_live_candles(candles_data: List[Dict]):
         logger.error(f"Live candle processing failed: {e}")
         return None
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     MARKET_MEMORY["df"] = load_csv_fallback()
     yield
     MARKET_MEMORY["df"] = None
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -146,6 +150,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class AnalysisRequest(BaseModel):
     timeframe: str = "1h"
     currency: str = "XAUUSD"
@@ -154,19 +159,20 @@ class AnalysisRequest(BaseModel):
     htf_candles: Optional[List[Dict]] = None
     news_data: Optional[Dict] = None
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE ENGINE — Peak Formation & Market Structure
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
-    cu = currency.upper().replace("/","").replace("-","").replace("_","")
+    cu = currency.upper().replace("/", "").replace("-", "").replace("_", "")
     if cu in ("XAUUSD", "GOLD"):
         return {"decimals": 2, "pip_size": 0.01, "label": "XAU/USD"}
     if cu in ("XAGUSD", "SILVER"):
         return {"decimals": 3, "pip_size": 0.001, "label": "XAG/USD"}
     if "JPY" in cu:
         return {"decimals": 3, "pip_size": 0.01, "label": currency}
-    if any(cu.startswith(p) or cu.endswith(p) for p in ("EUR","GBP","AUD","NZD","CAD","CHF","USD")):
+    if any(cu.startswith(p) or cu.endswith(p) for p in ("EUR", "GBP", "AUD", "NZD", "CAD", "CHF", "USD")):
         return {"decimals": 5, "pip_size": 0.0001, "label": currency}
     if current_price > 5000:
         return {"decimals": 1, "pip_size": 0.1, "label": currency}
@@ -220,7 +226,6 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
     filtered_lows = []
 
     for idx in range(left_w, n - right_w):
-        # Swing High check: >= left window, > right window (handles equal-high tweezers)
         l_highs = highs[idx - left_w : idx]
         r_highs = highs[idx + 1 : idx + right_w + 1]
         if highs[idx] >= np.max(l_highs) and highs[idx] > np.max(r_highs):
@@ -232,7 +237,6 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
                 elif highs[idx] > highs[filtered_highs[-1]]:
                     filtered_highs[-1] = idx
 
-        # Swing Low check: <= left window, < right window (handles equal-low tweezers)
         l_lows = lows[idx - left_w : idx]
         r_lows = lows[idx + 1 : idx + right_w + 1]
         if lows[idx] <= np.min(l_lows) and lows[idx] < np.min(r_lows):
@@ -257,39 +261,43 @@ def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str, lookback: int =
     start = max(0, len(closes) - lookback)
 
     for i in range(start + 2, len(closes) - 1):
-        body_size = abs(closes[i] - closes[i-1])
+        body_size = abs(closes[i] - closes[i - 1])
         if body_size < atr * 0.3:
             continue
 
         if bias == 'BULLISH':
-            is_bearish_candle = closes[i-1] < closes[i-2]
-            strong_up_move    = closes[i] > highs[i-1] and (closes[i] - closes[i-1]) > atr * 0.8
+            is_bearish_candle = closes[i - 1] < closes[i - 2]
+            strong_up_move    = closes[i] > highs[i - 1] and (closes[i] - closes[i - 1]) > atr * 0.8
             if is_bearish_candle and strong_up_move:
+                post_lows = lows[i + 1:] if (i + 1) < len(lows) else np.array([lows[i]])
+                mitigated = bool(np.min(post_lows) < lows[i - 1])
                 obs.append({
                     'type':      'BULL_OB',
-                    'top':       float(highs[i-1]),
-                    'bottom':    float(lows[i-1]),
-                    'time':      int(dates[i-1]),
+                    'top':       float(highs[i - 1]),
+                    'bottom':    float(lows[i - 1]),
+                    'time':      int(dates[i - 1]),
                     'end_time':  int(dates[-1]),
                     'label':     'Bull OB',
-                    'mitigated': float(lows[-1]) > float(lows[i-1])
+                    'mitigated': mitigated
                 })
         else:
-            is_bullish_candle = closes[i-1] > closes[i-2]
-            strong_down_move  = closes[i] < lows[i-1] and (closes[i-1] - closes[i]) > atr * 0.8
+            is_bullish_candle = closes[i - 1] > closes[i - 2]
+            strong_down_move  = closes[i] < lows[i - 1] and (closes[i - 1] - closes[i]) > atr * 0.8
             if is_bullish_candle and strong_down_move:
+                post_highs = highs[i + 1:] if (i + 1) < len(highs) else np.array([highs[i]])
+                mitigated = bool(np.max(post_highs) > highs[i - 1])
                 obs.append({
                     'type':      'BEAR_OB',
-                    'top':       float(highs[i-1]),
-                    'bottom':    float(lows[i-1]),
-                    'time':      int(dates[i-1]),
+                    'top':       float(highs[i - 1]),
+                    'bottom':    float(lows[i - 1]),
+                    'time':      int(dates[i - 1]),
                     'end_time':  int(dates[-1]),
                     'label':     'Bear OB',
-                    'mitigated': float(highs[-1]) < float(highs[i-1])
+                    'mitigated': mitigated
                 })
 
     unmitigated = [ob for ob in obs if not ob['mitigated']]
-    return unmitigated[-3:] if unmitigated else obs[-2:]
+    return unmitigated[-3:] if unmitigated else []
 
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
@@ -342,10 +350,6 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
 
 def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray,
                           atr: float, anchor_idx: Optional[int] = None, lookback: int = 150) -> Dict:
-    """
-    Confirms genuine W (Peak Formation Low) and M (Peak Formation High) chart patterns
-    around the active cycle anchor or live market edge, including Stop-Hunt W/M variations.
-    """
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -363,7 +367,6 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
     recent_lows  = sorted([int(i) for i in swing_lows if i >= cutoff])
     recent_highs = sorted([int(i) for i in swing_highs if i >= cutoff])
 
-    # --- W pattern (double bottom) ---
     for k in range(len(recent_lows) - 1, 0, -1):
         low2_idx = recent_lows[k]
         low1_idx = recent_lows[k - 1]
@@ -393,7 +396,6 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
                         })
                         break
 
-    # --- M pattern (double top) ---
     for k in range(len(recent_highs) - 1, 0, -1):
         high2_idx = recent_highs[k]
         high1_idx = recent_highs[k - 1]
@@ -430,7 +432,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                              swing_order_override: Optional[int] = None,
                              state_key: Optional[str] = None,
                              drop_forming: bool = False) -> Dict:
-    # Ignore the still-forming candle so a break only counts on a CLOSED candle.
     if drop_forming and len(df) > 60:
         df = df.iloc[:-1].reset_index(drop=True)
 
@@ -448,7 +449,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         swing_order = swing_order_override
     elif state_key:
         cached = ORDER_CACHE.get(state_key)
-        # Require a shift of 3+ to change cached order so swings never flicker
         if cached is None or abs(fresh_order - cached) >= 3:
             ORDER_CACHE[state_key] = fresh_order
             cached = fresh_order
@@ -459,21 +459,10 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     min_prominence = atr * SWING_PROMINENCE_ATR
     raw_highs, raw_lows = detect_swings_causal(highs, lows, swing_order, min_prominence)
 
-    logger.info(f"Core MMM swings: order={swing_order}, prominence={min_prominence:.5f}")
-    logger.info(f"Detected swing highs: {raw_highs.tolist()}")
-    logger.info(f"Detected swing lows : {raw_lows.tolist()}")
-
     ema_50_array  = df['Close'].ewm(span=50, adjust=False).mean().values
     ema_200_array = df['Close'].ewm(span=200, adjust=False).mean().values
 
     def compute_structural_cycles(seed_bullish: bool):
-        """
-        Walks forward through price action tracking true Protected Swings.
-        A Protected Low in an uptrend only advances when price makes a new Higher High
-        (and vice versa in a downtrend). When the Protected Swing is broken by
-        FLIP_CONFIRM_BARS closes beyond FLIP_BUFFER_ATR, a cycle flip occurs and the
-        exact Peak Formation Anchor (the extreme prior to the break) is locked.
-        """
         highs_set = set(raw_highs.tolist())
         lows_set  = set(raw_lows.tolist())
 
@@ -498,13 +487,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 last_confirmed_low = confirmed_bar
 
             if is_bull:
-                # Advance protected low ONLY when price achieves a new cycle high
                 if highs[i] >= extreme_price:
                     extreme_price = highs[i]
                     if last_confirmed_low is not None and last_confirmed_low >= cycle_start_idx:
                         protected_low_idx = last_confirmed_low
 
-                # If no confirmed low existed at the moment of the high, fallback to the first confirmed low of the cycle
                 if protected_low_idx == cycle_start_idx and last_confirmed_low is not None and last_confirmed_low > cycle_start_idx:
                     if highs[i] - lows[last_confirmed_low] >= ANCHOR_MIN_MOVE_ATR * atr:
                         protected_low_idx = last_confirmed_low
@@ -513,7 +500,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 pending = pending + 1 if broke else 0
 
                 if pending >= FLIP_CONFIRM_BARS:
-                    # Flip BULL -> BEAR: Peak High Anchor is the highest high from cycle_start_idx to i
                     true_peak_high_idx = cycle_start_idx + int(np.argmax(highs[cycle_start_idx : i + 1]))
                     is_bull = False
                     cycle_start_idx = true_peak_high_idx
@@ -529,7 +515,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                         "anchor_price": float(highs[true_peak_high_idx]),
                     })
             else:
-                # Advance protected high ONLY when price achieves a new cycle low
                 if lows[i] <= extreme_price:
                     extreme_price = lows[i]
                     if last_confirmed_high is not None and last_confirmed_high >= cycle_start_idx:
@@ -543,7 +528,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 pending = pending + 1 if broke else 0
 
                 if pending >= FLIP_CONFIRM_BARS:
-                    # Flip BEAR -> BULL: Peak Low Anchor is the lowest low from cycle_start_idx to i
                     true_peak_low_idx = cycle_start_idx + int(np.argmin(lows[cycle_start_idx : i + 1]))
                     is_bull = True
                     cycle_start_idx = true_peak_low_idx
@@ -565,19 +549,43 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     seed_bullish = bool(ema_50_array[seed_idx] > ema_200_array[seed_idx])
     cycle_events, is_bullish = compute_structural_cycles(seed_bullish)
 
-    # Find the most recent cycle event matching the computed direction
     matching_events = [e for e in cycle_events if e["bullish"] == is_bullish]
     if matching_events:
-        latest_event = matching_events[-1]
+        latest_event       = matching_events[-1]
         fresh_flip_time    = latest_event["flip_time"]
         fresh_anchor_idx   = latest_event["anchor_idx"]
         fresh_anchor_time  = latest_event["anchor_time"]
         fresh_anchor_price = latest_event["anchor_price"]
     else:
-        fresh_flip_time  = 0
-        fresh_anchor_idx = int(np.argmin(lows)) if is_bullish else int(np.argmax(highs))
-        fresh_anchor_time = int(dates[fresh_anchor_idx])
+        fresh_flip_time    = 0
+        fresh_anchor_idx   = int(np.argmin(lows)) if is_bullish else int(np.argmax(highs))
+        fresh_anchor_time  = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
+
+    # ── Macro Cycle Expiration Reset (Keeps Peak Relevant on Extended Trends) ──
+    # If an anchor is > 120 bars old and price is > 5.5 ATR away, advance the anchor
+    # to the most prominent major structural swing in the active 110-bar window.
+    current_idx = len(closes) - 1
+    if (current_idx - fresh_anchor_idx) > 120:
+        dist_atr = abs(closes[-1] - fresh_anchor_price) / atr if atr > 0 else 0
+        if dist_atr > 5.5:
+            recent_start = max(0, current_idx - 110)
+            if is_bullish:
+                cand_lows = [idx for idx in raw_lows if recent_start <= idx <= current_idx - swing_order]
+                if cand_lows:
+                    new_idx = min(cand_lows, key=lambda idx: lows[idx])
+                    if highs[new_idx:].max() - lows[new_idx] >= ANCHOR_MIN_MOVE_ATR * atr:
+                        fresh_anchor_idx   = int(new_idx)
+                        fresh_anchor_time  = int(dates[fresh_anchor_idx])
+                        fresh_anchor_price = float(lows[fresh_anchor_idx])
+            else:
+                cand_highs = [idx for idx in raw_highs if recent_start <= idx <= current_idx - swing_order]
+                if cand_highs:
+                    new_idx = max(cand_highs, key=lambda idx: highs[idx])
+                    if highs[new_idx] - lows[new_idx:].min() >= ANCHOR_MIN_MOVE_ATR * atr:
+                        fresh_anchor_idx   = int(new_idx)
+                        fresh_anchor_time  = int(dates[fresh_anchor_idx])
+                        fresh_anchor_price = float(highs[fresh_anchor_idx])
 
     # ── Strict Anti-Bounce Cycle & Anchor Lock ──────────────────────────────
     if state_key:
@@ -592,7 +600,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             }
             st = CYCLE_STATE[state_key]
         else:
-            # Case 1: Genuine new structural break in the OPPOSITE direction
             if is_bullish != st["bullish"] and fresh_flip_time > st["flip_time"]:
                 CYCLE_STATE[state_key] = {
                     "bullish":      is_bullish,
@@ -603,19 +610,21 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 }
                 st = CYCLE_STATE[state_key]
             else:
-                # Keep locked cycle direction and locked anchor!
                 is_bullish = st["bullish"]
+                # Allow macro expiration upgrade if locked anchor is > 120 bars old
+                locked_matches = np.where(dates == st["anchor_time"])[0]
+                locked_idx = int(locked_matches[0]) if len(locked_matches) > 0 else 0
+                if (current_idx - locked_idx) > 120 and fresh_anchor_time > st["anchor_time"]:
+                    st["anchor_time"]  = fresh_anchor_time
+                    st["anchor_price"] = fresh_anchor_price
 
-        # Map the locked anchor timestamp back to the current dataframe index
         time_matches = np.where(dates == st["anchor_time"])[0]
         if len(time_matches) > 0:
             anchor_idx_found = int(time_matches[0])
         else:
-            # If the anchor candle is older than the start of the dataframe, pin to index 0
             anchor_idx_found = int(np.searchsorted(dates, st["anchor_time"]))
             anchor_idx_found = int(np.clip(anchor_idx_found, 0, len(closes) - 1))
 
-        # One-way ratchet ONLY if price extends the extreme before a structural flip
         if is_bullish:
             post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
             if lows[post_min_idx] < st["anchor_price"]:
@@ -632,7 +641,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         anchor_price = float(st["anchor_price"])
         anchor_time  = int(st["anchor_time"])
     else:
-        # Stateless mode (used by /api/debug)
         anchor_idx_found = fresh_anchor_idx
         if is_bullish:
             post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
@@ -657,7 +665,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     peak_move_atr  = move / atr if atr > 0 else 0.0
     peak_confirmed = bool(extreme_held and move >= ANCHOR_MIN_MOVE_ATR * atr)
 
-    # Once confirmed in live state, keep it confirmed unless extreme is violated
     if state_key and state_key in CYCLE_STATE:
         if peak_confirmed:
             CYCLE_STATE[state_key]["confirmed"] = True
@@ -695,63 +702,78 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         "is_choch":   False
     }]
 
-    # ── Demand/supply trendline (convex hull of swing points since anchor) ──
+    # ── Anchor-Pinned Demand/Supply Trendline ──────────────────────────────
+    # Connects the Peak Anchor to the best unbroken outer swing point so a Supply
+    # Trendline stays ABOVE price and a Demand Trendline stays BELOW price.
     trendline_data = None
     swing_pts_idx = raw_lows if is_bullish else raw_highs
-    swing_pts_idx = swing_pts_idx[(swing_pts_idx >= anchor_idx) & (swing_pts_idx <= len(closes) - 1)]
-    if len(swing_pts_idx) >= 2:
-        swing_prices = lows[swing_pts_idx] if is_bullish else highs[swing_pts_idx]
-        pts = sorted(zip(swing_pts_idx.tolist(), swing_prices.tolist()))
+    swing_pts_idx = swing_pts_idx[(swing_pts_idx > anchor_idx) & (swing_pts_idx <= current_idx)]
 
-        def _cross(o, a, b):
-            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    if len(swing_pts_idx) >= 1 and current_idx > anchor_idx:
+        x1 = int(anchor_idx)
+        y1 = float(lows[x1]) if is_bullish else float(highs[x1])
+        best_x2 = None
+        best_slope = None
 
-        def _hull(points, upper):
-            seq = list(reversed(points)) if upper else points
-            h = []
-            for p in seq:
-                while len(h) >= 2 and _cross(h[-2], h[-1], p) <= 0:
-                    h.pop()
-                h.append(p)
-            if upper:
-                h.reverse()
-            return h
+        for x2_cand in swing_pts_idx:
+            x2_cand = int(x2_cand)
+            if x2_cand <= x1:
+                continue
+            y2_cand = float(lows[x2_cand]) if is_bullish else float(highs[x2_cand])
+            slope_cand = (y2_cand - y1) / (x2_cand - x1)
 
-        hull = _hull(pts, upper=not is_bullish)
-        if len(hull) >= 2:
-            (x1, y1), (x2, y2) = hull[-2], hull[-1]
-            if x2 != x1:
-                slope = (y2 - y1) / (x2 - x1)
-                intercept = y1 - slope * x1
-                current_idx = len(closes) - 1
-                trendline_data = {
-                    "start_time":  int(dates[x1]),
-                    "start_level": float(y1),
-                    "end_time":    int(dates[current_idx]),
-                    "end_level":   float(slope * current_idx + intercept),
-                    "type":        "Demand Trendline" if is_bullish else "Supply Trendline",
-                    "color":       "rgba(59, 255, 130, 0.8)" if is_bullish else "rgba(255, 59, 59, 0.8)",
-                }
+            if is_bullish and slope_cand <= 0:
+                continue
+            if (not is_bullish) and slope_cand >= 0:
+                continue
 
-    # ── Nearest unmitigated Order Block in the cycle direction ──
+            end_lvl = y1 + slope_cand * (current_idx - x1)
+            # Disqualify trendlines that current price has already broken past
+            if is_bullish and closes[-1] < end_lvl - (0.35 * atr):
+                continue
+            if (not is_bullish) and closes[-1] > end_lvl + (0.35 * atr):
+                continue
+
+            if best_slope is None:
+                best_slope = slope_cand
+                best_x2 = x2_cand
+            elif is_bullish and slope_cand < best_slope:
+                best_slope = slope_cand
+                best_x2 = x2_cand
+            elif (not is_bullish) and slope_cand > best_slope:
+                best_slope = slope_cand
+                best_x2 = x2_cand
+
+        if best_x2 is not None and best_slope is not None:
+            end_level = float(y1 + best_slope * (current_idx - x1))
+            trendline_data = {
+                "start_time":  int(dates[x1]),
+                "start_level": float(y1),
+                "end_time":    int(dates[current_idx]),
+                "end_level":   end_level,
+                "type":        "Demand Trendline" if is_bullish else "Supply Trendline",
+                "color":       "rgba(59, 255, 130, 0.8)" if is_bullish else "rgba(255, 59, 59, 0.8)",
+            }
+
+    # ── Nearest unmitigated Order Block in the cycle direction ──────────────
     nearest_ob = None
     if SHOW_ORDER_BLOCKS:
         ob_bias = 'BULLISH' if is_bullish else 'BEARISH'
         obs_found = detect_order_blocks(df, atr, ob_bias)
-        current_price = float(closes[-1])
-        unmitigated = [ob for ob in obs_found if not ob['mitigated']]
-        if unmitigated:
+        current_price_val = float(closes[-1])
+        if obs_found:
             if is_bullish:
-                below = [ob for ob in unmitigated if ob['top'] <= current_price]
+                below = [ob for ob in obs_found if ob['bottom'] <= current_price_val + (0.5 * atr)]
                 if below:
                     nearest_ob = max(below, key=lambda ob: ob['top'])
             else:
-                above = [ob for ob in unmitigated if ob['bottom'] >= current_price]
+                above = [ob for ob in obs_found if ob['top'] >= current_price_val - (0.5 * atr)]
                 if above:
                     nearest_ob = min(above, key=lambda ob: ob['bottom'])
 
     return {
         "cycle":          cycle,
+        "is_bullish":     is_bullish,
         "lines":          all_lines,
         "anchor":         anchor_price,
         "anchor_idx":     int(anchor_idx),
@@ -770,33 +792,182 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     }
 
 
-def calculate_trade_levels(current_price: float, signal: str,
-                           atr: float, decimals: int, ema_50: float) -> Optional[Dict]:
-    try:
-        entry = current_price
-        if signal == "BUY":
-            stop_loss   = min(entry - (atr * 1.5), ema_50 - (atr * 0.5))
-            risk        = abs(entry - stop_loss)
-            take_profit = entry + (risk * 2.0)
-        elif signal == "SELL":
-            stop_loss   = max(entry + (atr * 1.5), ema_50 + (atr * 0.5))
-            risk        = abs(entry - stop_loss)
-            take_profit = entry - (risk * 2.0)
-        else:
-            return None
-        risk = abs(entry - stop_loss)
-        if risk == 0:
-            return None
-        rr = round(abs(take_profit - entry) / risk, 2)
+def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
+                          ema_50: float, ema_200: float, rsi: float,
+                          htf_aligned: bool, decimals: int) -> Dict:
+    """
+    Evaluates the 3 core Peak Formation entry setups on closed candles:
+      1. 2nd-Leg M/W Retest of the Peak Formation zone
+      2. Trendline + 50/200 EMA Pullback Bounce
+      3. Internal Liquidity Sweep + Unmitigated Order Block tap
+    """
+    is_bullish     = ms["is_bullish"]
+    peak_confirmed = ms["peak_confirmed"]
+    anchor_price   = ms["anchor"]
+    atr            = ms["atr"]
+    trendline      = ms["trendline"]
+    nearest_ob     = ms["nearest_ob"]
+    sweeps         = ms["sweeps"]
+    w_confirmed    = ms["w_confirmed"]
+    m_confirmed    = ms["m_confirmed"]
+
+    if not peak_confirmed or atr <= 0:
         return {
-            "entry":       round(entry, decimals),
-            "stop_loss":   round(stop_loss, decimals),
-            "take_profit": round(take_profit, decimals),
-            "risk_reward": rr
+            "signal": "WAIT",
+            "confidence": 25,
+            "setup_name": "Waiting for Peak Confirmation",
+            "entry_note": f"⏳ Wait for price to displace {ANCHOR_MIN_MOVE_ATR} ATR from the Peak Candidate before looking for entries.",
+            "trade_levels": None
         }
-    except Exception as e:
-        logger.error(f"Trade level calc error: {e}")
-        return None
+
+    last_open  = float(df['Open'].iloc[-1])
+    last_close = float(df['Close'].iloc[-1])
+    last_high  = float(df['High'].iloc[-1])
+    last_low   = float(df['Low'].iloc[-1])
+    prev_high  = float(df['High'].iloc[-2]) if len(df) > 1 else last_high
+    prev_low   = float(df['Low'].iloc[-2]) if len(df) > 1 else last_low
+
+    bullish_candle = last_close > last_open
+    bearish_candle = last_close < last_open
+
+    recent_sweep = None
+    if sweeps:
+        last_sw = sweeps[-1]
+        if (len(df) - 1 - last_sw["sweep_idx"]) <= 4:
+            if (is_bullish and last_sw["type"] == "BULL_SWEEP") or ((not is_bullish) and last_sw["type"] == "BEAR_SWEEP"):
+                recent_sweep = last_sw
+
+    reasons = []
+    score   = 40
+
+    if is_bullish:
+        dist_to_anchor = current_price - anchor_price
+        near_anchor_w  = (0.0 <= dist_to_anchor <= 1.15 * atr)
+        near_tl        = False
+        if trendline:
+            tl_lvl = trendline["end_level"]
+            near_tl = (min(last_low, prev_low) <= tl_lvl + 0.35 * atr) and (last_close >= tl_lvl - 0.10 * atr)
+
+        near_ema = (min(last_low, prev_low) <= max(ema_50, ema_200) + 0.25 * atr) and (last_close > ema_50)
+        in_ob    = False
+        if nearest_ob:
+            in_ob = (min(last_low, prev_low) <= nearest_ob["top"] + 0.15 * atr) and (last_close >= nearest_ob["bottom"])
+
+        if near_anchor_w:
+            score += 22
+            reasons.append("2nd-Leg W retest near Peak Low zone")
+        if near_tl:
+            score += 20
+            reasons.append("Demand Trendline bounce")
+        if near_ema:
+            score += 12
+            reasons.append("50/200 EMA dynamic support hold")
+        if in_ob:
+            score += 15
+            reasons.append("Unmitigated Bullish Order Block tap")
+        if recent_sweep:
+            score += 18
+            reasons.append("Bullish Stop-Hunt sweep confirmed")
+        if w_confirmed:
+            score += 10
+            reasons.append("Confirmed W neckline breakout")
+        if htf_aligned:
+            score += 8
+
+        in_reaction_zone = (near_anchor_w or near_tl or in_ob or (near_ema and recent_sweep is not None))
+        if in_reaction_zone and bullish_candle and rsi < 68:
+            sl_base     = anchor_price - (0.35 * atr) if near_anchor_w else min(last_low, prev_low) - (0.50 * atr)
+            stop_loss   = min(sl_base, current_price - (0.80 * atr))
+            risk        = abs(current_price - stop_loss)
+            take_profit = current_price + (risk * DEFAULT_RR_RATIO)
+            confidence  = int(np.clip(score, 65, 96))
+            setup_str   = " + ".join(reasons[:2]) if reasons else "Bullish Pullback Continuation"
+            return {
+                "signal": "BUY",
+                "confidence": confidence,
+                "setup_name": setup_str,
+                "entry_note": f"🟢 BUY TRIGGERED ({setup_str}) — Entry: {current_price:.{decimals}f} | SL: {stop_loss:.{decimals}f} | TP: {take_profit:.{decimals}f}",
+                "trade_levels": {
+                    "entry":       round(current_price, decimals),
+                    "stop_loss":   round(stop_loss, decimals),
+                    "take_profit": round(take_profit, decimals),
+                    "risk_reward": DEFAULT_RR_RATIO
+                }
+            }
+        else:
+            wait_target = f"Demand Trendline ({trendline['end_level']:.{decimals}f})" if trendline else f"50 EMA ({ema_50:.{decimals}f})"
+            return {
+                "signal": "WAIT",
+                "confidence": int(np.clip(score, 35, 64)),
+                "setup_name": "Bullish Cycle Active — Waiting for Pullback Trigger",
+                "entry_note": f"⏳ Bullish Peak W locked at {anchor_price:.{decimals}f}. Wait for a pullback into {wait_target} + a bullish 1H close to BUY.",
+                "trade_levels": None
+            }
+
+    else:
+        dist_to_anchor = anchor_price - current_price
+        near_anchor_m  = (0.0 <= dist_to_anchor <= 1.15 * atr)
+        near_tl        = False
+        if trendline:
+            tl_lvl = trendline["end_level"]
+            near_tl = (max(last_high, prev_high) >= tl_lvl - 0.35 * atr) and (last_close <= tl_lvl + 0.10 * atr)
+
+        near_ema = (max(last_high, prev_high) >= min(ema_50, ema_200) - 0.25 * atr) and (last_close < ema_50)
+        in_ob    = False
+        if nearest_ob:
+            in_ob = (max(last_high, prev_high) >= nearest_ob["bottom"] - 0.15 * atr) and (last_close <= nearest_ob["top"])
+
+        if near_anchor_m:
+            score += 22
+            reasons.append("2nd-Leg M retest near Peak High zone")
+        if near_tl:
+            score += 20
+            reasons.append("Supply Trendline rejection")
+        if near_ema:
+            score += 12
+            reasons.append("50/200 EMA dynamic resistance hold")
+        if in_ob:
+            score += 15
+            reasons.append("Unmitigated Bearish Order Block tap")
+        if recent_sweep:
+            score += 18
+            reasons.append("Bearish Stop-Hunt sweep confirmed")
+        if m_confirmed:
+            score += 10
+            reasons.append("Confirmed M neckline breakdown")
+        if htf_aligned:
+            score += 8
+
+        in_reaction_zone = (near_anchor_m or near_tl or in_ob or (near_ema and recent_sweep is not None))
+        if in_reaction_zone and bearish_candle and rsi > 32:
+            sl_base     = anchor_price + (0.35 * atr) if near_anchor_m else max(last_high, prev_high) + (0.50 * atr)
+            stop_loss   = max(sl_base, current_price + (0.80 * atr))
+            risk        = abs(stop_loss - current_price)
+            take_profit = current_price - (risk * DEFAULT_RR_RATIO)
+            confidence  = int(np.clip(score, 65, 96))
+            setup_str   = " + ".join(reasons[:2]) if reasons else "Bearish Pullback Continuation"
+            return {
+                "signal": "SELL",
+                "confidence": confidence,
+                "setup_name": setup_str,
+                "entry_note": f"🔴 SELL TRIGGERED ({setup_str}) — Entry: {current_price:.{decimals}f} | SL: {stop_loss:.{decimals}f} | TP: {take_profit:.{decimals}f}",
+                "trade_levels": {
+                    "entry":       round(current_price, decimals),
+                    "stop_loss":   round(stop_loss, decimals),
+                    "take_profit": round(take_profit, decimals),
+                    "risk_reward": DEFAULT_RR_RATIO
+                }
+            }
+        else:
+            wait_target = f"Supply Trendline ({trendline['end_level']:.{decimals}f})" if trendline else f"50 EMA ({ema_50:.{decimals}f})"
+            return {
+                "signal": "WAIT",
+                "confidence": int(np.clip(score, 35, 64)),
+                "setup_name": "Bearish Cycle Active — Waiting for Pullback Trigger",
+                "entry_note": f"⏳ Bearish Peak M locked at {anchor_price:.{decimals}f}. Wait for a rally into {wait_target} + a bearish 1H close to SELL.",
+                "trade_levels": None
+            }
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API ENDPOINT
@@ -815,8 +986,8 @@ async def analyze(req: AnalysisRequest):
         return {"signal": "HOLD", "confidence": 0, "reasoning": ["⏳ Waiting for data..."]}
 
     try:
-        csv_last_price  = safe_float(df['Close'].iloc[-1])
-        current_price   = req.current_price if req.current_price > 0 else csv_last_price
+        csv_last_price = safe_float(df['Close'].iloc[-1])
+        current_price  = req.current_price if req.current_price > 0 else csv_last_price
 
         profile  = get_instrument_profile(req.currency, current_price)
         decimals = profile['decimals']
@@ -855,6 +1026,23 @@ async def analyze(req: AnalysisRequest):
 
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
 
+        htf_aligned = False
+        if req.htf_candles and len(req.htf_candles) > 50:
+            htf_df = process_live_candles(req.htf_candles)
+            if htf_df is not None:
+                htf_ema50  = safe_float(EMAIndicator(close=htf_df['Close'], window=50).ema_indicator().iloc[-1])
+                htf_ema200 = safe_float(EMAIndicator(close=htf_df['Close'], window=200).ema_indicator().iloc[-1])
+                htf_aligned = (cycle.startswith('BULLISH') and htf_ema50 > htf_ema200) or \
+                              (cycle.startswith('BEARISH') and htf_ema50 < htf_ema200)
+        else:
+            htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
+                          (cycle.startswith('BEARISH') and ema_50 < ema_200)
+
+        eval_df = df.iloc[:-1].reset_index(drop=True) if (DROP_FORMING_CANDLE and data_source == "LIVE_NODE_DATA" and len(df) > 60) else df
+        entry_eval = evaluate_entry_signal(
+            eval_df, ms, current_price, ema_50, ema_200, rsi, htf_aligned, decimals
+        )
+
         sweep_str = ""
         if sweeps:
             last_sweep = sweeps[-1]
@@ -878,30 +1066,18 @@ async def analyze(req: AnalysisRequest):
         else:
             reasoning.append("✅ W pattern (double-bottom) confirmed." if w_confirmed else "⏳ No confirmed W (double-bottom) pattern yet.")
         if trendline_data:
-            reasoning.append(f"📐 {trendline_data['type']} plotted — where liquidity is likely to be swept before a reaction.")
+            reasoning.append(f"📐 {trendline_data['type']} active at {trendline_data['end_level']:.{decimals}f}.")
         if nearest_ob:
-            reasoning.append(f"🎯 Nearest Order Block: {nearest_ob['bottom']:.{decimals}f}–{nearest_ob['top']:.{decimals}f} — the real demand/supply zone.")
-        reasoning.append("🚧 Entry signal in development — trendline and OB are shown for reference only, no trade signal generated yet.")
-
-        htf_aligned = False
-        if req.htf_candles and len(req.htf_candles) > 50:
-            htf_df = process_live_candles(req.htf_candles)
-            if htf_df is not None:
-                htf_ema50  = safe_float(EMAIndicator(close=htf_df['Close'], window=50).ema_indicator().iloc[-1])
-                htf_ema200 = safe_float(EMAIndicator(close=htf_df['Close'], window=200).ema_indicator().iloc[-1])
-                htf_aligned = (cycle.startswith('BULLISH') and htf_ema50 > htf_ema200) or \
-                              (cycle.startswith('BEARISH') and htf_ema50 < htf_ema200)
-        else:
-            htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
-                          (cycle.startswith('BEARISH') and ema_50 < ema_200)
+            reasoning.append(f"🎯 Nearest Order Block: {nearest_ob['bottom']:.{decimals}f}–{nearest_ob['top']:.{decimals}f}.")
+        reasoning.append(entry_eval["entry_note"])
 
         return {
-            "signal":     "NEUTRAL",
-            "confidence": 0,
-            "trend":      cycle,
-            "pattern":    "Peak Formation" if peak_confirmed else "Peak Candidate",
+            "signal":         entry_eval["signal"],
+            "confidence":     entry_eval["confidence"],
+            "trend":          cycle,
+            "pattern":        entry_eval["setup_name"] if entry_eval["signal"] in ("BUY", "SELL") else ("Peak Formation" if peak_confirmed else "Peak Candidate"),
             "peak_confirmed": peak_confirmed,
-            "reasoning":  reasoning,
+            "reasoning":      reasoning,
             "keyLevels": {
                 "resistance": round(current_price + (atr * 2), decimals),
                 "support":    round(current_price - (atr * 2), decimals),
@@ -918,13 +1094,14 @@ async def analyze(req: AnalysisRequest):
                 {"tf": "4H", "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 40},
                 {"tf": "1H", "bias": bias_str, "strength": 75 if bias_str == "BULLISH" else 65},
             ],
-            "tradeSetup": None,
-            "dataSource": data_source,
+            "tradeSetup":     entry_eval["trade_levels"],
+            "dataSource":     data_source,
         }
 
     except Exception as e:
         logger.error(f"Analysis Crash: {e}", exc_info=True)
         return {"signal": "ERROR", "confidence": 0, "reasoning": [f"Engine error: {str(e)}"]}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEBUG ENDPOINT (stateless — never touches the cycle lock)
@@ -947,7 +1124,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v4.0 (Protected Swings + Timestamp Anchor Pinning)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v4.2 (Protected Swings + Macro Expiration + Entry Engine)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",
@@ -965,6 +1142,7 @@ async def debug_analysis(req: AnalysisRequest):
     except Exception as e:
         import traceback
         return {"error": str(e), "traceback": traceback.format_exc()}
+
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"])
 async def proxy_to_node(path: str, request: Request):
