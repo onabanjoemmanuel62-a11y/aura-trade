@@ -7,7 +7,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
-from scipy.signal import argrelextrema
 import logging
 from contextlib import asynccontextmanager
 import httpx
@@ -27,19 +26,39 @@ NODE_URL = "http://127.0.0.1:10000"
 # Set to False ONLY if your node sends closed candles exclusively.
 DROP_FORMING_CANDLE = True
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PEAK CONFIRMATION TUNING
+# ─────────────────────────────────────────────────────────────────────────────
+# Causal fractal confirmation bars on the right side of a swing (3 to 6 bars)
+BASE_SWING_ORDER             = 4
+# A cycle flip only counts when price CLOSES beyond the opposing protected swing
+# by this many ATRs, and does so for FLIP_CONFIRM_BARS closes in a row.
+FLIP_BUFFER_ATR              = 0.25
+FLIP_CONFIRM_BARS            = 2
+# A peak is only shown as CONFIRMED once price has travelled at least this many
+# ATRs away from it AND has not taken the extreme out since.
+ANCHOR_MIN_MOVE_ATR          = 1.5
+# A swing point must stand out by this many ATRs to count as structural.
+SWING_PROMINENCE_ATR         = 0.90
+# How close two lows/highs must be (in ATR) to count as a W / M (includes stop-hunts).
+DOUBLE_PATTERN_TOLERANCE_ATR = 0.65
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
 
 MARKET_MEMORY = {"df": None}
 
-# Order blocks are computed but not requested/used downstream — the impulse
-# threshold in detect_order_blocks() fires on ordinary volatility, not real
-# institutional zones, and produces boxes that look arbitrary on chart.
-# Off by default; flip to True only if you actually want them back.
+# Off by default; flip to True only if you want order blocks displayed.
 SHOW_ORDER_BLOCKS = False
 
-# Anti-flicker memory (per "currency:timeframe"):
-#   CYCLE_STATE[key] = {"bullish": bool, "flip_time": int}
+# Anti-flicker & Anchor-Lock memory (per "currency:timeframe"):
+#   CYCLE_STATE[key] = {
+#       "bullish": bool,
+#       "flip_time": int,
+#       "anchor_time": int,
+#       "anchor_price": float,
+#       "confirmed": bool
+#   }
 #   ORDER_CACHE[key] = swing order currently in use (changes only on a real shift)
 CYCLE_STATE: Dict[str, Dict] = {}
 ORDER_CACHE: Dict[str, int] = {}
@@ -136,17 +155,7 @@ class AnalysisRequest(BaseModel):
     news_data: Optional[Dict] = None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPROVED PEAK DETECTION HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
-    avg_range = float((df['High'] - df['Low']).tail(50).mean())
-    ratio = avg_range / atr if atr > 0 else 1.0
-    order = int(np.clip(ratio * 10, 5, 20))
-    return order
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE — Peak Formation
+# CORE ENGINE — Peak Formation & Market Structure
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -165,26 +174,80 @@ def get_instrument_profile(currency: str, current_price: float) -> Dict:
         return {"decimals": 2, "pip_size": 0.01, "label": currency}
     return {"decimals": 5, "pip_size": 0.0001, "label": currency}
 
+
 def calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Wilder's smoothed ATR (matches TradingView / MT4 / MT5)."""
     high  = df['High'].values
     low   = df['Low'].values
     close = df['Close'].values
-    tr_list = []
-    for i in range(1, len(close)):
-        tr = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i]  - close[i-1]))
-        tr_list.append(tr)
-    tr_series = pd.Series(tr_list)
-    return float(tr_series.rolling(period).mean().iloc[-1]) if len(tr_list) >= period else float(tr_series.mean())
+    if len(close) < 2:
+        return 0.0
+    tr = np.maximum(
+        high[1:] - low[1:],
+        np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1]))
+    )
+    if len(tr) < period:
+        return float(np.mean(tr))
+    atr_series = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False).mean()
+    return float(atr_series.iloc[-1])
+
+
+def adaptive_swing_order(df: pd.DataFrame, atr: float) -> int:
+    """
+    Uses Kaufman Efficiency Ratio (KER) to adapt swing order between 3 and 6 bars.
+    Clean trending/displacement -> 3-4 bars. Choppy consolidation -> 5-6 bars.
+    """
+    if len(df) < 30 or atr <= 0:
+        return BASE_SWING_ORDER
+    recent_closes = df['Close'].tail(20).values
+    net_move = abs(recent_closes[-1] - recent_closes[0])
+    path_length = np.sum(np.abs(np.diff(recent_closes)))
+    efficiency = net_move / path_length if path_length > 0 else 0.5
+    order = int(np.clip(round(6.0 - (efficiency * 3.0)), 3, 6))
+    return order
+
+
+def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, min_prominence: float):
+    """
+    Detects causal swing highs and lows without failing on equal highs/lows (tweezers).
+    Left window looks back `swing_order * 2` bars; right window requires `swing_order` bars
+    for fast, non-repainting confirmation.
+    """
+    n = len(highs)
+    left_w = swing_order * 2
+    right_w = swing_order
+    filtered_highs = []
+    filtered_lows = []
+
+    for idx in range(left_w, n - right_w):
+        # Swing High check: >= left window, > right window (handles equal-high tweezers)
+        l_highs = highs[idx - left_w : idx]
+        r_highs = highs[idx + 1 : idx + right_w + 1]
+        if highs[idx] >= np.max(l_highs) and highs[idx] > np.max(r_highs):
+            left_prom  = highs[idx] - np.min(lows[idx - left_w : idx])
+            right_prom = highs[idx] - np.min(lows[idx + 1 : idx + right_w + 1])
+            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.45:
+                if not filtered_highs or (idx - filtered_highs[-1]) >= right_w:
+                    filtered_highs.append(idx)
+                elif highs[idx] > highs[filtered_highs[-1]]:
+                    filtered_highs[-1] = idx
+
+        # Swing Low check: <= left window, < right window (handles equal-low tweezers)
+        l_lows = lows[idx - left_w : idx]
+        r_lows = lows[idx + 1 : idx + right_w + 1]
+        if lows[idx] <= np.min(l_lows) and lows[idx] < np.min(r_lows):
+            left_prom  = np.max(highs[idx - left_w : idx]) - lows[idx]
+            right_prom = np.max(highs[idx + 1 : idx + right_w + 1]) - lows[idx]
+            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.45:
+                if not filtered_lows or (idx - filtered_lows[-1]) >= right_w:
+                    filtered_lows.append(idx)
+                elif lows[idx] < lows[filtered_lows[-1]]:
+                    filtered_lows[-1] = idx
+
+    return np.array(filtered_highs, dtype=int), np.array(filtered_lows, dtype=int)
+
 
 def detect_order_blocks(df: pd.DataFrame, atr: float, bias: str, lookback: int = 150) -> List[Dict]:
-    """
-    Order block: the last opposite-colored candle before a strong
-    impulsive move — where the real order flow that drove the move
-    originated. Repurposed per the strategy being tested: not for MMM
-    scoring (removed), but as the actual demand/supply reaction zone,
-    deeper and more reliable than the shallow retest of a broken
-    resistance/support level that retail traders use.
-    """
     closes = df['Close'].values
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -235,7 +298,7 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
-    min_wick = atr * 0.3
+    min_wick = atr * 0.20
     total    = len(closes)
     cutoff   = max(0, total - 200)
 
@@ -246,9 +309,11 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
         sh_price = highs[sh_idx]
         for i in range(sh_idx + 1, min(sh_idx + 80, total)):
             wick_above = highs[i] - sh_price
+            if closes[i] > sh_price + (atr * 0.25):
+                break
             if wick_above >= min_wick and closes[i] < sh_price:
                 sweeps.append({
-                    "type":      "BULL_SWEEP",
+                    "type":      "BEAR_SWEEP",
                     "level":     float(sh_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]) if len(dates) > i else 0,
@@ -260,9 +325,11 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
         sl_price = lows[sl_idx]
         for i in range(sl_idx + 1, min(sl_idx + 80, total)):
             wick_below = sl_price - lows[i]
+            if closes[i] < sl_price - (atr * 0.25):
+                break
             if wick_below >= min_wick and closes[i] > sl_price:
                 sweeps.append({
-                    "type":      "BEAR_SWEEP",
+                    "type":      "BULL_SWEEP",
                     "level":     float(sl_price),
                     "sweep_idx": int(i),
                     "time":      int(dates[i]) if len(dates) > i else 0,
@@ -273,69 +340,88 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     return sweeps[-5:]
 
 
-def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float, lookback: int = 150) -> Dict:
+def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray,
+                          atr: float, anchor_idx: Optional[int] = None, lookback: int = 150) -> Dict:
     """
-    Confirms genuine W (double-bottom / Peak Formation Low) and M (double-top /
-    Peak Formation High) chart patterns from real swing points, rather than
-    relying purely on EMA trend direction (which only tells you the current
-    bias, not whether an actual reversal shape has formed).
+    Confirms genuine W (Peak Formation Low) and M (Peak Formation High) chart patterns
+    around the active cycle anchor or live market edge, including Stop-Hunt W/M variations.
     """
     closes = df['Close'].values
-    highs = df['High'].values
-    lows = df['Low'].values
-    total = len(closes)
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    total  = len(closes)
     cutoff = max(0, total - lookback)
 
-    price_tolerance = atr * 1.0      # how close the two lows/highs must be to count as "similar"
-    middle_prominence = atr * 0.5    # how much higher/lower the middle swing point must be
+    price_tolerance   = atr * DOUBLE_PATTERN_TOLERANCE_ATR
+    middle_prominence = atr * 0.45
 
     result = {
         "w_confirmed": False, "w_low1": None, "w_low2": None, "w_middle": None, "w_low2_idx": None,
         "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None, "m_high2_idx": None,
     }
 
-    recent_lows = sorted([int(i) for i in swing_lows if i >= cutoff])
+    recent_lows  = sorted([int(i) for i in swing_lows if i >= cutoff])
     recent_highs = sorted([int(i) for i in swing_highs if i >= cutoff])
 
     # --- W pattern (double bottom) ---
-    if len(recent_lows) >= 2:
-        low2_idx = recent_lows[-1]
-        low1_idx = recent_lows[-2]
+    for k in range(len(recent_lows) - 1, 0, -1):
+        low2_idx = recent_lows[k]
+        low1_idx = recent_lows[k - 1]
+        if (low2_idx - low1_idx) > 65:
+            continue
+        if anchor_idx is not None and abs(low1_idx - anchor_idx) > 25 and abs(low2_idx - anchor_idx) > 25 and k < len(recent_lows) - 1:
+            continue
+
         low1_price = lows[low1_idx]
         low2_price = lows[low2_idx]
 
         if abs(low1_price - low2_price) <= price_tolerance:
-            between_highs = [h for h in swing_highs if low1_idx < h < low2_idx]
+            between_highs = [h for h in range(low1_idx + 1, low2_idx)]
             if between_highs:
-                middle_idx = max(between_highs, key=lambda h: highs[int(h)])
-                middle_price = highs[int(middle_idx)]
-                if middle_price - max(low1_price, low2_price) >= middle_prominence:
-                    if closes[-1] > low2_price:  # confirmation: price reclaimed above the second low
-                        result["w_confirmed"] = True
-                        result["w_low1"] = float(low1_price)
-                        result["w_low2"] = float(low2_price)
-                        result["w_middle"] = float(middle_price)
-                        result["w_low2_idx"] = low2_idx
+                middle_idx   = max(between_highs, key=lambda h: highs[h])
+                middle_price = highs[middle_idx]
+                if middle_price - min(low1_price, low2_price) >= middle_prominence:
+                    post_closes = closes[low2_idx + 1:]
+                    post_lows   = lows[low2_idx + 1:]
+                    if len(post_closes) > 0 and np.max(post_closes) > middle_price and np.min(post_lows) >= min(low1_price, low2_price) - (0.1 * atr):
+                        result.update({
+                            "w_confirmed": True,
+                            "w_low1": float(low1_price),
+                            "w_low2": float(low2_price),
+                            "w_middle": float(middle_price),
+                            "w_low2_idx": int(low2_idx),
+                        })
+                        break
 
     # --- M pattern (double top) ---
-    if len(recent_highs) >= 2:
-        high2_idx = recent_highs[-1]
-        high1_idx = recent_highs[-2]
+    for k in range(len(recent_highs) - 1, 0, -1):
+        high2_idx = recent_highs[k]
+        high1_idx = recent_highs[k - 1]
+        if (high2_idx - high1_idx) > 65:
+            continue
+        if anchor_idx is not None and abs(high1_idx - anchor_idx) > 25 and abs(high2_idx - anchor_idx) > 25 and k < len(recent_highs) - 1:
+            continue
+
         high1_price = highs[high1_idx]
         high2_price = highs[high2_idx]
 
         if abs(high1_price - high2_price) <= price_tolerance:
-            between_lows = [l for l in swing_lows if high1_idx < l < high2_idx]
+            between_lows = [l for l in range(high1_idx + 1, high2_idx)]
             if between_lows:
-                middle_idx = min(between_lows, key=lambda l: lows[int(l)])
-                middle_price = lows[int(middle_idx)]
-                if min(high1_price, high2_price) - middle_price >= middle_prominence:
-                    if closes[-1] < high2_price:  # confirmation: price dropped back below the second high
-                        result["m_confirmed"] = True
-                        result["m_high1"] = float(high1_price)
-                        result["m_high2"] = float(high2_price)
-                        result["m_middle"] = float(middle_price)
-                        result["m_high2_idx"] = high2_idx
+                middle_idx   = min(between_lows, key=lambda l: lows[l])
+                middle_price = lows[middle_idx]
+                if max(high1_price, high2_price) - middle_price >= middle_prominence:
+                    post_closes = closes[high2_idx + 1:]
+                    post_highs  = highs[high2_idx + 1:]
+                    if len(post_closes) > 0 and np.min(post_closes) < middle_price and np.max(post_highs) <= max(high1_price, high2_price) + (0.1 * atr):
+                        result.update({
+                            "m_confirmed": True,
+                            "m_high1": float(high1_price),
+                            "m_high2": float(high2_price),
+                            "m_middle": float(middle_price),
+                            "m_high2_idx": int(high2_idx),
+                        })
+                        break
 
     return result
 
@@ -354,202 +440,255 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
 
     atr = calculate_atr(df, 14)
-    if atr == 0: atr = float(df['Close'].mean()) * 0.001
+    if atr == 0:
+        atr = float(df['Close'].mean()) * 0.001
 
-    # swing_order_override exists ONLY for backtesting experiments (see
-    # peak_speed_experiment.py) — it's never set by the live /api/analyze
-    # endpoint, so live behavior is completely unchanged by this parameter.
-    #
-    # With a state_key (live), the order only changes when the adaptive value
-    # has moved by 3+ — a shift of 1 candle in the order rewrites swing points
-    # and was a source of flicker.
     fresh_order = adaptive_swing_order(df, atr)
     if swing_order_override is not None:
         swing_order = swing_order_override
     elif state_key:
         cached = ORDER_CACHE.get(state_key)
+        # Require a shift of 3+ to change cached order so swings never flicker
         if cached is None or abs(fresh_order - cached) >= 3:
             ORDER_CACHE[state_key] = fresh_order
             cached = fresh_order
         swing_order = cached
     else:
         swing_order = fresh_order
-    min_prominence = atr * 0.3
 
-    raw_highs_idx = argrelextrema(highs, np.greater, order=swing_order)[0]
-    raw_lows_idx  = argrelextrema(lows,  np.less,    order=swing_order)[0]
-
-    filtered_highs = []
-    for idx in raw_highs_idx:
-        if idx > swing_order and idx < len(highs) - swing_order:
-            neigh_min = min(np.min(highs[idx-swing_order:idx]), np.min(highs[idx+1:idx+swing_order+1]))
-            if highs[idx] - neigh_min >= min_prominence:
-                filtered_highs.append(idx)
-
-    filtered_lows = []
-    for idx in raw_lows_idx:
-        if idx > swing_order and idx < len(lows) - swing_order:
-            neigh_max = max(np.max(lows[idx-swing_order:idx]), np.max(lows[idx+1:idx+swing_order+1]))
-            if neigh_max - lows[idx] >= min_prominence:
-                filtered_lows.append(idx)
-
-    raw_highs = np.array(filtered_highs, dtype=int)
-    raw_lows  = np.array(filtered_lows, dtype=int)
+    min_prominence = atr * SWING_PROMINENCE_ATR
+    raw_highs, raw_lows = detect_swings_causal(highs, lows, swing_order, min_prominence)
 
     logger.info(f"Core MMM swings: order={swing_order}, prominence={min_prominence:.5f}")
     logger.info(f"Detected swing highs: {raw_highs.tolist()}")
     logger.info(f"Detected swing lows : {raw_lows.tolist()}")
 
-    ema_200_series = df['Close'].ewm(span=200, adjust=False).mean()
-    ema_50_series  = df['Close'].ewm(span=50, adjust=False).mean()
-    ema_50_array   = ema_50_series.values
-    ema_200_array  = ema_200_series.values
+    ema_50_array  = df['Close'].ewm(span=50, adjust=False).mean().values
+    ema_200_array = df['Close'].ewm(span=200, adjust=False).mean().values
 
-    def compute_structural_flips(seed_bullish):
+    def compute_structural_cycles(seed_bullish: bool):
         """
-        Walks forward through the whole series once, tracking the most
-        recent CONFIRMED swing high/low, and records every index where a
-        candle CLOSES beyond the opposing swing level — a Market
-        Structure Break (MSB). This replaces EMA50/EMA200 as the cycle
-        signal: EMA crossovers are a lagging indicator by construction.
-
-        CAUSAL: a swing at index k only becomes usable at candle
-        k + swing_order, because that is the earliest a live tool could have
-        known it (it needs swing_order candles on its right). Using it any
-        earlier is hindsight, and it makes past flips get rewritten when the
-        swing is confirmed — the cause of the PFH/PFL flip-back.
-
-        Confirmation requires a candle CLOSE beyond the swing level, not
-        just a wick — a wick that pierces and retraces is a liquidity
-        sweep, not a real structure break.
-
-        Returns (flips, final_is_bullish).
+        Walks forward through price action tracking true Protected Swings.
+        A Protected Low in an uptrend only advances when price makes a new Higher High
+        (and vice versa in a downtrend). When the Protected Swing is broken by
+        FLIP_CONFIRM_BARS closes beyond FLIP_BUFFER_ATR, a cycle flip occurs and the
+        exact Peak Formation Anchor (the extreme prior to the break) is locked.
         """
         highs_set = set(raw_highs.tolist())
-        lows_set = set(raw_lows.tolist())
-        flips = []
+        lows_set  = set(raw_lows.tolist())
+
         is_bull = seed_bullish
-        last_high_idx = None
-        last_low_idx = None
+        cycle_start_idx = 0
+        extreme_price = highs[0] if is_bull else lows[0]
+
+        protected_low_idx   = 0
+        protected_high_idx  = 0
+        last_confirmed_low  = None
+        last_confirmed_high = None
+
+        buf = FLIP_BUFFER_ATR * atr
+        pending = 0
+        events = []
+
         for i in range(len(closes)):
-            if (i - swing_order) in highs_set:
-                last_high_idx = i - swing_order
-            if (i - swing_order) in lows_set:
-                last_low_idx = i - swing_order
-            if is_bull and last_low_idx is not None and closes[i] < lows[last_low_idx]:
-                is_bull = False
-                flips.append(i)
-            elif not is_bull and last_high_idx is not None and closes[i] > highs[last_high_idx]:
-                is_bull = True
-                flips.append(i)
-        return flips, is_bull
+            confirmed_bar = i - swing_order
+            if confirmed_bar in highs_set:
+                last_confirmed_high = confirmed_bar
+            if confirmed_bar in lows_set:
+                last_confirmed_low = confirmed_bar
 
-    seed_idx = min(300, len(closes) - 1)
-    seed_bullish = ema_50_array[seed_idx] > ema_200_array[seed_idx]
-    structural_flips, is_bullish = compute_structural_flips(seed_bullish)
+            if is_bull:
+                # Advance protected low ONLY when price achieves a new cycle high
+                if highs[i] >= extreme_price:
+                    extreme_price = highs[i]
+                    if last_confirmed_low is not None and last_confirmed_low >= cycle_start_idx:
+                        protected_low_idx = last_confirmed_low
 
-    # ── Cycle lock ──────────────────────────────────────────────────────────
-    # Only change the displayed cycle when there is a genuinely NEW break
-    # (a flip later than the one already shown). If a recompute merely
-    # disagrees with what was shown but has no newer break, it rewrote
-    # history — keep the shown cycle.
-    fresh_bullish = is_bullish
-    last_flip_time = int(dates[structural_flips[-1]]) if structural_flips else 0
+                # If no confirmed low existed at the moment of the high, fallback to the first confirmed low of the cycle
+                if protected_low_idx == cycle_start_idx and last_confirmed_low is not None and last_confirmed_low > cycle_start_idx:
+                    if highs[i] - lows[last_confirmed_low] >= ANCHOR_MIN_MOVE_ATR * atr:
+                        protected_low_idx = last_confirmed_low
+
+                broke = closes[i] < (lows[protected_low_idx] - buf)
+                pending = pending + 1 if broke else 0
+
+                if pending >= FLIP_CONFIRM_BARS:
+                    # Flip BULL -> BEAR: Peak High Anchor is the highest high from cycle_start_idx to i
+                    true_peak_high_idx = cycle_start_idx + int(np.argmax(highs[cycle_start_idx : i + 1]))
+                    is_bull = False
+                    cycle_start_idx = true_peak_high_idx
+                    extreme_price = lows[i]
+                    protected_high_idx = true_peak_high_idx
+                    pending = 0
+                    events.append({
+                        "flip_idx":     i,
+                        "flip_time":    int(dates[i]),
+                        "bullish":      False,
+                        "anchor_idx":   true_peak_high_idx,
+                        "anchor_time":  int(dates[true_peak_high_idx]),
+                        "anchor_price": float(highs[true_peak_high_idx]),
+                    })
+            else:
+                # Advance protected high ONLY when price achieves a new cycle low
+                if lows[i] <= extreme_price:
+                    extreme_price = lows[i]
+                    if last_confirmed_high is not None and last_confirmed_high >= cycle_start_idx:
+                        protected_high_idx = last_confirmed_high
+
+                if protected_high_idx == cycle_start_idx and last_confirmed_high is not None and last_confirmed_high > cycle_start_idx:
+                    if highs[last_confirmed_high] - lows[i] >= ANCHOR_MIN_MOVE_ATR * atr:
+                        protected_high_idx = last_confirmed_high
+
+                broke = closes[i] > (highs[protected_high_idx] + buf)
+                pending = pending + 1 if broke else 0
+
+                if pending >= FLIP_CONFIRM_BARS:
+                    # Flip BEAR -> BULL: Peak Low Anchor is the lowest low from cycle_start_idx to i
+                    true_peak_low_idx = cycle_start_idx + int(np.argmin(lows[cycle_start_idx : i + 1]))
+                    is_bull = True
+                    cycle_start_idx = true_peak_low_idx
+                    extreme_price = highs[i]
+                    protected_low_idx = true_peak_low_idx
+                    pending = 0
+                    events.append({
+                        "flip_idx":     i,
+                        "flip_time":    int(dates[i]),
+                        "bullish":      True,
+                        "anchor_idx":   true_peak_low_idx,
+                        "anchor_time":  int(dates[true_peak_low_idx]),
+                        "anchor_price": float(lows[true_peak_low_idx]),
+                    })
+
+        return events, is_bull
+
+    seed_idx = min(50, len(closes) - 1)
+    seed_bullish = bool(ema_50_array[seed_idx] > ema_200_array[seed_idx])
+    cycle_events, is_bullish = compute_structural_cycles(seed_bullish)
+
+    # Find the most recent cycle event matching the computed direction
+    matching_events = [e for e in cycle_events if e["bullish"] == is_bullish]
+    if matching_events:
+        latest_event = matching_events[-1]
+        fresh_flip_time    = latest_event["flip_time"]
+        fresh_anchor_idx   = latest_event["anchor_idx"]
+        fresh_anchor_time  = latest_event["anchor_time"]
+        fresh_anchor_price = latest_event["anchor_price"]
+    else:
+        fresh_flip_time  = 0
+        fresh_anchor_idx = int(np.argmin(lows)) if is_bullish else int(np.argmax(highs))
+        fresh_anchor_time = int(dates[fresh_anchor_idx])
+        fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
+
+    # ── Strict Anti-Bounce Cycle & Anchor Lock ──────────────────────────────
     if state_key:
         st = CYCLE_STATE.get(state_key)
         if st is None:
-            CYCLE_STATE[state_key] = {"bullish": fresh_bullish, "flip_time": last_flip_time}
-        elif fresh_bullish == st["bullish"]:
-            st["flip_time"] = last_flip_time
-        elif last_flip_time > st["flip_time"]:
-            CYCLE_STATE[state_key] = {"bullish": fresh_bullish, "flip_time": last_flip_time}
+            CYCLE_STATE[state_key] = {
+                "bullish":      is_bullish,
+                "flip_time":    fresh_flip_time,
+                "anchor_time":  fresh_anchor_time,
+                "anchor_price": fresh_anchor_price,
+                "confirmed":    False,
+            }
+            st = CYCLE_STATE[state_key]
         else:
-            is_bullish = st["bullish"]
-
-    def find_cycle_anchor(current_idx, is_bullish_now, max_lookback_crossings=10, edge_buffer=120):
-        """
-        Finds the true origin (highest high / lowest low) of the current
-        cycle. A naive search bounded to [most-recent-flip, now] is wrong
-        most of the time — the real peak/trough often sits just before
-        the flip is confirmed, not after it.
-
-        Steps backward through the precomputed structural flip list (most
-        recent first) rather than crawling one candle at a time. Two
-        failure modes are corrected once boundaries jump properly:
-          1. Degenerate: the found extreme sits right on the flip candle
-             itself (an artifact of where the window started).
-          2. Edge-adjacent: a materially bigger extreme sits just outside
-             the window, in the edge_buffer candles immediately before
-             the flip.
-
-        CONFIRMATION CAP (fixes early/premature Peak confirmation): the
-        search window is never allowed to reach the last `swing_order`
-        candles before the live edge. A brand-new low/high sitting right at
-        the live edge hasn't proven anything yet — price could still be
-        mid-move through it. Only once a bar has "survived" swing_order
-        candles without being taken out is it eligible to be shown as the
-        Peak. This uses the exact same confirmation window that already
-        governs swing points and structural flips, so the whole engine is
-        consistent about what counts as "confirmed."
-        """
-        confirmed_limit = max(0, current_idx - swing_order)
-
-        candidate_boundaries = [f for f in reversed(structural_flips) if f <= current_idx]
-        candidate_boundaries.append(0)  # always allow searching back to the start of available data
-
-        extreme_idx = confirmed_limit
-        for step in range(min(max_lookback_crossings, len(candidate_boundaries))):
-            cross_idx_local = candidate_boundaries[step]
-            search_end = max(cross_idx_local, confirmed_limit)
-            if is_bullish_now:
-                extreme_idx = cross_idx_local + int(np.argmin(lows[cross_idx_local:search_end + 1]))
+            # Case 1: Genuine new structural break in the OPPOSITE direction
+            if is_bullish != st["bullish"] and fresh_flip_time > st["flip_time"]:
+                CYCLE_STATE[state_key] = {
+                    "bullish":      is_bullish,
+                    "flip_time":    fresh_flip_time,
+                    "anchor_time":  fresh_anchor_time,
+                    "anchor_price": fresh_anchor_price,
+                    "confirmed":    False,
+                }
+                st = CYCLE_STATE[state_key]
             else:
-                extreme_idx = cross_idx_local + int(np.argmax(highs[cross_idx_local:search_end + 1]))
+                # Keep locked cycle direction and locked anchor!
+                is_bullish = st["bullish"]
 
-            degenerate = (extreme_idx - cross_idx_local) <= 2
+        # Map the locked anchor timestamp back to the current dataframe index
+        time_matches = np.where(dates == st["anchor_time"])[0]
+        if len(time_matches) > 0:
+            anchor_idx_found = int(time_matches[0])
+        else:
+            # If the anchor candle is older than the start of the dataframe, pin to index 0
+            anchor_idx_found = int(np.searchsorted(dates, st["anchor_time"]))
+            anchor_idx_found = int(np.clip(anchor_idx_found, 0, len(closes) - 1))
 
-            edge_start = max(0, cross_idx_local - edge_buffer)
-            bigger_nearby = False
-            if edge_start < cross_idx_local:
-                if is_bullish_now:
-                    bigger_nearby = lows[edge_start:cross_idx_local].min() < lows[extreme_idx]
-                else:
-                    bigger_nearby = highs[edge_start:cross_idx_local].max() > highs[extreme_idx]
+        # One-way ratchet ONLY if price extends the extreme before a structural flip
+        if is_bullish:
+            post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
+            if lows[post_min_idx] < st["anchor_price"]:
+                anchor_idx_found   = post_min_idx
+                st["anchor_time"]  = int(dates[post_min_idx])
+                st["anchor_price"] = float(lows[post_min_idx])
+        else:
+            post_max_idx = anchor_idx_found + int(np.argmax(highs[anchor_idx_found:]))
+            if highs[post_max_idx] > st["anchor_price"]:
+                anchor_idx_found   = post_max_idx
+                st["anchor_time"]  = int(dates[post_max_idx])
+                st["anchor_price"] = float(highs[post_max_idx])
 
-            if (not degenerate) and (not bigger_nearby):
-                break
-            if cross_idx_local == 0:
-                break
-        return extreme_idx
+        anchor_price = float(st["anchor_price"])
+        anchor_time  = int(st["anchor_time"])
+    else:
+        # Stateless mode (used by /api/debug)
+        anchor_idx_found = fresh_anchor_idx
+        if is_bullish:
+            post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
+            if lows[post_min_idx] < lows[anchor_idx_found]:
+                anchor_idx_found = post_min_idx
+            anchor_price = float(lows[anchor_idx_found])
+        else:
+            post_max_idx = anchor_idx_found + int(np.argmax(highs[anchor_idx_found:]))
+            if highs[post_max_idx] > highs[anchor_idx_found]:
+                anchor_idx_found = post_max_idx
+            anchor_price = float(highs[anchor_idx_found])
+        anchor_time = int(dates[anchor_idx_found])
 
-    anchor_idx_found = find_cycle_anchor(len(closes) - 1, is_bullish)
-
+    # ── Candidate vs CONFIRMED peak ─────────────────────────────────────────
     if is_bullish:
-        use_bearish  = False
-        best_low_idx = anchor_idx_found
+        move = float(highs[anchor_idx_found:].max() - anchor_price)
+        extreme_held = bool(lows[anchor_idx_found:].min() >= anchor_price - 1e-9)
     else:
-        use_bearish   = True
-        best_high_idx = anchor_idx_found
+        move = float(anchor_price - lows[anchor_idx_found:].min())
+        extreme_held = bool(highs[anchor_idx_found:].max() <= anchor_price + 1e-9)
 
-    if use_bearish:
-        cycle        = "BEARISH CYCLE (Peak M)"
-        anchor_idx   = best_high_idx
-        anchor_price = float(highs[anchor_idx])
-        pattern_name = "Peak Formation High (M)"
-        anchor_color = "rgba(255, 59, 59, 1)"
+    peak_move_atr  = move / atr if atr > 0 else 0.0
+    peak_confirmed = bool(extreme_held and move >= ANCHOR_MIN_MOVE_ATR * atr)
+
+    # Once confirmed in live state, keep it confirmed unless extreme is violated
+    if state_key and state_key in CYCLE_STATE:
+        if peak_confirmed:
+            CYCLE_STATE[state_key]["confirmed"] = True
+        elif CYCLE_STATE[state_key]["confirmed"] and extreme_held:
+            peak_confirmed = True
+
+    if not is_bullish:
+        cycle      = "BEARISH CYCLE (Peak M)"
+        anchor_idx = anchor_idx_found
+        if peak_confirmed:
+            pattern_name = "Peak Formation High (M)"
+            anchor_color = "rgba(255, 59, 59, 1)"
+        else:
+            pattern_name = "Peak Candidate High (M)"
+            anchor_color = "rgba(255, 59, 59, 0.45)"
     else:
-        cycle        = "BULLISH CYCLE (Peak W)"
-        anchor_idx   = best_low_idx
-        anchor_price = float(lows[anchor_idx])
-        pattern_name = "Peak Formation Low (W)"
-        anchor_color = "rgba(59, 255, 130, 1)"
+        cycle      = "BULLISH CYCLE (Peak W)"
+        anchor_idx = anchor_idx_found
+        if peak_confirmed:
+            pattern_name = "Peak Formation Low (W)"
+            anchor_color = "rgba(59, 255, 130, 1)"
+        else:
+            pattern_name = "Peak Candidate Low (W)"
+            anchor_color = "rgba(59, 255, 130, 0.45)"
 
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr)
+    pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr, anchor_idx=anchor_idx)
 
     all_lines = [{
         "level":      anchor_price,
-        "start_time": int(dates[anchor_idx]),
+        "start_time": anchor_time,
         "end_time":   int(dates[-1]),
         "type":       pattern_name,
         "color":      anchor_color,
@@ -557,12 +696,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     }]
 
     # ── Demand/supply trendline (convex hull of swing points since anchor) ──
-    # Fit through swing LOWS for a bullish/demand cycle, swing HIGHS for a
-    # bearish/supply cycle. Uses the lower/upper convex hull, not a raw OLS
-    # regression — a regression line lets roughly half its own defining
-    # points sit on the wrong side of it, which doesn't behave like a real
-    # support/resistance boundary. The hull guarantees every point used to
-    # build it sits on the correct side, by construction.
     trendline_data = None
     swing_pts_idx = raw_lows if is_bullish else raw_highs
     swing_pts_idx = swing_pts_idx[(swing_pts_idx >= anchor_idx) & (swing_pts_idx <= len(closes) - 1)]
@@ -601,9 +734,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 }
 
     # ── Nearest unmitigated Order Block in the cycle direction ──
-    # The real reaction zone, per the strategy: not the shallow retest of a
-    # broken level, but the last opposite-colored candle before the
-    # impulsive move — where real order flow originated.
     nearest_ob = None
     if SHOW_ORDER_BLOCKS:
         ob_bias = 'BULLISH' if is_bullish else 'BEARISH'
@@ -621,20 +751,22 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                     nearest_ob = min(above, key=lambda ob: ob['bottom'])
 
     return {
-        "cycle":         cycle,
-        "lines":         all_lines,
-        "anchor":        anchor_price,
-        "anchor_idx":    int(anchor_idx),
-        "atr":           atr,
-        "sweeps":        sweeps,
-        "w_confirmed":   pattern_info["w_confirmed"],
-        "m_confirmed":   pattern_info["m_confirmed"],
-        "pattern_info":  pattern_info,
-        "swing_order":   swing_order,
-        "raw_highs":     raw_highs.tolist(),  # swing-high indices since the anchor — exposed for the upcoming trendline fit
-        "raw_lows":      raw_lows.tolist(),   # swing-low indices — same purpose
-        "trendline":     trendline_data,
-        "nearest_ob":    nearest_ob,
+        "cycle":          cycle,
+        "lines":          all_lines,
+        "anchor":         anchor_price,
+        "anchor_idx":     int(anchor_idx),
+        "atr":            atr,
+        "peak_confirmed": peak_confirmed,
+        "peak_move_atr":  round(peak_move_atr, 2),
+        "sweeps":         sweeps,
+        "w_confirmed":    pattern_info["w_confirmed"],
+        "m_confirmed":    pattern_info["m_confirmed"],
+        "pattern_info":   pattern_info,
+        "swing_order":    swing_order,
+        "raw_highs":      raw_highs.tolist(),
+        "raw_lows":       raw_lows.tolist(),
+        "trendline":      trendline_data,
+        "nearest_ob":     nearest_ob,
     }
 
 
@@ -653,7 +785,8 @@ def calculate_trade_levels(current_price: float, signal: str,
         else:
             return None
         risk = abs(entry - stop_loss)
-        if risk == 0: return None
+        if risk == 0:
+            return None
         rr = round(abs(take_profit - entry) / risk, 2)
         return {
             "entry":       round(entry, decimals),
@@ -710,23 +843,23 @@ async def analyze(req: AnalysisRequest):
             state_key=f"{req.currency}:{req.timeframe}",
             drop_forming=(DROP_FORMING_CANDLE and data_source == "LIVE_NODE_DATA"),
         )
-        cycle       = ms['cycle']
-        lines       = ms['lines']
-        sweeps      = ms['sweeps']
-        w_confirmed = ms.get('w_confirmed', False)
-        m_confirmed = ms.get('m_confirmed', False)
+        cycle          = ms['cycle']
+        lines          = ms['lines']
+        sweeps         = ms['sweeps']
+        w_confirmed    = ms.get('w_confirmed', False)
+        m_confirmed    = ms.get('m_confirmed', False)
+        peak_confirmed = ms.get('peak_confirmed', False)
+        peak_move_atr  = ms.get('peak_move_atr', 0.0)
         trendline_data = ms.get('trendline')
-        nearest_ob      = ms.get('nearest_ob')
+        nearest_ob     = ms.get('nearest_ob')
 
         bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
 
-        sweep_nearby = False
         sweep_str = ""
         if sweeps:
             last_sweep = sweeps[-1]
             candle_age = len(df) - 1 - last_sweep['sweep_idx']
             if candle_age <= 15:
-                sweep_nearby = True
                 sweep_str = f"🎯 Stop Hunt / Pin detected at {last_sweep['level']:.{decimals}f}."
 
         reasoning = [
@@ -734,6 +867,10 @@ async def analyze(req: AnalysisRequest):
             f"📈 Price vs Macro Trend: {ema_bias}",
             news_string,
         ]
+        if peak_confirmed:
+            reasoning.append(f"✅ Peak CONFIRMED — price has moved {peak_move_atr:.1f} ATR away and the extreme is locked.")
+        else:
+            reasoning.append(f"⏳ Peak CANDIDATE — moved {peak_move_atr:.1f} of {ANCHOR_MIN_MOVE_ATR:.1f} ATR needed to confirm.")
         if sweep_str:
             reasoning.append(sweep_str)
         if cycle.startswith("BEARISH"):
@@ -762,7 +899,8 @@ async def analyze(req: AnalysisRequest):
             "signal":     "NEUTRAL",
             "confidence": 0,
             "trend":      cycle,
-            "pattern":    "Peak Formation",
+            "pattern":    "Peak Formation" if peak_confirmed else "Peak Candidate",
+            "peak_confirmed": peak_confirmed,
             "reasoning":  reasoning,
             "keyLevels": {
                 "resistance": round(current_price + (atr * 2), decimals),
@@ -805,18 +943,19 @@ async def debug_analysis(req: AnalysisRequest):
     try:
         current_price = req.current_price if req.current_price > 0 else safe_float(df['Close'].iloc[-1])
         profile = get_instrument_profile(req.currency, current_price)
-        atr = calculate_atr(df, 14)
 
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v3.2 (causal flips + cycle lock + anchor confirmation cap)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v4.0 (Protected Swings + Timestamp Anchor Pinning)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",
             "🎯 CYCLE":            ms['cycle'],
             "⚓ ANCHOR":            ms['anchor'],
             "─── PEAK INFO ───": "──────────────────────────────────────",
+            "Peak confirmed":              ms.get('peak_confirmed', False),
+            "Peak move (ATR)":             ms.get('peak_move_atr', 0.0),
             "W (double-bottom) confirmed": ms.get('w_confirmed', False),
             "M (double-top) confirmed":    ms.get('m_confirmed', False),
             "Core Swing Highs":  ms.get('raw_highs', []),
