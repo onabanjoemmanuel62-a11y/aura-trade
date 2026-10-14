@@ -362,7 +362,6 @@ def find_origin_poi_with_fvg(df: pd.DataFrame, is_bullish: bool, origin_start_id
     search_hi = min(total - 3, break_idx + 2)
 
     if is_bullish:
-        # Walk backwards from the break impulse to find the last reaction candle with a Bullish FVG
         for k in range(search_hi, search_lo - 1, -1):
             fvg_bot = float(highs[k])
             fvg_top = float(lows[k + 2])
@@ -370,13 +369,12 @@ def find_origin_poi_with_fvg(df: pd.DataFrame, is_bullish: bool, origin_start_id
             is_disp = (closes[k + 1] > opens[k + 1]) and ((closes[k + 1] - opens[k + 1]) >= 0.25 * atr)
 
             if fvg_sz >= (MIN_FVG_SIZE_ATR * atr) and is_disp:
-                # Refinement: pick the reaction candle (or lowest candle at k / k-1) right before the impulse
                 ob_idx = k
                 if k > search_lo and lows[k - 1] < lows[k] and closes[k - 1] <= opens[k - 1]:
                     ob_idx = k - 1
 
-                ob_bot  = float(min(lows[ob_idx], lows[k]))
-                ob_top  = float(max(highs[ob_idx], opens[ob_idx], closes[ob_idx]))
+                ob_bot = float(min(lows[ob_idx], lows[k]))
+                ob_top = float(max(highs[ob_idx], opens[ob_idx], closes[ob_idx]))
                 if (ob_top - ob_bot) > 1.15 * atr:
                     ob_top = ob_bot + 0.55 * atr
                 if (ob_top - ob_bot) < 0.18 * atr:
@@ -396,14 +394,12 @@ def find_origin_poi_with_fvg(df: pd.DataFrame, is_bullish: bool, origin_start_id
                 break
 
         if best_poi is None:
-            # Fallback to the lowest candle in the origin range if no strict 3-bar gap remained open
-             local_min_idx = search_lo + int(np.argmin(lows[search_lo : search_hi + 1]))
+            local_min_idx = search_lo + int(np.argmin(lows[search_lo : search_hi + 1]))
             ob_bot = float(lows[local_min_idx])
             ob_top = float(min(highs[local_min_idx], ob_bot + 0.45 * atr))
             if (ob_top - ob_bot) < 0.20 * atr:
                 ob_top = ob_bot + 0.32 * atr
 
-            # Check if any 3-candle micro-imbalance exists near local_min_idx
             has_micro_fvg = False
             fvg_bot, fvg_top, fvg_t = ob_top, ob_top + 0.15 * atr, int(dates[local_min_idx])
             for m in range(local_min_idx, min(total - 2, local_min_idx + 5)):
@@ -438,8 +434,8 @@ def find_origin_poi_with_fvg(df: pd.DataFrame, is_bullish: bool, origin_start_id
                 if k > search_lo and highs[k - 1] > highs[k] and closes[k - 1] >= opens[k - 1]:
                     ob_idx = k - 1
 
-                ob_top  = float(max(highs[ob_idx], highs[k]))
-                ob_bot  = float(min(lows[ob_idx], opens[ob_idx], closes[ob_idx]))
+                ob_top = float(max(highs[ob_idx], highs[k]))
+                ob_bot = float(min(lows[ob_idx], opens[ob_idx], closes[ob_idx]))
                 if (ob_top - ob_bot) > 1.15 * atr:
                     ob_bot = ob_top - 0.55 * atr
                 if (ob_top - ob_bot) < 0.18 * atr:
@@ -509,14 +505,12 @@ def find_liquidity_before_poi(df: pd.DataFrame, is_bullish: bool, poi_idx: int,
         return {"has_liquidity": False, "swept": False, "liq_level": None, "liq_box": None, "liq_type": "None"}
 
     if is_bullish:
-        # Look for an internal swing low / inducement low formed after the impulse above the Buy POI
         cand_lows = [
             int(i) for i in raw_lows
             if poi_idx + 2 < int(i) < total
             and poi_top < lows[int(i)] <= poi_top + (3.2 * atr)
         ]
         if not cand_lows:
-            # Check for local pullback lows / range equal lows above POI
             for j in range(poi_idx + 3, total - 1):
                 if lows[j] <= lows[j - 1] and lows[j] <= lows[j + 1]:
                     if poi_top < lows[j] <= poi_top + (2.8 * atr):
@@ -525,11 +519,9 @@ def find_liquidity_before_poi(df: pd.DataFrame, is_bullish: bool, poi_idx: int,
         if cand_lows:
             idm_idx   = cand_lows[0]
             idm_price = float(lows[idm_idx])
-            # Detect if Equal Lows (Range Liquidity) or single Inducement Low
             eq_lows   = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.25 * atr]
             liq_type  = "Range Liquidity (EQL)" if len(eq_lows) >= 2 else "Inducement (IDM)"
 
-            # Was this liquidity swept by a subsequent candle dipping below it into/toward the POI?
             post_min = float(np.min(lows[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
             swept    = bool(post_min < idm_price - (0.03 * atr))
 
@@ -677,7 +669,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     ema_50_array  = df['Close'].ewm(span=50, adjust=False).mean().values
     ema_200_array = df['Close'].ewm(span=200, adjust=False).mean().values
 
-    # ── Track BOS (Break of Structure) & CHoCH (Change of Character) Events ──
     highs_set = set(raw_highs.tolist())
     lows_set  = set(raw_lows.tolist())
 
@@ -699,13 +690,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         if confirmed_bar in lows_set:
             active_sl_idx = confirmed_bar
 
-        # Check Bullish Break of last confirmed Swing High
         if active_sh_idx > 0 and active_sh_idx not in broken_sh_set and i > active_sh_idx:
             sh_lvl = float(highs[active_sh_idx])
             if closes[i] > sh_lvl + buf:
                 broken_sh_set.add(active_sh_idx)
                 kind = "BOS" if is_bull else "CHoCH"
-                # Origin low is the lowest point between the broken Swing High and the break candle i
                 origin_low_idx = active_sh_idx + int(np.argmin(lows[active_sh_idx : i + 1]))
                 is_bull = True
                 structure_breaks.append({
@@ -722,13 +711,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                     "origin_price": float(lows[origin_low_idx]),
                 })
 
-        # Check Bearish Break of last confirmed Swing Low
         if active_sl_idx > 0 and active_sl_idx not in broken_sl_set and i > active_sl_idx:
             sl_lvl = float(lows[active_sl_idx])
             if closes[i] < sl_lvl - buf:
                 broken_sl_set.add(active_sl_idx)
                 kind = "BOS" if (not is_bull) else "CHoCH"
-                # Origin high is the highest point between the broken Swing Low and the break candle i
                 origin_high_idx = active_sl_idx + int(np.argmax(highs[active_sl_idx : i + 1]))
                 is_bull = False
                 structure_breaks.append({
@@ -745,7 +732,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                     "origin_price": float(highs[origin_high_idx]),
                 })
 
-    # ── Select Active Recent Structure Break (Focus on the Recent Trend!) ───
     if structure_breaks:
         latest_break = structure_breaks[-1]
         is_bullish   = latest_break["bullish"]
@@ -762,18 +748,15 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         anchor_price = float(lows[anchor_idx]) if is_bullish else float(highs[anchor_idx])
         break_idx    = min(total - 1, anchor_idx + 5)
 
-    # ── Detect Ranging Market (Equal Highs & Equal Lows Compression) ────────
     recent_window = min(45, total)
     recent_range  = float(np.max(highs[-recent_window:]) - np.min(lows[-recent_window:]))
     bars_since_break = (total - 1) - break_idx
     is_ranging = bool(recent_range < (2.0 * atr) and bars_since_break > 35)
 
-    # ── Locate Origin POI Order Block + Mandatory 3-Candle FVG ──────────────
     poi_data = find_origin_poi_with_fvg(
         df, is_bullish, anchor_idx, break_idx, atr, decimals
     )
 
-    # If the Origin POI was already completely violated (broken through), advance to most recent intact swing origin
     poi_violated = False
     if is_bullish and closes[-1] < poi_data["poi_bottom"] - (0.15 * atr):
         poi_violated = True
@@ -781,7 +764,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         poi_violated = True
 
     if poi_violated and len(structure_breaks) >= 2:
-        # Check if price is still respecting the macro origin
         prev_same = [b for b in structure_breaks[:-1] if b["bullish"] == is_bullish]
         if prev_same:
             alt_b = prev_same[-1]
@@ -799,12 +781,10 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     poi_time   = poi_data["poi_time"]
     has_fvg    = poi_data["has_fvg"]
 
-    # ── Confluence #4: Liquidity / Inducement Before POI ────────────────────
     liq_data = find_liquidity_before_poi(
         df, is_bullish, poi_idx, poi_top, poi_bottom, raw_highs, raw_lows, atr, decimals
     )
 
-    # ── Build Chart Zone Boxes (Origin POI + FVG + Liquidity Zone) ──────────
     zone_boxes = []
     if is_bullish:
         poi_label = f"BUY POI / OB ({poi_bottom:.{decimals}f}–{poi_top:.{decimals}f})" + (" + FVG ✅" if has_fvg else "")
@@ -850,7 +830,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         df, raw_highs, raw_lows, is_bullish, poi_level, int(anchor_idx), anchor_price, atr, decimals
     )
 
-    # ── Build BOS / CHoCH Structure Lines + Target Lines ────────────────────
     all_lines = []
     recent_breaks = structure_breaks[-3:] if len(structure_breaks) >= 3 else structure_breaks
     for sb in recent_breaks:
@@ -965,7 +944,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     liq_level     = liq_data.get("liq_level")
     break_lvl_str = f"{latest_break['level']:.{decimals}f}" if latest_break else f"{anchor_price:.{decimals}f}"
 
-    # ── 0. RANGING MARKET FILTER ("Fold your hands and watch!") ─────────────
     if is_ranging:
         checklist = [
             {"step": "1. Market Structure (BOS / CHoCH)", "done": False, "detail": "RANGING (Equal H/L)"},
@@ -992,7 +970,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             "trade_levels": None,
         }
 
-    # ── 1. CHECK IN-MEMORY FROZEN TRADE VAULT FIRST ─────────────────────────
     if state_key and state_key in ACTIVE_TRADES:
         lt = ACTIVE_TRADES[state_key]
         live_high = max(float(full_df['High'].iloc[-1]), current_price)
@@ -1008,7 +985,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         if closed_out:
             del ACTIVE_TRADES[state_key]
 
-    # ── 2. SCAN FOR A DETERMINISTIC, UNCLOSED 1H SIGNAL CANDLE IN THE POI ───
     locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
     poi_idx      = int(poi_data.get("poi_idx", anchor_idx))
 
@@ -1027,7 +1003,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             l_wick  = min(c_open, c_close) - c_low
 
             if is_bullish:
-                # Price taps into the BUY POI Order Block (or attached FVG) and holds above OB bottom
                 tap_ceil   = max(active_ob["top"], poi_data.get("fvg_top", active_ob["top"]))
                 touched_ob = (min(c_low, p_low) <= tap_ceil + 0.12 * atr) and (c_close >= active_ob["bottom"] - 0.05 * atr)
                 if not touched_ob:
@@ -1125,7 +1100,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     ACTIVE_TRADES[state_key] = locked_trade
                 break
 
-    # ── 3. IF AN ACTIVE NON-REPAINTING TRADE IS LOCKED ──────────────────────
     if locked_trade:
         f_entry = locked_trade["entry"]
         f_sl    = locked_trade["stop_loss"]
@@ -1154,11 +1128,10 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         checklist = [
             {"step": f"1. Market Structure ({break_kind} {'▲' if is_bullish else '▼'})", "done": True, "detail": f"Cleared {break_lvl_str} ✅"},
             {"step": "2. Origin POI + Fair Value Gap (FVG)", "done": True, "detail": f"{active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f} ✅"},
-            {"step": f"3. Liquidity ({liq_type}) Swept", "done": True, "detail": f"Swept into POI ✅"},
+            {"step": f"3. Liquidity ({liq_type}) Swept", "done": True, "detail": "Swept into POI ✅"},
             {"step": f"4. 1H POI Rejection (RR 1:{f_rr})", "done": True, "detail": f"Entered @ {f_entry:.{decimals}f} ✅"},
         ]
 
-        # Base 85% + bonuses for FVG, Liquidity Sweep, and HTF alignment
         active_conf = 80 + (5 if has_fvg else 0) + (5 if has_liquidity else 0) + (4 if htf_aligned else 0)
 
         trigger_note = (
@@ -1191,7 +1164,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             }
         }
 
-    # ── 4. WAITING FOR POI TAP OR CONFIRMING IN POI ZONE ────────────────────
     live_high = max(float(full_df['High'].iloc[-1]), current_price)
     live_low  = min(float(full_df['Low'].iloc[-1]), current_price)
     live_open = float(full_df['Open'].iloc[-1])
