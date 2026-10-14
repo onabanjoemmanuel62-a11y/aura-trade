@@ -24,7 +24,7 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1: PEAK FORMATION + CHoCH & BOS TREND DIRECTION TUNING
+# STEP 1: PEAK FORMATION + TRUE EXTERNAL CHoCH & BOS TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.20
@@ -139,7 +139,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 ENGINE — Peak Formation + True CHoCH & BOS Trend Direction
+# STEP 1 ENGINE — Peak Formation + True External CHoCH & BOS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -223,12 +223,17 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                                  raw_highs: np.ndarray, raw_lows: np.ndarray,
                                  atr: float, decimals: int) -> List[Dict]:
     """
-    VIDEO STRATEGY STEP 1 (Market Structure from the Peak):
-    1. Finds the LAST structural swing before/near the Peak (the last Higher Low before a
-       Peak High, or the last Lower High before a Peak Low) OR the first internal swing
-       after the Peak. When price breaks and closes beyond it, that FIRST break is `CHoCH`.
-    2. After `CHoCH` occurs, every subsequent Swing Low (in a Bearish trend) or Swing High
-       (in a Bullish trend) that gets broken by a candle close is marked as `BOS`.
+    VIDEO STRATEGY STEP 1 (14:10 - 20:10):
+    1. TRUE CHoCH:
+       - In a Bullish Trend (from Peak Formation Low): CHoCH is the break of the
+         LAST LOWER HIGH (the origin Swing High that sent price down into the Peak Low).
+         Internal minor pauses inside that drop are NEVER CHoCH!
+       - In a Bearish Trend (from Peak Formation High): CHoCH is the break of the
+         LAST HIGHER LOW (the origin Swing Low that sent price up into the Peak High).
+    2. TRUE EXTERNAL BOS:
+       - Only after CHoCH has occurred (`m > choch_break_idx`), when price forms a new
+         external Swing High/Low (followed by a real pullback >= 0.75 * ATR) and then
+         closes beyond that Swing High/Low, it is marked as `BOS`.
     """
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -237,162 +242,229 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     total  = len(closes)
 
     anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
-    buf        = 0.10 * atr
+    buf        = 0.08 * atr
     events     = []
 
-    if not is_bullish:
-        # ── BEARISH TREND FROM PEAK FORMATION HIGH ──────────────────────────
-        # 1. Find the CHoCH level: the last Higher Low (Support Key Zone) right before the Peak High
-        #    (within 25 bars before the Peak) OR the first pullback low formed right after the Peak.
-        pre_lows = [int(i) for i in raw_lows if max(0, anchor_idx - 25) <= int(i) < anchor_idx]
-        post_lows = [int(i) for i in raw_lows if anchor_idx < int(i) < total - 1]
+    if is_bullish:
+        # ── 1. FIND THE LAST LOWER HIGH (PRE-PEAK SWING HIGH) THAT CAUSED THE PEAK LOW ──
+        peak_low_val = float(lows[anchor_idx])
+        search_left  = max(0, anchor_idx - 35)
 
-        choch_found     = False
-        choch_break_idx = anchor_idx
+        # Look for the last prominent Swing High before anchor_idx that originated the drop into the Peak Low
+        pre_high_candidates = [
+            int(i) for i in raw_highs
+            if search_left <= int(i) < anchor_idx
+            and (highs[int(i)] - peak_low_val) >= (1.10 * atr)
+        ]
 
-        # First check if a tight pre-peak Higher Low (within 18 bars of Peak) was broken right after the Peak
-        cand_choch_lows = []
-        if pre_lows and (anchor_idx - pre_lows[-1]) <= 18:
-            cand_choch_lows.append(pre_lows[-1])
-        if post_lows:
-            cand_choch_lows.extend(post_lows)
-
-        # Also scan local 2-bar swing lows right around the Peak if raw_lows missed a tight neckline
-        for j in range(max(2, anchor_idx - 12), min(total - 2, anchor_idx + 15)):
-            if j == anchor_idx:
-                continue
-            if lows[j] <= np.min(lows[j - 2 : j + 3]) and (highs[anchor_idx] - lows[j]) >= (0.60 * atr):
-                cand_choch_lows.append(j)
-
-        cand_choch_lows = sorted(set(cand_choch_lows))
-
-        # Find the first valid Support Key Zone that got broken after the Peak High
-        best_choch = None
-        for sl_idx in cand_choch_lows:
-            sl_val = float(lows[sl_idx])
-            search_from = max(anchor_idx + 1, sl_idx + 1)
-            for m in range(search_from, total):
-                if closes[m] < sl_val - buf:
-                    # Pick the earliest break after the Peak!
-                    if best_choch is None or m < best_choch["break_idx"]:
-                        best_choch = {
-                            "kind":       "CHoCH",
-                            "level":      round(sl_val, decimals),
-                            "swing_idx":  int(sl_idx),
-                            "start_time": int(dates[sl_idx]),
-                            "break_idx":  int(m),
-                            "end_time":   int(dates[m]),
-                        }
+        if not pre_high_candidates:
+            # Scan 3-bar local swing highs to the left of anchor_idx
+            for j in range(anchor_idx - 1, search_left, -1):
+                l_w = max(0, j - 3)
+                r_w = min(anchor_idx + 1, j + 4)
+                if highs[j] >= np.max(highs[l_w:r_w]) and (highs[j] - peak_low_val) >= (1.10 * atr):
+                    pre_high_candidates.append(j)
                     break
 
-        if best_choch:
-            events.append(best_choch)
-            choch_break_idx = best_choch["break_idx"]
-            last_broken_low = float(best_choch["level"])
-        else:
-            last_broken_low = float(highs[anchor_idx])
+        if not pre_high_candidates and anchor_idx > 0:
+            # Fallback to the highest point in the 20 bars leading into the Peak Low
+            win_start = max(0, anchor_idx - 20)
+            pre_high_candidates.append(win_start + int(np.argmax(highs[win_start:anchor_idx])))
 
-        # 2. Now find all subsequent Bearish BOS (Lower Lows formed after anchor_idx and broken after choch_break_idx)
-        bos_low_candidates = [int(i) for i in raw_lows if anchor_idx < int(i) < total - 1]
-        for j in range(anchor_idx + 2, total - 2):
-            if lows[j] <= np.min(lows[j - 2 : j + 3]):
-                bos_low_candidates.append(j)
-        bos_low_candidates = sorted(set(bos_low_candidates))
+        # The LAST Lower High before the Peak Low is the true CHoCH level!
+        choch_swing_idx = max(pre_high_candidates) if pre_high_candidates else anchor_idx
+        # Refine to exact highest bar in a 2-bar neighborhood so the line sits on the exact tip of the candle wick
+        nb_lo = max(0, choch_swing_idx - 2)
+        nb_hi = min(anchor_idx, choch_swing_idx + 3)
+        if nb_hi > nb_lo:
+            choch_swing_idx = nb_lo + int(np.argmax(highs[nb_lo:nb_hi]))
 
-        current_search_bar = choch_break_idx + 1
-        for sl_idx in bos_low_candidates:
-            if sl_idx <= anchor_idx:
-                continue
-            sl_val = float(lows[sl_idx])
-            # Must be a lower low than the previous broken structure level
-            if sl_val >= last_broken_low - (0.25 * atr):
-                continue
-            start_check = max(sl_idx + 1, current_search_bar)
-            for m in range(start_check, total):
-                if closes[m] < sl_val - buf:
-                    events.append({
-                        "kind":       "BOS",
-                        "level":      round(sl_val, decimals),
-                        "swing_idx":  int(sl_idx),
-                        "start_time": int(dates[sl_idx]),
-                        "break_idx":  int(m),
-                        "end_time":   int(dates[m]),
-                    })
-                    last_broken_low    = sl_val
-                    current_search_bar = m + 1
-                    break
+        choch_lvl = float(highs[choch_swing_idx])
 
-    else:
-        # ── BULLISH TREND FROM PEAK FORMATION LOW ───────────────────────────
-        pre_highs  = [int(i) for i in raw_highs if max(0, anchor_idx - 25) <= int(i) < anchor_idx]
-        post_highs = [int(i) for i in raw_highs if anchor_idx < int(i) < total - 1]
+        # Find the exact candle AFTER anchor_idx that broke and closed above this CHoCH level
+        choch_break_idx = None
+        for m in range(anchor_idx + 1, total):
+            if closes[m] > choch_lvl + buf:
+                choch_break_idx = m
+                events.append({
+                    "kind":       "CHoCH",
+                    "level":      round(choch_lvl, decimals),
+                    "swing_idx":  int(choch_swing_idx),
+                    "start_time": int(dates[choch_swing_idx]),
+                    "break_idx":  int(m),
+                    "end_time":   int(dates[m]),
+                })
+                break
 
-        choch_break_idx = anchor_idx
-        cand_choch_highs = []
-        if pre_highs and (anchor_idx - pre_highs[-1]) <= 18:
-            cand_choch_highs.append(pre_highs[-1])
-        if post_highs:
-            cand_choch_highs.extend(post_highs)
-
-        for j in range(max(2, anchor_idx - 12), min(total - 2, anchor_idx + 15)):
-            if j == anchor_idx:
-                continue
-            if highs[j] >= np.max(highs[j - 2 : j + 3]) and (highs[j] - lows[anchor_idx]) >= (0.60 * atr):
-                cand_choch_highs.append(j)
-
-        cand_choch_highs = sorted(set(cand_choch_highs))
-
-        best_choch = None
-        for sh_idx in cand_choch_highs:
-            sh_val = float(highs[sh_idx])
-            search_from = max(anchor_idx + 1, sh_idx + 1)
-            for m in range(search_from, total):
-                if closes[m] > sh_val + buf:
-                    if best_choch is None or m < best_choch["break_idx"]:
-                        best_choch = {
+        # If price hasn't broken the pre-peak high yet, check if a major post-peak swing high was broken
+        if choch_break_idx is None:
+            post_highs = [int(i) for i in raw_highs if anchor_idx < int(i) < total - 1 and (highs[int(i)] - peak_low_val) >= 1.20 * atr]
+            for sh_idx in post_highs:
+                sh_val = float(highs[sh_idx])
+                for m in range(sh_idx + 1, total):
+                    if closes[m] > sh_val + buf:
+                        choch_break_idx = m
+                        choch_lvl       = sh_val
+                        events.append({
                             "kind":       "CHoCH",
                             "level":      round(sh_val, decimals),
                             "swing_idx":  int(sh_idx),
                             "start_time": int(dates[sh_idx]),
                             "break_idx":  int(m),
                             "end_time":   int(dates[m]),
-                        }
+                        })
+                        break
+                if choch_break_idx is not None:
                     break
 
-        if best_choch:
-            events.append(best_choch)
-            choch_break_idx  = best_choch["break_idx"]
-            last_broken_high = float(best_choch["level"])
-        else:
-            last_broken_high = float(lows[anchor_idx])
+        # ── 2. FIND SUBSEQUENT EXTERNAL BOS BREAKS AFTER CHoCH ──────────────
+        if choch_break_idx is not None:
+            last_broken_high   = choch_lvl
+            current_search_bar = choch_break_idx
 
-        # 2. Now find all subsequent Bullish BOS (Higher Highs formed after anchor_idx and broken after choch_break_idx)
-        bos_high_candidates = [int(i) for i in raw_highs if anchor_idx < int(i) < total - 1]
-        for j in range(anchor_idx + 2, total - 2):
-            if highs[j] >= np.max(highs[j - 2 : j + 3]):
-                bos_high_candidates.append(j)
-        bos_high_candidates = sorted(set(bos_high_candidates))
+            while current_search_bar < total - 3:
+                # Find the next external Swing High formed at or after current_search_bar
+                found_bos = False
+                for sh_idx in range(current_search_bar, total - 2):
+                    l_w = max(anchor_idx + 1, sh_idx - 3)
+                    r_w = min(total, sh_idx + 4)
+                    if highs[sh_idx] < np.max(highs[l_w:r_w]):
+                        continue
+                    sh_val = float(highs[sh_idx])
+                    # Must be decisively higher than the previous broken level
+                    if sh_val <= last_broken_high + (0.35 * atr):
+                        continue
 
-        current_search_bar = choch_break_idx + 1
-        for sh_idx in bos_high_candidates:
-            if sh_idx <= anchor_idx:
-                continue
-            sh_val = float(highs[sh_idx])
-            if sh_val <= last_broken_high + (0.25 * atr):
-                continue
-            start_check = max(sh_idx + 1, current_search_bar)
-            for m in range(start_check, total):
-                if closes[m] > sh_val + buf:
-                    events.append({
-                        "kind":       "BOS",
-                        "level":      round(sh_val, decimals),
-                        "swing_idx":  int(sh_idx),
-                        "start_time": int(dates[sh_idx]),
-                        "break_idx":  int(m),
-                        "end_time":   int(dates[m]),
-                    })
-                    last_broken_high   = sh_val
-                    current_search_bar = m + 1
+                    # Must have a real pullback (at least 0.65 * ATR drop from sh_val) before breaking!
+                    for m in range(sh_idx + 2, total):
+                        pullback_low = float(np.min(lows[sh_idx + 1 : m + 1]))
+                        if (sh_val - pullback_low) < (0.65 * atr):
+                            continue
+                        # Ensure sh_val was the true highest point before the break candle m
+                        if float(np.max(highs[sh_idx : m])) > sh_val + 1e-9:
+                            break
+                        if closes[m] > sh_val + buf:
+                            events.append({
+                                "kind":       "BOS",
+                                "level":      round(sh_val, decimals),
+                                "swing_idx":  int(sh_idx),
+                                "start_time": int(dates[sh_idx]),
+                                "break_idx":  int(m),
+                                "end_time":   int(dates[m]),
+                            })
+                            last_broken_high   = sh_val
+                            current_search_bar = m
+                            found_bos          = True
+                            break
+                    if found_bos:
+                        break
+                if not found_bos:
+                    break
+
+    else:
+        # ── 1. FIND THE LAST HIGHER LOW (PRE-PEAK SWING LOW) THAT CAUSED THE PEAK HIGH ──
+        peak_high_val = float(highs[anchor_idx])
+        search_left   = max(0, anchor_idx - 35)
+
+        pre_low_candidates = [
+            int(i) for i in raw_lows
+            if search_left <= int(i) < anchor_idx
+            and (peak_high_val - lows[int(i)]) >= (1.10 * atr)
+        ]
+
+        if not pre_low_candidates:
+            for j in range(anchor_idx - 1, search_left, -1):
+                l_w = max(0, j - 3)
+                r_w = min(anchor_idx + 1, j + 4)
+                if lows[j] <= np.min(lows[l_w:r_w]) and (peak_high_val - lows[j]) >= (1.10 * atr):
+                    pre_low_candidates.append(j)
+                    break
+
+        if not pre_low_candidates and anchor_idx > 0:
+            win_start = max(0, anchor_idx - 20)
+            pre_low_candidates.append(win_start + int(np.argmin(lows[win_start:anchor_idx])))
+
+        # The LAST Higher Low before the Peak High is the true CHoCH level!
+        choch_swing_idx = max(pre_low_candidates) if pre_low_candidates else anchor_idx
+        nb_lo = max(0, choch_swing_idx - 2)
+        nb_hi = min(anchor_idx, choch_swing_idx + 3)
+        if nb_hi > nb_lo:
+            choch_swing_idx = nb_lo + int(np.argmin(lows[nb_lo:nb_hi]))
+
+        choch_lvl = float(lows[choch_swing_idx])
+
+        choch_break_idx = None
+        for m in range(anchor_idx + 1, total):
+            if closes[m] < choch_lvl - buf:
+                choch_break_idx = m
+                events.append({
+                    "kind":       "CHoCH",
+                    "level":      round(choch_lvl, decimals),
+                    "swing_idx":  int(choch_swing_idx),
+                    "start_time": int(dates[choch_swing_idx]),
+                    "break_idx":  int(m),
+                    "end_time":   int(dates[m]),
+                })
+                break
+
+        if choch_break_idx is None:
+            post_lows = [int(i) for i in raw_lows if anchor_idx < int(i) < total - 1 and (peak_high_val - lows[int(i)]) >= 1.20 * atr]
+            for sl_idx in post_lows:
+                sl_val = float(lows[sl_idx])
+                for m in range(sl_idx + 1, total):
+                    if closes[m] < sl_val - buf:
+                        choch_break_idx = m
+                        choch_lvl       = sl_val
+                        events.append({
+                            "kind":       "CHoCH",
+                            "level":      round(sl_val, decimals),
+                            "swing_idx":  int(sl_idx),
+                            "start_time": int(dates[sl_idx]),
+                            "break_idx":  int(m),
+                            "end_time":   int(dates[m]),
+                        })
+                        break
+                if choch_break_idx is not None:
+                    break
+
+        # ── 2. FIND SUBSEQUENT EXTERNAL BOS BREAKS AFTER CHoCH ──────────────
+        if choch_break_idx is not None:
+            last_broken_low    = choch_lvl
+            current_search_bar = choch_break_idx
+
+            while current_search_bar < total - 3:
+                found_bos = False
+                for sl_idx in range(current_search_bar, total - 2):
+                    l_w = max(anchor_idx + 1, sl_idx - 3)
+                    r_w = min(total, sl_idx + 4)
+                    if lows[sl_idx] > np.min(lows[l_w:r_w]):
+                        continue
+                    sl_val = float(lows[sl_idx])
+                    if sl_val >= last_broken_low - (0.35 * atr):
+                        continue
+
+                    for m in range(sl_idx + 2, total):
+                        pullback_high = float(np.max(highs[sl_idx + 1 : m + 1]))
+                        if (pullback_high - sl_val) < (0.65 * atr):
+                            continue
+                        if float(np.min(lows[sl_idx : m])) < sl_val - 1e-9:
+                            break
+                        if closes[m] < sl_val - buf:
+                            events.append({
+                                "kind":       "BOS",
+                                "level":      round(sl_val, decimals),
+                                "swing_idx":  int(sl_idx),
+                                "start_time": int(dates[sl_idx]),
+                                "break_idx":  int(m),
+                                "end_time":   int(dates[m]),
+                            })
+                            last_broken_low    = sl_val
+                            current_search_bar = m
+                            found_bos          = True
+                            break
+                    if found_bos:
+                        break
+                if not found_bos:
                     break
 
     return events
@@ -599,7 +671,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
 
     peak_confirmed = bool(extreme_held and move >= ANCHOR_MIN_MOVE_ATR * atr)
 
-    # ── 2. Find Exact CHoCH and Subsequent BOS Breaks From the Peak ─────────
+    # ── 2. Find Exact CHoCH and Subsequent External BOS Breaks From the Peak ──
     struct_events = find_choch_and_bos_from_peak(
         df, is_bullish, anchor_idx, raw_highs, raw_lows, atr, decimals
     )
@@ -611,7 +683,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         pattern_name = f"Peak Formation Low ({anchor_price:.{decimals}f})"
         anchor_color = "rgba(59, 255, 130, 0.95)"
 
-    # ── 3. Build Step 1 Lines ONLY (Peak Line + CHoCH + BOS) ────────────────
+    # ── 3. Build Step 1 Lines ONLY (Peak Line + True CHoCH + External BOS) ──
     all_lines = [{
         "level":      round(anchor_price, decimals),
         "start_time": anchor_time,
@@ -862,7 +934,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v8.0 — Step 1 (Peak + CHoCH & BOS Structure)",
+            "✅ ENGINE VERSION": "AuraBrain v8.1 — Step 1 (True Pre-Peak CHoCH & External BOS)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
