@@ -4,9 +4,9 @@ import axios from 'axios';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-const ENTRY_THRESHOLD = 65;
-const EXIT_THRESHOLD  = 50;
-const FLIP_THRESHOLD  = 75;
+const ENTRY_THRESHOLD   = 65;
+const EXIT_THRESHOLD    = 50;
+const FLIP_THRESHOLD    = 72;
 const LOCK_EXPIRY_HOURS = 4;
 
 // ── Session detection (UTC) ──
@@ -16,52 +16,60 @@ const SESSIONS = [
   { name: 'NEW YORK', start: 13, end: 22, color: '#f59e0b' },
   { name: 'SYDNEY',   start: 21, end: 6,  color: '#10b981' },
 ];
+
 const getActiveSession = () => {
   const h = new Date().getUTCHours();
-  // Priority: NY > London > Tokyo > Sydney
   return SESSIONS.find(s => {
     if (s.start < s.end) return h >= s.start && h < s.end;
     return h >= s.start || h < s.end;
   }) || null;
 };
 
-// ── Lot size calculator ──
+// ── Accurate Lot Size Calculator (Handles Forex, JPY, and Gold XAU/USD) ──
 const calcLotSize = (balance, riskPct, entryPrice, slPrice, pipValue = 10) => {
   if (!balance || !entryPrice || !slPrice) return 0;
   const riskAmount = (balance * riskPct) / 100;
-  const slPips = Math.abs(entryPrice - slPrice) * 10000; // works for most forex pairs
+  const priceDiff  = Math.abs(entryPrice - slPrice);
+  if (priceDiff === 0) return 0;
+
+  let slPips;
+  if (entryPrice > 500) {
+    // Gold (XAU/USD): 1 pip = $0.10 move (or $1.00 per standard lot per $0.01)
+    slPips = priceDiff * 10;
+  } else if (entryPrice > 20) {
+    // JPY pairs: 1 pip = 0.01
+    slPips = priceDiff * 100;
+  } else {
+    // Standard Forex pairs: 1 pip = 0.0001
+    slPips = priceDiff * 10000;
+  }
+
   if (slPips === 0) return 0;
   const lots = riskAmount / (slPips * pipValue);
   return Math.max(0.01, parseFloat(lots.toFixed(2)));
 };
 
 const SignalCard = ({ externalData, loading, onRefresh }) => {
-  const [analysis,        setAnalysis]        = useState(null);
-  const [newsLoading,     setNewsLoading]     = useState(false);
-  const [upcomingNews,    setUpcomingNews]     = useState([]);
-  const [now,             setNow]             = useState(Date.now());
-  const [activeTab,       setActiveTab]       = useState('signal'); // 'signal' | 'risk' | 'mtf'
-  const [activeSession,   setActiveSession]   = useState(getActiveSession());
+  const [analysis,      setAnalysis]      = useState(null);
+  const [upcomingNews,  setUpcomingNews]  = useState([]);
+  const [now,           setNow]           = useState(Date.now());
+  const [activeTab,     setActiveTab]     = useState('signal'); // 'signal' | 'risk' | 'mtf'
+  const [activeSession, setActiveSession] = useState(getActiveSession());
 
   // Risk calculator state
-  const [balance,   setBalance]   = useState(10000);
-  const [riskPct,   setRiskPct]   = useState(1);
-  const [pipValue,  setPipValue]  = useState(10);
+  const [balance,  setBalance]  = useState(10000);
+  const [riskPct,  setRiskPct]  = useState(1);
+  const [pipValue, setPipValue] = useState(10);
 
-  const getSavedLock = () => {
-    try {
-      const saved = localStorage.getItem('aura_ai_lock');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        const ageHours = (Date.now() - parsed.timestamp) / (1000 * 60 * 60);
-        if (ageHours < LOCK_EXPIRY_HOURS) return parsed;
-      }
-    } catch { /* silent */ }
-    return { type: 'NEUTRAL', confidence: 0, timestamp: Date.now() };
-  };
-
-  const activeSignalRef = useRef(getSavedLock());
-  const [displayState,  setDisplayState]  = useState(activeSignalRef.current);
+  // Per-pair signal lock memory so EUR/USD never bleeds onto USD/JPY or Gold
+  const locksByPairRef = useRef({});
+  const [displayState, setDisplayState] = useState({
+    type: 'WAIT',
+    bias: 'NEUTRAL',
+    confidence: 0,
+    isLocked: false,
+    timestamp: Date.now()
+  });
 
   useEffect(() => {
     if (externalData) processNewData(externalData);
@@ -69,50 +77,68 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
 
   const processNewData = (newData) => {
     const rawConf   = Math.max(0, newData.confidence || 0);
-    const rawSignal = (newData.signal || 'NEUTRAL').toUpperCase();
-    let currentLock = activeSignalRef.current.type;
-    let nextState   = 'NEUTRAL';
+    const rawSignal = (newData.signal || 'WAIT').toUpperCase();
+    const rawTrend  = (newData.trend  || '').toUpperCase();
+    const pairKey   = `${newData.trend || 'PAIR'}_${newData?.keyLevels?.ema200 || ''}`;
 
-    if (currentLock === 'NEUTRAL') {
-      if (rawConf >= ENTRY_THRESHOLD) nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
-    } else {
-      const isOpposite = (currentLock === 'BUY' && rawSignal.includes('SELL')) ||
-                         (currentLock === 'SELL' && rawSignal.includes('BUY'));
-      if (isOpposite && rawConf >= FLIP_THRESHOLD) nextState = rawSignal.includes('BUY') ? 'BUY' : 'SELL';
-      else if (rawConf < EXIT_THRESHOLD)            nextState = 'NEUTRAL';
-      else                                          nextState = currentLock;
+    const cycleBias = rawTrend.includes('BULLISH') ? 'BULLISH'
+                    : rawTrend.includes('BEARISH') ? 'BEARISH'
+                    : 'NEUTRAL';
+
+    const hasValidTradeSetup = Boolean(newData.tradeSetup && newData.tradeSetup.entry);
+    const prevLock = locksByPairRef.current[pairKey] || { type: 'WAIT', confidence: 0, isLocked: false };
+
+    let nextType = 'WAIT';
+    let locked   = false;
+
+    // ONLY lock BUY or SELL when Python actually fires BUY or SELL with a valid tradeSetup!
+    if ((rawSignal === 'BUY' || rawSignal === 'SELL') && hasValidTradeSetup && rawConf >= ENTRY_THRESHOLD) {
+      nextType = rawSignal;
+      locked   = true;
+    } else if (prevLock.isLocked && hasValidTradeSetup) {
+      const isOpposite = (prevLock.type === 'BUY' && rawSignal === 'SELL') ||
+                         (prevLock.type === 'SELL' && rawSignal === 'BUY');
+      if (isOpposite && rawConf >= FLIP_THRESHOLD) {
+        nextType = rawSignal;
+        locked   = true;
+      } else if (rawConf >= EXIT_THRESHOLD) {
+        nextType = prevLock.type;
+        locked   = true;
+      }
     }
 
-    const newLock = { type: nextState, confidence: rawConf, timestamp: Date.now() };
-    activeSignalRef.current = newLock;
-    localStorage.setItem('aura_ai_lock', JSON.stringify(newLock));
+    const newState = {
+      type:       nextType,
+      bias:       cycleBias,
+      confidence: rawConf,
+      isLocked:   locked,
+      timestamp:  Date.now(),
+    };
+
+    locksByPairRef.current[pairKey] = newState;
     setAnalysis(newData);
-    setDisplayState(newLock);
+    setDisplayState(newState);
   };
 
+  // Fetch upcoming High-Impact USD News (for countdown alert banner ONLY — never overwrites chart analysis!)
   const fetchDailyNews = async () => {
     try {
-      const res     = await axios.get(`${API_URL}/api/news`);
-      const today   = new Date().toDateString();
-      const events  = res.data.filter(n => {
-        const newsDate  = new Date(n.time * 1000).toDateString();
-        const eventTime = new Date(n.time * 1000);
+      const res   = await axios.get(`${API_URL}/api/news`);
+      const today = new Date().toDateString();
+      const events = (res.data || []).filter(n => {
+        const ts        = n.time > 2000000000 ? n.time : n.time * 1000;
+        const newsDate  = new Date(ts).toDateString();
+        const eventTime = new Date(ts);
         return newsDate === today && n.impact === 'High' && n.currency === 'USD' && eventTime > new Date();
       }).sort((a, b) => a.time - b.time);
       setUpcomingNews(events);
-      if (events.length > 0) {
-        const res2 = await axios.post(`${API_URL}/api/analyze`, {
-          timeframe: '1h', currency: 'USD', eventName: events[0].event
-        });
-        if (res2.data) processNewData(res2.data);
-      }
     } catch { /* silent */ }
   };
 
   useEffect(() => {
     fetchDailyNews();
-    const newsId  = setInterval(fetchDailyNews, 60000);
-    const tickId  = setInterval(() => {
+    const newsId = setInterval(fetchDailyNews, 60000);
+    const tickId = setInterval(() => {
       setNow(Date.now());
       setActiveSession(getActiveSession());
     }, 1000);
@@ -122,23 +148,31 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const getCountdown = (target) => {
     const diff = target - now;
     if (diff <= 0) return 'Releasing Now...';
-    const h = Math.floor(diff / 3600000);
-    const m = Math.floor((diff % 3600000) / 60000);
+    const h   = Math.floor(diff / 3600000);
+    const m   = Math.floor((diff % 3600000) / 60000);
     const sec = Math.floor((diff % 60000) / 1000);
-    return `${h}h ${String(m).padStart(2,'0')}m ${String(sec).padStart(2,'0')}s`;
+    return `${h}h ${String(m).padStart(2, '0')}m ${String(sec).padStart(2, '0')}s`;
   };
 
-  const signalColor = displayState.type === 'BUY' ? '#00e676'
+  // Color & Label Logic: Never show "SELL" on a Bullish Wait!
+  const signalColor = displayState.type === 'BUY'  ? '#00e676'
                     : displayState.type === 'SELL' ? '#ff4757'
+                    : displayState.bias === 'BULLISH' ? '#00e676'
+                    : displayState.bias === 'BEARISH' ? '#ff4757'
                     : '#f0b429';
 
-  const isLocked = displayState.type !== 'NEUTRAL';
-  const isBusy   = loading || newsLoading;
+  const statusLabel = displayState.type === 'BUY'  ? 'BUY ACTIVE'
+                    : displayState.type === 'SELL' ? 'SELL ACTIVE'
+                    : displayState.bias === 'BULLISH' ? 'WAIT FOR BUY'
+                    : displayState.bias === 'BEARISH' ? 'WAIT FOR SELL'
+                    : 'WAIT / NEUTRAL';
 
-  const circumference  = 2 * Math.PI * 36;
-  const dashOffset     = circumference - (displayState.confidence / 100) * circumference;
+  const isLocked = displayState.isLocked;
+  const isBusy   = loading;
 
-  // Calculated lot size
+  const circumference = 2 * Math.PI * 32;
+  const dashOffset    = circumference - (displayState.confidence / 100) * circumference;
+
   const lotSize = calcLotSize(
     balance,
     riskPct,
@@ -148,8 +182,9 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   );
   const riskAmount = ((balance * riskPct) / 100).toFixed(2);
 
-  // MTF confluence mock (replace with real API data when available)
   const mtfData = analysis?.mtf_confluence || [];
+  const target1 = analysis?.keyLevels?.target1 || analysis?.tradeSetup?.target_1;
+  const target2 = analysis?.keyLevels?.target2 || analysis?.tradeSetup?.target_2;
 
   const tabBtnStyle = (id) => ({
     flex: 1, padding: '7px 4px', background: activeTab === id ? 'rgba(240,180,41,0.1)' : 'transparent',
@@ -164,9 +199,9 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       height: '100%', background: 'rgba(13,17,23,0.95)',
       border: upcomingNews.length > 0
         ? '1px solid rgba(239,83,80,0.5)'
-        : `1px solid ${isLocked ? signalColor + '40' : 'rgba(255,255,255,0.08)'}`,
+        : `1px solid ${isLocked ? signalColor + '55' : 'rgba(255,255,255,0.08)'}`,
       borderRadius: 12, padding: 16, color: '#e8edf3',
-      display: 'flex', flexDirection: 'column', gap: 12,
+      display: 'flex', flexDirection: 'column', gap: 10,
       transition: 'border 0.3s ease', overflow: 'hidden',
       fontFamily: "'Syne', sans-serif",
     }}>
@@ -182,9 +217,13 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           )}
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          {isLocked && (
+          {isLocked ? (
             <div style={{ fontSize: 9, background: `${signalColor}18`, color: signalColor, border: `1px solid ${signalColor}40`, padding: '2px 8px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-              <Lock size={9} /> LOCKED
+              <Lock size={9} /> SIGNAL ACTIVE
+            </div>
+          ) : (
+            <div style={{ fontSize: 9, background: 'rgba(240,180,41,0.1)', color: '#f0b429', border: '1px solid rgba(240,180,41,0.3)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              SCANNING
             </div>
           )}
           <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: 5, cursor: 'pointer', padding: 5, display: 'flex', alignItems: 'center' }}>
@@ -207,7 +246,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           <span style={{ fontSize: 11, fontFamily: "'Space Mono', monospace" }}>Simulating outcomes...</span>
         </div>
       ) : (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', minHeight: 0 }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', minHeight: 0, paddingRight: 2 }}>
 
           {/* ─── TAB: SIGNAL ─── */}
           {activeTab === 'signal' && (
@@ -219,55 +258,58 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                     <circle cx="38" cy="38" r="32" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
                     <circle cx="38" cy="38" r="32" stroke={signalColor} strokeWidth="6" fill="transparent"
                       strokeDasharray={circumference} strokeDashoffset={dashOffset} strokeLinecap="round"
-                      style={{ transition: 'stroke-dashoffset 1s ease-in-out' }} />
+                      style={{ transition: 'stroke-dashoffset 0.8s ease-in-out' }} />
                   </svg>
                   <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    {displayState.type === 'BUY'  ? <TrendingUp size={16} color={signalColor} /> :
-                     displayState.type === 'SELL' ? <TrendingUp size={16} color={signalColor} style={{ transform: 'scaleY(-1)' }} /> :
+                    {displayState.bias === 'BULLISH' ? <TrendingUp size={16} color={signalColor} /> :
+                     displayState.bias === 'BEARISH' ? <TrendingUp size={16} color={signalColor} style={{ transform: 'scaleY(-1)' }} /> :
                      <Shield size={16} color={signalColor} />}
                   </div>
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2 }}>PROBABILITY</div>
+                  <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2 }}>SETUP READINESS</div>
                   <div style={{ fontSize: 26, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
-                  <div style={{ fontSize: 11, color: signalColor, fontWeight: 700, letterSpacing: 2, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>{displayState.type}</div>
+                  <div style={{ fontSize: 11, color: signalColor, fontWeight: 700, letterSpacing: 1.5, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+                    {statusLabel}
+                  </div>
                 </div>
               </div>
 
-              {/* Strategy logic */}
-              <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flexShrink: 0 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-                  <History size={12} /> STRATEGY LOGIC
+              {/* Structural Target Roadmap (Always visible so traders see Target 1 & Target 2 clearly) */}
+              {(target1 || target2) && !analysis?.tradeSetup && (
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, flexShrink: 0 }}>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '7px 8px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 9, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1 🎯</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target1 ?? '—'}</div>
+                  </div>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '7px 8px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 9, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2 🚀</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target2 ?? '—'}</div>
+                  </div>
                 </div>
-                <div style={{ fontSize: 11, color: '#d1d5db', lineHeight: 1.6, maxHeight: 90, overflowY: 'auto' }}>
-                  {analysis?.reasoning && Array.isArray(analysis.reasoning)
-                    ? analysis.reasoning.map((r, i) => (
-                        <div key={i} style={{ display: 'flex', gap: 6, marginBottom: 3 }}>
-                          <span style={{ color: signalColor }}>•</span>
-                          <span>{r.replace(/OB/g, 'Order Block')}</span>
-                        </div>
-                      ))
-                    : (analysis?.reason || 'Scanning market structure...')}
-                </div>
-              </div>
+              )}
 
-              {/* Trade setup levels */}
-              {isLocked && analysis?.tradeSetup && (
-                <div style={{ background: 'rgba(0,0,0,0.25)', padding: 10, borderRadius: 7, border: '1px solid rgba(255,255,255,0.05)', flexShrink: 0 }}>
+              {/* Active Trade Setup Levels (Shown immediately when BUY or SELL triggers) */}
+              {analysis?.tradeSetup && (
+                <div style={{ background: 'rgba(0,0,0,0.32)', padding: 10, borderRadius: 7, border: `1px solid ${signalColor}40`, flexShrink: 0 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                    <span style={{ fontSize: 9, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: 3, fontFamily: "'Space Mono', monospace" }}>
-                      <Crosshair size={11} /> ENTRY
+                    <span style={{ fontSize: 9, color: '#9ca3af', display: 'flex', alignItems: 'center', gap: 4, fontFamily: "'Space Mono', monospace" }}>
+                      <Crosshair size={11} color="#2962FF" /> LIVE ENTRY
                     </span>
                     <span style={{ fontSize: 12, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.entry}</span>
                   </div>
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
-                    <div style={{ background: 'rgba(255,71,87,0.12)', padding: '6px 8px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(255,71,87,0.2)' }}>
-                      <div style={{ fontSize: 9, color: '#ff4757', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>STOP LOSS</div>
-                      <div style={{ fontSize: 11, color: '#ffcdd2', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.stop_loss}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 5 }}>
+                    <div style={{ background: 'rgba(255,71,87,0.12)', padding: '6px 4px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(255,71,87,0.25)' }}>
+                      <div style={{ fontSize: 8, color: '#ff4757', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>STOP LOSS</div>
+                      <div style={{ fontSize: 10, color: '#ffcdd2', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.stop_loss}</div>
                     </div>
-                    <div style={{ background: 'rgba(0,230,118,0.12)', padding: '6px 8px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(0,230,118,0.2)' }}>
-                      <div style={{ fontSize: 9, color: '#00e676', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TAKE PROFIT</div>
-                      <div style={{ fontSize: 11, color: '#b9f6ca', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.take_profit}</div>
+                    <div style={{ background: 'rgba(0,230,118,0.12)', padding: '6px 4px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(0,230,118,0.25)' }}>
+                      <div style={{ fontSize: 8, color: '#00e676', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1</div>
+                      <div style={{ fontSize: 10, color: '#b9f6ca', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.take_profit}</div>
+                    </div>
+                    <div style={{ background: 'rgba(0,230,118,0.18)', padding: '6px 4px', borderRadius: 4, textAlign: 'center', border: '1px solid rgba(0,230,118,0.35)' }}>
+                      <div style={{ fontSize: 8, color: '#00e676', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2</div>
+                      <div style={{ fontSize: 10, color: '#b9f6ca', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.target_2 || analysis.tradeSetup.take_profit}</div>
                     </div>
                   </div>
                   <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#9ca3af', fontFamily: "'Space Mono', monospace" }}>
@@ -275,6 +317,23 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   </div>
                 </div>
               )}
+
+              {/* Strategy logic (Fixed clipping & increased height so all lines read cleanly) */}
+              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 110, display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
+                  <History size={12} /> STRATEGY LOGIC
+                </div>
+                <div style={{ fontSize: 11, color: '#d1d5db', lineHeight: 1.55, overflowY: 'auto', paddingTop: 2, paddingRight: 4 }}>
+                  {analysis?.reasoning && Array.isArray(analysis.reasoning)
+                    ? analysis.reasoning.map((r, i) => (
+                        <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 5 }}>
+                          <span style={{ color: signalColor, lineHeight: 1.4 }}>•</span>
+                          <span style={{ flex: 1 }}>{r}</span>
+                        </div>
+                      ))
+                    : (analysis?.reason || 'Scanning market structure...')}
+                </div>
+              </div>
 
               {/* News alerts */}
               {upcomingNews.length > 0 && (
@@ -292,12 +351,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   ))}
                 </div>
               )}
-
-              {!isLocked && (
-                <div style={{ marginTop: 'auto', padding: 12, textAlign: 'center', border: '1px dashed rgba(240,180,41,0.2)', borderRadius: 7, color: '#f0b429', fontSize: 11, fontStyle: 'italic', background: 'rgba(240,180,41,0.03)' }}>
-                  Awaiting high-probability setup (&gt;{ENTRY_THRESHOLD}%)
-                </div>
-              )}
             </>
           )}
 
@@ -313,13 +366,13 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '4px 0' }} />
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <ResultBox label="LOT SIZE"    value={lotSize}    color="#f0b429" unit="lots" />
+                <ResultBox label="LOT SIZE"    value={lotSize || '—'} color="#f0b429" unit={lotSize ? 'lots' : 'awaiting entry'} />
                 <ResultBox label="RISK AMOUNT" value={`$${riskAmount}`} color="#ff4757" />
               </div>
 
               {analysis?.tradeSetup && (
                 <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)', fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
-                  <div style={{ color: '#6b7a8d', marginBottom: 6, fontSize: 9, letterSpacing: 1 }}>USING CURRENT SETUP</div>
+                  <div style={{ color: '#6b7a8d', marginBottom: 6, fontSize: 9, letterSpacing: 1 }}>ACTIVE TRADE SETUP</div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                     <span style={{ color: '#9ca3af' }}>Entry</span>
                     <span style={{ color: '#fff' }}>{analysis.tradeSetup.entry}</span>
@@ -327,6 +380,10 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                     <span style={{ color: '#9ca3af' }}>Stop Loss</span>
                     <span style={{ color: '#ff4757' }}>{analysis.tradeSetup.stop_loss}</span>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                    <span style={{ color: '#9ca3af' }}>Target 1 / Target 2</span>
+                    <span style={{ color: '#00e676' }}>{analysis.tradeSetup.take_profit} / {analysis.tradeSetup.target_2 || '—'}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                     <span style={{ color: '#9ca3af' }}>RR</span>
@@ -336,7 +393,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               )}
 
               <div style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace", lineHeight: 1.5, marginTop: 4 }}>
-                * Pip value varies by broker and pair. Adjust accordingly for gold (XAU) or JPY pairs.
+                * Automatically scales pip calculation for Forex Majors, JPY pairs, and Gold (XAU/USD).
               </div>
             </div>
           )}
@@ -346,15 +403,16 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>MULTI-TIMEFRAME ALIGNMENT</div>
               {mtfData.map((tf, i) => {
-                const tfColor = tf.bias === 'BUY' || tf.bias?.includes('BUY') ? '#00e676'
-                              : tf.bias === 'SELL' || tf.bias?.includes('SELL') ? '#ff4757'
+                const biasStr = (tf.bias || 'NEUTRAL').toString().toUpperCase();
+                const tfColor = (biasStr.includes('BULL') || biasStr.includes('BUY'))  ? '#00e676'
+                              : (biasStr.includes('BEAR') || biasStr.includes('SELL')) ? '#ff4757'
                               : '#f0b429';
                 return (
                   <div key={i} style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)' }}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
                       <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "'Space Mono', monospace", color: '#e8edf3' }}>{tf.tf}</span>
                       <span style={{ fontSize: 10, fontWeight: 700, color: tfColor, fontFamily: "'Space Mono', monospace", background: `${tfColor}15`, padding: '2px 8px', borderRadius: 3 }}>
-                        {typeof tf.bias === 'string' ? tf.bias.replace('STRONG_','') : 'NEUTRAL'}
+                        {biasStr.replace('STRONG_', '')}
                       </span>
                     </div>
                     <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2, overflow: 'hidden' }}>
@@ -370,12 +428,12 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               <div style={{ marginTop: 4, padding: '8px 10px', background: 'rgba(255,255,255,0.02)', borderRadius: 6, border: '1px solid rgba(255,255,255,0.04)' }}>
                 <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>CONFLUENCE SCORE</div>
                 <div style={{ fontSize: 20, fontWeight: 800, color: signalColor, fontFamily: "'Space Mono', monospace" }}>
-                  {Math.round(mtfData.filter(t => {
-                    const b = (t.bias || '').toString();
-                    return b.includes('BULLISH') || b.includes('BEARISH');
-                  }).length / mtfData.length * 100)}%
+                  {mtfData.length > 0 ? Math.round(mtfData.filter(t => {
+                    const b = (t.bias || '').toString().toUpperCase();
+                    return b.includes('BULL') || b.includes('BEAR');
+                  }).length / mtfData.length * 100) : 0}%
                 </div>
-                <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with signal</div>
+                <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with cycle</div>
               </div>
             </div>
           )}

@@ -1,7 +1,7 @@
-const axios = require('axios'); // 🔌 Bridge to Python
+const axios = require('axios');
 const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
-const { openPaperTradeIfEligible } = require('./tradeController'); // 👈 NEW: automatic paper trading
+const { openPaperTradeIfEligible } = require('./tradeController');
 
 // ⚙️ CONFIGURATION
 const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
@@ -12,8 +12,6 @@ const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
         if (!targetEvent) return null;
-
-        console.log(`🔎 Scouting History for: ${targetEvent} (${targetCurrency})...`);
 
         const pastEvents = await NewsEvent.find({
             event: targetEvent,
@@ -33,10 +31,7 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
             if (deviation === 0) continue;
 
             const candleTime = news.time - (news.time % 3600);
-
-            // 🛑 LEGACY SAFEGUARD: Kept this locked to Gold so historical news logic holds
             const candle = await Candle.findOne({ time: candleTime, timeframe: '1h', symbol: 'GC=F' });
-
             if (!candle) continue;
 
             totalValid++;
@@ -78,20 +73,8 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
 exports.analyzePattern = async (req, res) => {
     try {
         const { timeframe, eventName, currency, symbol } = req.body;
-
-        // 👈 FIX: the frontend (App.js) sends the selected pair as `currency`
-        // (e.g. "EURUSD=X"), not `symbol`. This used to read ONLY `symbol`,
-        // which is never sent by the current frontend, so targetSymbol fell
-        // back to 'GC=F' (gold) on EVERY request regardless of which tab was
-        // active — every non-gold pair was silently being analyzed as gold.
-        // Accepting either field name fixes it without requiring a frontend
-        // change, and stays backward-compatible with any caller that DOES
-        // send `symbol` explicitly.
         const targetSymbol = symbol || currency || 'GC=F';
 
-        // ------------------------------------
-        // PATH A: NEWS EVENT ANALYSIS (Legacy Logic)
-        // ------------------------------------
         if (eventName) {
             const newsStrategy = await analyzeNewsImpact(eventName, currency || 'USD');
             if (newsStrategy && newsStrategy.probability > 60) {
@@ -106,13 +89,8 @@ exports.analyzePattern = async (req, res) => {
             }
         }
 
-        // ------------------------------------
-        // PATH B: SMC BRAIN (4H/1H Multi-Timeframe)
-        // ------------------------------------
-
         console.log(`⏱️ Fetching 1H and 4H Data Matrix for ${targetSymbol}...`);
 
-        // Both queries strictly filter by the selected targetSymbol!
         const [raw1HCandles, raw4HCandles] = await Promise.all([
              Candle.find({ timeframe: '1h', symbol: targetSymbol }).sort({ time: -1 }).limit(3000).lean(),
              Candle.find({ timeframe: '4h', symbol: targetSymbol }).sort({ time: -1 }).limit(1000).lean()
@@ -122,7 +100,6 @@ exports.analyzePattern = async (req, res) => {
             return res.json({ signal: 'NEUTRAL', confidence: 0, reason: [`Not enough data for ${targetSymbol}.`] });
         }
 
-        // 2. Prepare Data for Python (Oldest -> Newest)
         const formatCandles = (candles) => candles.reverse().map(c => ({
             open: c.open,
             high: c.high,
@@ -136,34 +113,46 @@ exports.analyzePattern = async (req, res) => {
         const clean4HCandles = formatCandles(raw4HCandles);
         const currentPrice = clean1HCandles[clean1HCandles.length - 1].close;
 
-        // 3. FETCH RECENT FUNDAMENTAL NEWS
         const latestNews = await NewsEvent.findOne({
             impact: 'High',
             actual: { $ne: null },
             forecast: { $ne: null }
         }).sort({ time: -1 }).lean();
 
-        // 4. Call the Python Brain with BOTH arrays
         console.log(`📡 Contacting SMC Brain for ${targetSymbol}: [1H: ${clean1HCandles.length}] + [4H: ${clean4HCandles.length}] + News...`);
 
         try {
             const pythonResponse = await axios.post(PYTHON_API_URL, {
                 timeframe: timeframe || '1h',
-                currency: targetSymbol, // 👈 Send the explicit symbol to Python
+                currency: targetSymbol,
                 current_price: currentPrice,
                 candles: clean1HCandles,
                 htf_candles: clean4HCandles,
                 news_data: latestNews
             });
 
-            // 👈 Automatically open a paper trade if this signal qualifies.
-            // Fire this before responding, but never let it block or break the
-            // actual analysis response — openPaperTradeIfEligible has its own
-            // internal try/catch and resolves to null on any failure.
-            await openPaperTradeIfEligible(targetSymbol, pythonResponse.data);
+            const aiResult = pythonResponse.data;
 
-            // 5. Return the Smart Response
-            return res.json(pythonResponse.data);
+            // Open a new paper trade if eligible, OR retrieve the currently OPEN paper trade on this symbol
+            const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
+
+            // If there is an active OPEN trade on this symbol, keep its Entry/SL/TP pinned on the chart!
+            if (activeTrade && activeTrade.status === 'OPEN') {
+                const risk = Math.max(Math.abs(activeTrade.entry - activeTrade.sl), 1e-6);
+                const rr   = parseFloat((Math.abs(activeTrade.tp - activeTrade.entry) / risk).toFixed(2));
+                aiResult.signal     = activeTrade.action.toUpperCase(); // 'BUY' or 'SELL'
+                aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 72);
+                aiResult.tradeSetup = {
+                    entry:       activeTrade.entry,
+                    stop_loss:   activeTrade.sl,
+                    take_profit: activeTrade.tp,
+                    target_1:    activeTrade.tp,
+                    target_2:    aiResult.keyLevels?.target2 || activeTrade.tp,
+                    risk_reward: rr
+                };
+            }
+
+            return res.json(aiResult);
 
         } catch (pyError) {
             console.error("⚠️ Python Brain Unreachable:", pyError.message);

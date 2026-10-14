@@ -1,20 +1,37 @@
 const Trade = require('../models/Trade');
 
-// Maps the raw asset codes used internally (Candle.symbol, server.js's ASSETS list)
-// to a human-readable pair label for the dashboard, matching the convention already
-// used elsewhere in the app (e.g. brain.py's get_instrument_profile).
+// Maps raw Yahoo Finance symbols to clean dashboard pair labels
 const SYMBOL_LABELS = {
-  'GC=F': 'XAUUSD',
+  'GC=F':     'XAUUSD',
   'EURUSD=X': 'EURUSD',
   'GBPUSD=X': 'GBPUSD',
-  'JPY=X': 'USDJPY',
+  'JPY=X':    'USDJPY',
   'AUDUSD=X': 'AUDUSD',
-  'CAD=X': 'USDCAD',
-  'CHF=X': 'USDCHF',
+  'CAD=X':    'USDCAD',
+  'CHF=X':    'USDCHF',
   'NZDUSD=X': 'NZDUSD',
 };
 
 const symbolToPairLabel = (symbol) => SYMBOL_LABELS[symbol] || symbol;
+
+/**
+ * Converts a raw price difference into standard Forex / Gold Pips:
+ * - Gold (GC=F / XAUUSD): $0.10 move = 1 pip (so $10 move = 100 pips)
+ * - JPY pairs (JPY=X / USDJPY): 0.01 move = 1 pip
+ * - Forex Majors (EURUSD, GBPUSD, etc.): 0.0001 move = 1 pip
+ */
+const calculatePips = (symbol = '', rawPriceDiff = 0) => {
+  const s = symbol.toUpperCase();
+  let pips;
+  if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) {
+    pips = rawPriceDiff * 10;
+  } else if (s.includes('JPY')) {
+    pips = rawPriceDiff * 100;
+  } else {
+    pips = rawPriceDiff * 10000;
+  }
+  return parseFloat(pips.toFixed(1));
+};
 
 // @desc    Get trades (optionally filtered by status)
 // @route   GET /api/trades?status=OPEN|CLOSED
@@ -45,61 +62,51 @@ const getOpenTrades = async (req, res) => {
 };
 
 /**
- * Opens a new automatic paper trade from a qualifying AI signal.
- * Called internally by analysisController — NOT an HTTP route.
- *
- * Guards against duplicates: if a symbol already has an OPEN trade, this does
- * nothing (mirrors brain.py's own SIGNAL_LOCK concept, but persisted in Mongo
- * so it survives restarts — one open paper position per symbol at a time).
- *
- * @param {string} symbol - raw asset code, e.g. 'GC=F'
- * @param {object} analysisResult - the object returned by the Python brain's
- *   /api/analyze response (must have .signal, .tradeSetup, .confidence)
+ * Opens a new automatic paper trade from a qualifying AI signal, OR returns
+ * the existing OPEN trade for this symbol so the chart keeps showing the
+ * active Entry / SL / TP lines until the trade closes.
  */
 const openPaperTradeIfEligible = async (symbol, analysisResult) => {
   try {
     if (!analysisResult) return null;
-    const { signal, tradeSetup, confidence } = analysisResult;
 
-    if (signal !== 'BUY' && signal !== 'SELL') return null;
-    if (!tradeSetup || tradeSetup.entry == null || tradeSetup.stop_loss == null || tradeSetup.take_profit == null) return null;
-
+    // 1. Check if there is ALREADY an open trade running on this symbol
     const existingOpen = await Trade.findOne({ symbol, status: 'OPEN' });
     if (existingOpen) {
-      return null; // already have an open paper position on this symbol — don't stack another
+      return existingOpen;
+    }
+
+    // 2. Otherwise, only open a new trade if Python fired a live BUY or SELL with >= 65% confidence
+    const { signal, tradeSetup, confidence } = analysisResult;
+    if (signal !== 'BUY' && signal !== 'SELL') return null;
+    if ((confidence || 0) < 65) return null;
+    if (!tradeSetup || tradeSetup.entry == null || tradeSetup.stop_loss == null || tradeSetup.take_profit == null) {
+      return null;
     }
 
     const trade = await Trade.create({
       symbol,
-      pair: symbolToPairLabel(symbol),
-      action: signal === 'BUY' ? 'Buy' : 'Sell',
-      entry: tradeSetup.entry,
-      sl: tradeSetup.stop_loss,
-      tp: tradeSetup.take_profit,
+      pair:       symbolToPairLabel(symbol),
+      action:     signal === 'BUY' ? 'Buy' : 'Sell',
+      entry:      tradeSetup.entry,
+      sl:         tradeSetup.stop_loss,
+      tp:         tradeSetup.take_profit,
       confidence: confidence,
-      status: 'OPEN',
+      status:     'OPEN',
     });
 
     console.log(`📝 PAPER TRADE OPENED: ${trade.action} ${trade.pair} @ ${trade.entry} | SL ${trade.sl} | TP ${trade.tp} | Confidence ${confidence}%`);
     return trade;
   } catch (error) {
-    // Never let paper-trade bookkeeping break the actual analysis response.
     console.error(`⚠️ Failed to open paper trade for ${symbol}:`, error.message);
     return null;
   }
 };
 
 /**
- * Checks all OPEN paper trades on a given symbol against a fresh price candle,
- * closing any whose stop-loss or take-profit was hit. Called internally by
- * server.js's live price tick handler — NOT an HTTP route.
- *
- * Uses high/low (not just close) to catch intra-candle wicks touching SL/TP,
- * matching the same logic backtest.py uses to simulate trade outcomes —
- * keeps live paper trading consistent with how the strategy was validated.
- *
- * @param {string} symbol - raw asset code, e.g. 'GC=F'
- * @param {object} candle - { high, low, close, time } from the live price feed
+ * Checks all OPEN paper trades on a given symbol against a fresh price tick,
+ * closing any whose stop-loss or take-profit was hit and recording the
+ * outcome in real Forex/Gold Pips.
  */
 const evaluateOpenTrades = async (symbol, candle) => {
   try {
@@ -120,7 +127,7 @@ const evaluateOpenTrades = async (symbol, candle) => {
           hit = 'TP';
           exitPrice = trade.tp;
         }
-      } else { // 'Sell'
+      } else {
         if (candle.high >= trade.sl) {
           hit = 'SL';
           exitPrice = trade.sl;
@@ -132,18 +139,20 @@ const evaluateOpenTrades = async (symbol, candle) => {
 
       if (!hit) continue;
 
-      const profit = trade.action === 'Buy'
+      const rawDiff = trade.action === 'Buy'
         ? exitPrice - trade.entry
         : trade.entry - exitPrice;
 
-      trade.status = 'CLOSED';
-      trade.exit = exitPrice;
-      trade.result = hit === 'TP' ? 'WON' : 'LOST';
-      trade.profit = profit;
+      const profitPips = calculatePips(symbol, rawDiff);
+
+      trade.status   = 'CLOSED';
+      trade.exit     = exitPrice;
+      trade.result   = hit === 'TP' ? 'WON' : 'LOST';
+      trade.profit   = profitPips;
       trade.closedAt = new Date();
       await trade.save();
 
-      console.log(`✅ PAPER TRADE CLOSED: ${trade.action} ${trade.pair} | ${trade.result} | Exit ${exitPrice} | Profit ${profit.toFixed(2)}`);
+      console.log(`✅ PAPER TRADE CLOSED: ${trade.action} ${trade.pair} | ${trade.result} | Exit ${exitPrice} | Profit ${profitPips > 0 ? '+' : ''}${profitPips} pips`);
     }
   } catch (error) {
     console.error(`⚠️ Failed to evaluate open trades for ${symbol}:`, error.message);
@@ -156,4 +165,5 @@ module.exports = {
   openPaperTradeIfEligible,
   evaluateOpenTrades,
   symbolToPairLabel,
+  calculatePips,
 };

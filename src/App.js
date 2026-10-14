@@ -9,13 +9,13 @@ const API_URL = 'https://aura-trade-v1.onrender.com';
 
 const ASSETS = [
   { id: 'GC=F',     name: 'XAU/USD',  label: 'Gold',        icon: '⬡', category: 'metals'  },
-  { id: 'EURUSD=X',  name: 'EUR/USD',  label: 'Euro',        icon: '€', category: 'majors'  },
-  { id: 'GBPUSD=X',  name: 'GBP/USD',  label: 'Cable',       icon: '£', category: 'majors'  },
-  { id: 'JPY=X',     name: 'USD/JPY',  label: 'Yen',         icon: '¥', category: 'majors'  },
-  { id: 'CHF=X',     name: 'USD/CHF',  label: 'Swissy',      icon: 'F', category: 'majors'  },
-  { id: 'AUDUSD=X',  name: 'AUD/USD',  label: 'Aussie',      icon: 'A', category: 'minors'  },
-  { id: 'CAD=X',     name: 'USD/CAD',  label: 'Loonie',      icon: 'C', category: 'minors'  },
-  { id: 'NZDUSD=X',  name: 'NZD/USD',  label: 'Kiwi',        icon: 'N', category: 'minors'  },
+  { id: 'EURUSD=X', name: 'EUR/USD',  label: 'Euro',        icon: '€', category: 'majors'  },
+  { id: 'GBPUSD=X', name: 'GBP/USD',  label: 'Cable',       icon: '£', category: 'majors'  },
+  { id: 'JPY=X',    name: 'USD/JPY',  label: 'Yen',         icon: '¥', category: 'majors'  },
+  { id: 'CHF=X',    name: 'USD/CHF',  label: 'Swissy',      icon: 'F', category: 'majors'  },
+  { id: 'AUDUSD=X', name: 'AUD/USD',  label: 'Aussie',      icon: 'A', category: 'minors'  },
+  { id: 'CAD=X',    name: 'USD/CAD',  label: 'Loonie',      icon: 'C', category: 'minors'  },
+  { id: 'NZDUSD=X', name: 'NZD/USD',  label: 'Kiwi',        icon: 'N', category: 'minors'  },
 ];
 
 const SESSIONS = [
@@ -28,7 +28,7 @@ const SESSIONS = [
 const getActiveSessions = (utcHour) => {
   return SESSIONS.filter(s => {
     if (s.start < s.end) return utcHour >= s.start && utcHour < s.end;
-    return utcHour >= s.start || utcHour < s.end; 
+    return utcHour >= s.start || utcHour < s.end;
   });
 };
 
@@ -46,11 +46,10 @@ function App() {
   const [activeNav,       setActiveNav]      = useState('chart');
   const [utcTime,         setUtcTime]        = useState(new Date());
   const [activeSessions,  setActiveSessions] = useState([]);
-  const [stats,           setStats]          = useState({ winRate: 0, totalPips: 0, signals: 0, streak: 0 });
-  
-  
-  // 1. Fixed States for responsiveness and sidebar toggling
-  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
+  const [stats,           setStats]          = useState({ winRate: 0, totalPips: '0.0', signals: 0, streak: 0 });
+
+  // Fixed States for responsiveness and sidebar toggling
+  const [isMobile,    setIsMobile]    = useState(window.innerWidth < 768);
   const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth >= 768);
 
   // Handle window resize dynamically
@@ -76,39 +75,53 @@ function App() {
     return () => clearInterval(id);
   }, []);
 
-  // Fetch performance stats
+  // Fetch performance stats (Only count CLOSED trades for Win Rate & Streak!)
   useEffect(() => {
     const fetchStats = async () => {
       try {
         const res = await axios.get(`${API_URL}/api/trades`);
         if (Array.isArray(res.data) && res.data.length > 0) {
-          const trades = res.data;
-          const wins = trades.filter(t => t.result === 'WON').length;
-          const winRate = Math.round((wins / trades.length) * 100);
-          const totalPips = trades.reduce((sum, t) => sum + (parseFloat(t.profit) || 0), 0);
+          const allTrades    = res.data;
+          const closedTrades = allTrades.filter(t => t.status === 'CLOSED');
+          const wins         = closedTrades.filter(t => t.result === 'WON').length;
+          const winRate      = closedTrades.length > 0 ? Math.round((wins / closedTrades.length) * 100) : 0;
+          const totalPips    = closedTrades.reduce((sum, t) => sum + (parseFloat(t.profit) || 0), 0);
 
+          // `closedTrades` is sorted newest-first (timestamp: -1), so index 0 is the most recent closed trade
           let streak = 0;
-          for (let i = trades.length - 1; i >= 0; i--) {
-            if (i === trades.length - 1) {
-              streak = trades[i].result === 'WON' ? 1 : -1;
+          for (let i = 0; i < closedTrades.length; i++) {
+            const won = closedTrades[i].result === 'WON';
+            if (i === 0) {
+              streak = won ? 1 : -1;
+            } else if (won && streak > 0) {
+              streak++;
+            } else if (!won && streak < 0) {
+              streak--;
             } else {
-              if (trades[i].result === 'WON' && streak > 0) streak++;
-              else if (trades[i].result !== 'WON' && streak < 0) streak--;
-              else break;
+              break;
             }
           }
-          setStats({ winRate, totalPips: totalPips.toFixed(1), signals: trades.length, streak });
+          setStats({
+            winRate,
+            totalPips: totalPips.toFixed(1),
+            signals:   allTrades.length,
+            streak,
+          });
         }
       } catch { /* silent */ }
     };
     fetchStats();
+    const statsId = setInterval(fetchStats, 30000);
+    return () => clearInterval(statsId);
   }, []);
 
   const runAnalysis = useCallback(async (sym) => {
+    const targetSym = sym || activeSymbol;
     setLoading(true);
     try {
       const res = await axios.post(`${API_URL}/api/analyze`, {
-        currency:  sym || activeSymbol,
+        currency:  targetSym,
+        symbol:    targetSym,
         timeframe: '1h',
       });
       if (res.data) setAiData(res.data);
@@ -120,6 +133,7 @@ function App() {
   }, [activeSymbol]);
 
   useEffect(() => {
+    setAiData(null); // Clear stale pair visuals immediately when switching tabs
     runAnalysis(activeSymbol);
     const id = setInterval(() => runAnalysis(activeSymbol), 60000);
     return () => clearInterval(id);
@@ -152,7 +166,7 @@ function App() {
               key={item.id}
               onClick={() => {
                 setActiveNav(item.id);
-                if (isMobile) setSidebarOpen(false); // Close drawer on mobile after selection
+                if (isMobile) setSidebarOpen(false);
               }}
               style={{ ...s.navBtn, ...(activeNav === item.id ? s.navBtnActive : {}) }}
               title={item.label}
@@ -198,16 +212,16 @@ function App() {
         <header style={s.topbar}>
           {/* Mobile Hamburger Menu */}
           {isMobile && (
-             <button onClick={() => setSidebarOpen(true)} style={s.hamburgerBtn}>
-               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#e8edf3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                 <line x1="3" y1="12" x2="21" y2="12"></line>
-                 <line x1="3" y1="6" x2="21" y2="6"></line>
-                 <line x1="3" y1="18" x2="21" y2="18"></line>
-               </svg>
-             </button>
+            <button onClick={() => setSidebarOpen(true)} style={s.hamburgerBtn}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#e8edf3" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="3" y1="12" x2="21" y2="12"></line>
+                <line x1="3" y1="6" x2="21" y2="6"></line>
+                <line x1="3" y1="18" x2="21" y2="18"></line>
+              </svg>
+            </button>
           )}
 
-          {/* Pair tabs - Made scrollable on mobile */}
+          {/* Pair tabs */}
           <div style={s.pairTabs}>
             {ASSETS.map(asset => (
               <button
@@ -220,24 +234,23 @@ function App() {
               </button>
             ))}
           </div>
-          
-          {/* Only show full stats on desktop to save space, or make them scrollable too */}
-        {!isMobile && (
-  <div style={s.statsBar}>
-    <StatPill label="WIN RATE"   value={`${stats.winRate}%`}   color="#00e676" />
-    <StatPill label="PIPS"       value={stats.totalPips}        color={stats.totalPips >= 0 ? '#00e676' : '#ff4757'} />
-    <StatPill label="SIGNALS"    value={stats.signals}          color="#f0b429" />
-    <StatPill label="STREAK"     value={stats.streak > 0 ? `+${stats.streak}` : stats.streak} color={stats.streak >= 0 ? '#00e676' : '#ff4757'} />
 
-    {/* Active session badge */}
-    {activeSessions.length > 0 && activeSessions.map(ses => (
-      <div key={ses.name} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '4px 12px', borderRadius: 4, background: `${ses.color}15`, border: `1px solid ${ses.color}40` }}>
-        <span style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>SESSION</span>
-        <span style={{ fontSize: 13, fontWeight: 700, color: ses.color, fontFamily: "'Space Mono', monospace" }}>{ses.abbr}</span>
-      </div>
-    ))}
-  </div>
-)}
+          {/* Desktop stats bar */}
+          {!isMobile && (
+            <div style={s.statsBar}>
+              <StatPill label="WIN RATE" value={`${stats.winRate}%`} color="#00e676" />
+              <StatPill label="PIPS"     value={stats.totalPips}      color={parseFloat(stats.totalPips) >= 0 ? '#00e676' : '#ff4757'} />
+              <StatPill label="SIGNALS"  value={stats.signals}        color="#f0b429" />
+              <StatPill label="STREAK"   value={stats.streak > 0 ? `+${stats.streak}` : stats.streak} color={stats.streak >= 0 ? '#00e676' : '#ff4757'} />
+
+              {activeSessions.length > 0 && activeSessions.map(ses => (
+                <div key={ses.name} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '4px 12px', borderRadius: 4, background: `${ses.color}15`, border: `1px solid ${ses.color}40` }}>
+                  <span style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>SESSION</span>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: ses.color, fontFamily: "'Space Mono', monospace" }}>{ses.abbr}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </header>
 
         {/* ── CONTENT ── */}
@@ -305,7 +318,6 @@ const StatPill = ({ label, value, color }) => (
   </div>
 );
 
-// Converted styles to a function to compute dynamic layout properly
 const getStyles = (isMobile, sidebarOpen) => ({
   root: {
     display: 'flex', height: '100vh', width: '100vw',
@@ -407,7 +419,7 @@ const getStyles = (isMobile, sidebarOpen) => ({
   },
   chartWrap: {
     flex: isMobile ? 'none' : '0 0 70%',
-    height: isMobile ? 350 : '100%', // Prevent collapsing on mobile
+    height: isMobile ? 350 : '100%',
     border: '1px solid rgba(255,255,255,0.07)',
     borderRadius: 10, overflow: 'hidden', background: '#161A25',
   },
