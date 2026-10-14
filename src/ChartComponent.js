@@ -1,13 +1,10 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CandlestickSeries, LineSeries } from 'lightweight-charts';
+import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import axios from 'axios';
 import io from 'socket.io-client';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 🧮 HELPER: Precision, Safe Time Coordinate Lookup & Smooth EMAs
-// ─────────────────────────────────────────────────────────────────────────────
 const getPriceFormat = (sym = '') => {
   const s = sym.toUpperCase();
   if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) {
@@ -41,19 +38,6 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
   return timeScale.timeToCoordinate(candles[nearestIdx].time);
 };
 
-const calculateEMA = (data, period) => {
-  if (!data || data.length === 0) return [];
-  const k = 2 / (period + 1);
-  let ema = data[0].close;
-  return data.map(d => {
-    ema = (d.close - ema) * k + ema;
-    return { time: d.time, value: ema };
-  });
-};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 🔵 HORIZONTAL STRUCTURE & TARGET LINES
-// ─────────────────────────────────────────────────────────────────────────────
 class LineRenderer {
   constructor(data) { this._data = data; }
 
@@ -133,9 +117,6 @@ class LinePrimitive {
   paneViews() { return this._paneViews; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 🟩 DEMAND/SUPPLY TRENDLINE
-// ─────────────────────────────────────────────────────────────────────────────
 class TrendlineRenderer {
   constructor(data) { this._data = data; }
 
@@ -200,9 +181,6 @@ class TrendlinePrimitive {
   paneViews() { return this._paneViews; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 🟨 KEY ZONE / POI ORDER BLOCK BOX
-// ─────────────────────────────────────────────────────────────────────────────
 class OBZoneRenderer {
   constructor(data) { this._data = data; }
 
@@ -276,9 +254,6 @@ class OBZonePrimitive {
   paneViews() { return this._paneViews; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 🏹 2-LEG PROJECTED ROADMAP ARROW
-// ─────────────────────────────────────────────────────────────────────────────
 class ProjectionRenderer {
   constructor(data) { this._data = data; }
 
@@ -370,15 +345,10 @@ class ProjectionPrimitive {
   paneViews() { return this._paneViews; }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 🚀 MAIN COMPONENT (With Fullscreen Expand Toggle!)
-// ─────────────────────────────────────────────────────────────────────────────
 const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef       = useRef(null);
   const chartRef                = useRef(null);
   const candleSeriesRef         = useRef(null);
-  const ema50SeriesRef          = useRef(null);
-  const ema200SeriesRef         = useRef(null);
 
   const linePrimitiveRef        = useRef(null);
   const trendlinePrimitiveRef   = useRef(null);
@@ -402,11 +372,8 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const updateChartData = useCallback((data) => {
     if (!candleSeriesRef.current || !data.length) return;
     candleSeriesRef.current.setData(data);
-    if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(data, 50));
-    if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(data, 200));
   }, []);
 
-  // Resize chart when toggling Fullscreen / Expanded mode or window resize
   useEffect(() => {
     if (!chartRef.current || !chartContainerRef.current) return;
     const timer = setTimeout(() => {
@@ -420,7 +387,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     return () => clearTimeout(timer);
   }, [isExpanded]);
 
-  // Allow ESC key to exit Fullscreen mode
   useEffect(() => {
     const onKeyDown = (e) => {
       if (e.key === 'Escape' && isExpanded) setIsExpanded(false);
@@ -434,8 +400,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     if (candleSeriesRef.current) {
       const pf = getPriceFormat(symbol);
       candleSeriesRef.current.applyOptions({ priceFormat: pf });
-      if (ema50SeriesRef.current)  ema50SeriesRef.current.applyOptions({ priceFormat: pf });
-      if (ema200SeriesRef.current) ema200SeriesRef.current.applyOptions({ priceFormat: pf });
       allDataRef.current = [];
       updateChartData([]);
     }
@@ -477,9 +441,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       priceFormat:     initialFormat,
     });
 
-    const ema50  = chart.addSeries(LineSeries, { color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false, priceFormat: initialFormat });
-    const ema200 = chart.addSeries(LineSeries, { color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false, priceFormat: initialFormat });
-
     const lineP = new LinePrimitive();
     series.attachPrimitive(lineP);
     linePrimitiveRef.current = lineP;
@@ -498,8 +459,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
     chartRef.current        = chart;
     candleSeriesRef.current = series;
-    ema50SeriesRef.current  = ema50;
-    ema200SeriesRef.current = ema200;
     isChartReady.current    = true;
 
     const onResize = () => {
@@ -522,8 +481,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       chart.remove();
       chartRef.current        = null;
       candleSeriesRef.current = null;
-      ema50SeriesRef.current  = null;
-      ema200SeriesRef.current = null;
     };
   }, []);
 
@@ -572,12 +529,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
-        currentBarRef.current = latestCandleRef.current;
-
-        if (allDataRef.current.length) {
-          if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(allDataRef.current, 50));
-          if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(allDataRef.current, 200));
-        }
+        currentBarRef.current   = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 
