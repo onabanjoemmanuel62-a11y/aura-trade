@@ -60,7 +60,10 @@ class LineRenderer {
       this._data.forEach((line) => {
         if (line.x1 === null || line.x2 === null || line.y === null) return;
         const x1 = Math.max(0, line.x1 * hPR);
-        const x2 = Math.min(Math.max(x1 + 18 * hPR, line.x2 * hPR), rightEdge);
+        // Target lines always extend cleanly to the right edge; BOS/CHoCH lines stop at the break candle
+        const x2 = line.isStruct
+          ? Math.min(Math.max(x1 + 22 * hPR, line.x2 * hPR), rightEdge)
+          : rightEdge;
         const y  = line.y * vPR;
         if (x1 >= rightEdge) return;
 
@@ -78,12 +81,10 @@ class LineRenderer {
         ctx.fillStyle = line.color;
 
         if (line.isStruct) {
-          // Center BOS / CHoCH label neatly along the structure break span
-          const midX = Math.min(Math.max(x1 + 6 * hPR, (x1 + x2) / 2 - 38 * hPR), rightEdge - 145 * hPR);
+          const midX = Math.min(Math.max(x1 + 4 * hPR, (x1 + x2) / 2 - 42 * hPR), rightEdge - 145 * hPR);
           ctx.fillText(line.label, midX, y - 5 * vPR);
         } else {
-          // Place Target 1 / Target 2 label near the right edge without colliding with candlesticks
-          const labelX = Math.max(x1 + 6 * hPR, rightEdge - 155 * hPR);
+          const labelX = Math.max(x1 + 6 * hPR, rightEdge - 150 * hPR);
           ctx.fillText(line.label, labelX, y - 5 * vPR);
         }
         ctx.restore();
@@ -212,27 +213,27 @@ class OBZoneRenderer {
         const x2      = rightEdge;
         const yTop    = Math.min(zone.yTop, zone.yBottom) * vPR;
         const yBottom = Math.max(zone.yTop, zone.yBottom) * vPR;
-        const boxH    = Math.max(2 * vPR, yBottom - yTop);
+        const boxH    = Math.max(3 * vPR, yBottom - yTop);
         if (x1 >= rightEdge) return;
 
-        let fillCol   = 'rgba(38,166,154,0.14)';
-        let strokeCol = 'rgba(38,166,154,0.85)';
+        let fillCol   = 'rgba(38,166,154,0.16)';
+        let strokeCol = 'rgba(38,166,154,0.90)';
         let textCol   = 'rgba(38,166,154,1)';
         let isDashed  = false;
 
         if (zone.zoneKind === 'FVG') {
-          fillCol   = 'rgba(240,180,41,0.14)';
+          fillCol   = 'rgba(240,180,41,0.12)';
           strokeCol = 'rgba(240,180,41,0.75)';
           textCol   = 'rgba(255,215,64,0.95)';
           isDashed  = true;
         } else if (zone.zoneKind === 'LIQ') {
-          fillCol   = 'rgba(168,85,247,0.10)';
-          strokeCol = 'rgba(168,85,247,0.80)';
+          fillCol   = 'rgba(168,85,247,0.12)';
+          strokeCol = 'rgba(168,85,247,0.85)';
           textCol   = 'rgba(216,180,254,0.95)';
           isDashed  = true;
         } else if (!zone.isBullish) {
-          fillCol   = 'rgba(239,83,80,0.14)';
-          strokeCol = 'rgba(239,83,80,0.85)';
+          fillCol   = 'rgba(239,83,80,0.16)';
+          strokeCol = 'rgba(239,83,80,0.90)';
           textCol   = 'rgba(255,107,107,1)';
         }
 
@@ -248,7 +249,7 @@ class OBZoneRenderer {
 
         ctx.font      = `bold ${10 * hPR}px monospace`;
         ctx.fillStyle = textCol;
-        const textX   = Math.min(x1 + 6 * hPR, rightEdge - 220 * hPR);
+        const textX   = Math.min(x1 + 6 * hPR, rightEdge - 230 * hPR);
         const textY   = boxH > 14 * vPR ? yTop + 12 * vPR : yTop - 4 * vPR;
         ctx.fillText(zone.label || 'POI ZONE', Math.max(4 * hPR, textX), textY);
         ctx.restore();
