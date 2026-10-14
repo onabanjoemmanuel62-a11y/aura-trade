@@ -1,12 +1,12 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { createChart, ColorType, CandlestickSeries, LineSeries } from 'lightweight-charts';
+import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import axios from 'axios';
 import io from 'socket.io-client';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🧮 HELPER: Precision, Safe Time Coordinate Lookup & Curved EMAs
+// 🧮 HELPER: Precision & Safe Time Coordinate Lookup
 // ─────────────────────────────────────────────────────────────────────────────
 const getPriceFormat = (sym = '') => {
   const s = sym.toUpperCase();
@@ -43,18 +43,8 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
   return timeScale.timeToCoordinate(candles[nearestIdx].time);
 };
 
-const calculateEMA = (data, period) => {
-  if (!data || data.length === 0) return [];
-  const k = 2 / (period + 1);
-  let ema = data[0].close;
-  return data.map(d => {
-    ema = (d.close - ema) * k + ema;
-    return { time: d.time, value: ema };
-  });
-};
-
 // ─────────────────────────────────────────────────────────────────────────────
-// 🔵 PEAK FORMATION & TARGET LINES (Peak High/Low + Target 1 & Target 2)
+// 🔵 BOS / CHoCH STRUCTURE LINES & TARGET LINES
 // ─────────────────────────────────────────────────────────────────────────────
 class LineRenderer {
   constructor(data) { this._data = data; }
@@ -70,23 +60,33 @@ class LineRenderer {
       this._data.forEach((line) => {
         if (line.x1 === null || line.x2 === null || line.y === null) return;
         const x1 = Math.max(0, line.x1 * hPR);
-        const x2 = Math.min(line.x2 * hPR, rightEdge);
+        const x2 = Math.min(Math.max(x1 + 18 * hPR, line.x2 * hPR), rightEdge);
         const y  = line.y * vPR;
         if (x1 >= rightEdge) return;
 
+        ctx.save();
         ctx.beginPath();
         ctx.moveTo(x1, y);
         ctx.lineTo(x2, y);
         ctx.strokeStyle = line.color;
-        ctx.lineWidth   = line.isAnchor ? 2.2 * hPR : 1.6 * hPR;
-        ctx.setLineDash(line.isAnchor ? [] : [6 * hPR, 4 * hPR]);
+        ctx.lineWidth   = line.isChoch ? 2.2 * hPR : 1.6 * hPR;
+        ctx.setLineDash(line.isStruct ? (line.isChoch ? [] : [4 * hPR, 3 * hPR]) : [6 * hPR, 4 * hPR]);
         ctx.stroke();
         ctx.setLineDash([]);
 
-        const labelX  = Math.min(x2 + 8 * hPR, rightEdge - 150 * hPR);
-        ctx.font      = `bold ${11 * hPR}px monospace`;
+        ctx.font      = `bold ${10.5 * hPR}px monospace`;
         ctx.fillStyle = line.color;
-        ctx.fillText(line.label, labelX, y - 5 * vPR);
+
+        if (line.isStruct) {
+          // Center BOS / CHoCH label neatly along the structure break span
+          const midX = Math.min(Math.max(x1 + 6 * hPR, (x1 + x2) / 2 - 38 * hPR), rightEdge - 145 * hPR);
+          ctx.fillText(line.label, midX, y - 5 * vPR);
+        } else {
+          // Place Target 1 / Target 2 label near the right edge without colliding with candlesticks
+          const labelX = Math.max(x1 + 6 * hPR, rightEdge - 155 * hPR);
+          ctx.fillText(line.label, labelX, y - 5 * vPR);
+        }
+        ctx.restore();
       });
     });
   }
@@ -113,10 +113,11 @@ class LinePrimitive {
         const y  = series.priceToCoordinate(line.level);
         if (x1 === null || x2 === null || y === null) return null;
 
-        const isAnchor = line.type?.includes('Anchor') || line.type?.includes('Peak');
-        const color    = line.color || (isAnchor ? 'rgba(255,215,0,0.9)' : 'rgba(239,83,80,0.8)');
+        const isStruct = Boolean(line.is_struct || line.type?.includes('BOS') || line.type?.includes('CHoCH'));
+        const isChoch  = Boolean(line.is_choch || line.type?.includes('CHoCH'));
+        const color    = line.color || (isStruct ? 'rgba(0,230,118,0.9)' : 'rgba(255,193,7,0.95)');
 
-        return { x1, x2, y, color, label: line.type || 'LEVEL', isAnchor };
+        return { x1, x2, y, color, label: line.type || 'LEVEL', isStruct, isChoch };
       } catch { return null; }
     }).filter(Boolean);
   }
@@ -125,7 +126,7 @@ class LinePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟩 DEMAND/SUPPLY TRENDLINE (sloped — separate from the horizontal peak line)
+// 🟩 OPTIONAL SLOPED TRENDLINE PRIMITIVE
 // ─────────────────────────────────────────────────────────────────────────────
 class TrendlineRenderer {
   constructor(data) { this._data = data; }
@@ -192,7 +193,7 @@ class TrendlinePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟨 ORDER BLOCK ZONE (uses dynamic label from backend)
+// 🟨 SMC ZONES: ORIGIN POI ORDER BLOCK, FAIR VALUE GAP (FVG) & LIQUIDITY ZONE
 // ─────────────────────────────────────────────────────────────────────────────
 class OBZoneRenderer {
   constructor(data) { this._data = data; }
@@ -206,22 +207,51 @@ class OBZoneRenderer {
       const rightEdge = scope.mediaSize.width * hPR;
 
       this._data.forEach((zone) => {
-        if (zone.x1 === null || zone.yTop === null) return;
+        if (zone.x1 === null || zone.yTop === null || zone.yBottom === null) return;
         const x1      = Math.max(0, zone.x1 * hPR);
         const x2      = rightEdge;
-        const yTop    = zone.yTop * vPR;
-        const yBottom = zone.yBottom * vPR;
+        const yTop    = Math.min(zone.yTop, zone.yBottom) * vPR;
+        const yBottom = Math.max(zone.yTop, zone.yBottom) * vPR;
+        const boxH    = Math.max(2 * vPR, yBottom - yTop);
         if (x1 >= rightEdge) return;
 
-        ctx.fillStyle   = zone.isBullish ? 'rgba(38,166,154,0.11)' : 'rgba(239,83,80,0.11)';
-        ctx.fillRect(x1, yTop, x2 - x1, yBottom - yTop);
-        ctx.strokeStyle = zone.isBullish ? 'rgba(38,166,154,0.75)' : 'rgba(239,83,80,0.75)';
-        ctx.lineWidth   = 1 * hPR;
-        ctx.strokeRect(x1, yTop, x2 - x1, yBottom - yTop);
+        let fillCol   = 'rgba(38,166,154,0.14)';
+        let strokeCol = 'rgba(38,166,154,0.85)';
+        let textCol   = 'rgba(38,166,154,1)';
+        let isDashed  = false;
+
+        if (zone.zoneKind === 'FVG') {
+          fillCol   = 'rgba(240,180,41,0.14)';
+          strokeCol = 'rgba(240,180,41,0.75)';
+          textCol   = 'rgba(255,215,64,0.95)';
+          isDashed  = true;
+        } else if (zone.zoneKind === 'LIQ') {
+          fillCol   = 'rgba(168,85,247,0.10)';
+          strokeCol = 'rgba(168,85,247,0.80)';
+          textCol   = 'rgba(216,180,254,0.95)';
+          isDashed  = true;
+        } else if (!zone.isBullish) {
+          fillCol   = 'rgba(239,83,80,0.14)';
+          strokeCol = 'rgba(239,83,80,0.85)';
+          textCol   = 'rgba(255,107,107,1)';
+        }
+
+        ctx.save();
+        ctx.fillStyle = fillCol;
+        ctx.fillRect(x1, yTop, x2 - x1, boxH);
+
+        ctx.strokeStyle = strokeCol;
+        ctx.lineWidth   = 1.2 * hPR;
+        if (isDashed) ctx.setLineDash([4 * hPR, 3 * hPR]);
+        ctx.strokeRect(x1, yTop, x2 - x1, boxH);
+        ctx.setLineDash([]);
 
         ctx.font      = `bold ${10 * hPR}px monospace`;
-        ctx.fillStyle = zone.isBullish ? 'rgba(38,166,154,0.95)' : 'rgba(239,83,80,0.95)';
-        ctx.fillText(zone.label || 'ORDER BLOCK', x1 + 6 * hPR, yTop + 13 * vPR);
+        ctx.fillStyle = textCol;
+        const textX   = Math.min(x1 + 6 * hPR, rightEdge - 220 * hPR);
+        const textY   = boxH > 14 * vPR ? yTop + 12 * vPR : yTop - 4 * vPR;
+        ctx.fillText(zone.label || 'POI ZONE', Math.max(4 * hPR, textX), textY);
+        ctx.restore();
       });
     });
   }
@@ -247,12 +277,17 @@ class OBZonePrimitive {
         const yTop    = series.priceToCoordinate(ob.top);
         const yBottom = series.priceToCoordinate(ob.bottom);
         if (x1 === null || yTop === null || yBottom === null) return null;
+
+        const tStr     = (ob.type || '').toUpperCase();
+        const zoneKind = tStr.includes('FVG') ? 'FVG' : tStr.includes('LIQ') ? 'LIQ' : 'OB';
+
         return {
           x1,
           yTop,
           yBottom,
-          isBullish: ob.type?.includes('BULL'),
-          label:     ob.label || 'ORDER BLOCK',
+          zoneKind,
+          isBullish: tStr.includes('BULL'),
+          label:     ob.label || 'ORIGIN POI',
         };
       } catch { return null; }
     }).filter(Boolean);
@@ -262,7 +297,7 @@ class OBZonePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🏹 2-LEG PROJECTED ROADMAP ARROW (Now -> Pullback Zone -> Target 2)
+// 🏹 2-LEG PROJECTED ROADMAP ARROW (Now -> POI Entry Zone -> Target 2)
 // ─────────────────────────────────────────────────────────────────────────────
 class ProjectionRenderer {
   constructor(data) { this._data = data; }
@@ -341,7 +376,7 @@ class ProjectionPrimitive {
         this._rendererData = null;
         return;
       }
-      const isBull = path[2].price > path[0].price;
+      const isBull = path[2].price > path[1].price;
       this._rendererData = {
         points: [
           { x: x0, y: y0 },
@@ -363,8 +398,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef       = useRef(null);
   const chartRef                = useRef(null);
   const candleSeriesRef         = useRef(null);
-  const ema50SeriesRef          = useRef(null);
-  const ema200SeriesRef         = useRef(null);
 
   const linePrimitiveRef        = useRef(null);
   const trendlinePrimitiveRef   = useRef(null);
@@ -387,8 +420,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const updateChartData = useCallback((data) => {
     if (!candleSeriesRef.current || !data.length) return;
     candleSeriesRef.current.setData(data);
-    if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(data, 50));
-    if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(data, 200));
   }, []);
 
   useEffect(() => {
@@ -396,8 +427,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     if (candleSeriesRef.current) {
       const pf = getPriceFormat(symbol);
       candleSeriesRef.current.applyOptions({ priceFormat: pf });
-      if (ema50SeriesRef.current)  ema50SeriesRef.current.applyOptions({ priceFormat: pf });
-      if (ema200SeriesRef.current) ema200SeriesRef.current.applyOptions({ priceFormat: pf });
       allDataRef.current = [];
       updateChartData([]);
     }
@@ -439,9 +468,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       priceFormat:     initialFormat,
     });
 
-    const ema50  = chart.addSeries(LineSeries, { color: '#2962FF', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false, priceFormat: initialFormat });
-    const ema200 = chart.addSeries(LineSeries, { color: '#FFD700', lineWidth: 2, crosshairMarkerVisible: false, priceLineVisible: false, priceFormat: initialFormat });
-
     const lineP = new LinePrimitive();
     series.attachPrimitive(lineP);
     linePrimitiveRef.current = lineP;
@@ -460,8 +486,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
     chartRef.current        = chart;
     candleSeriesRef.current = series;
-    ema50SeriesRef.current  = ema50;
-    ema200SeriesRef.current = ema200;
     isChartReady.current    = true;
 
     const onResize = () => {
@@ -479,8 +503,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       chart.remove();
       chartRef.current        = null;
       candleSeriesRef.current = null;
-      ema50SeriesRef.current  = null;
-      ema200SeriesRef.current = null;
     };
   }, []);
 
@@ -522,7 +544,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     load();
   }, [timeframe, symbol, processCandles, updateChartData]);
 
-  // Render loop for Primitives & Live EMAs
+  // Render loop for SMC Primitives & Live Ticks
   useEffect(() => {
     let rafId;
     const loop = () => {
@@ -530,12 +552,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
       if (candleSeriesRef.current && latestCandleRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
-        currentBarRef.current = latestCandleRef.current;
-
-        if (allDataRef.current.length) {
-          if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(allDataRef.current, 50));
-          if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(allDataRef.current, 200));
-        }
+        currentBarRef.current   = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 

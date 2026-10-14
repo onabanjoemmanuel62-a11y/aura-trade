@@ -158,11 +158,11 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
 
   const statusLabel = displayState.type === 'BUY'  ? '🟢 BUY ACTIVE NOW'
                     : displayState.type === 'SELL' ? '🔴 SELL ACTIVE NOW'
-                    : isInZone && displayState.bias === 'BULLISH' ? '🎯 IN BUY ZONE — WATCH 1H CLOSE'
-                    : isInZone && displayState.bias === 'BEARISH' ? '🎯 IN SELL ZONE — WATCH 1H CLOSE'
-                    : displayState.bias === 'BULLISH' ? '⏳ AWAITING BUY PULLBACK'
-                    : displayState.bias === 'BEARISH' ? '⏳ AWAITING SELL RALLY'
-                    : 'SCANNING STRUCTURE';
+                    : isInZone && displayState.bias === 'BULLISH' ? '🎯 IN BUY POI — WATCH 1H CLOSE'
+                    : isInZone && displayState.bias === 'BEARISH' ? '🎯 IN SELL POI — WATCH 1H CLOSE'
+                    : displayState.bias === 'BULLISH' ? '⏳ AWAITING BUY POI TAP'
+                    : displayState.bias === 'BEARISH' ? '⏳ AWAITING SELL POI TAP'
+                    : '⏸️ RANGING — FOLD HANDS';
 
   const isBusy = loading;
 
@@ -181,6 +181,8 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const planSL   = execPlan?.planned_sl;
   const target1  = analysis?.keyLevels?.target1 || analysis?.tradeSetup?.target_1;
   const target2  = analysis?.keyLevels?.target2 || analysis?.tradeSetup?.target_2;
+
+  const monoNumStyle = { fontFamily: "'Space Mono', monospace", fontWeight: 700, textDecoration: 'none' };
 
   const tabBtnStyle = (id) => ({
     flex: 1, padding: '7px 4px', background: activeTab === id ? 'rgba(240,180,41,0.1)' : 'transparent',
@@ -219,11 +221,11 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             </div>
           ) : isInZone ? (
             <div style={{ fontSize: 9, background: 'rgba(41,98,255,0.2)', color: '#82b1ff', border: '1px solid rgba(41,98,255,0.5)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-              🎯 ZONE TAPPED
+              🎯 POI TAPPED
             </div>
           ) : (
             <div style={{ fontSize: 9, background: 'rgba(240,180,41,0.1)', color: '#f0b429', border: '1px solid rgba(240,180,41,0.3)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-              WAITING FOR ZONE
+              WAITING FOR POI
             </div>
           )}
           <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: 5, cursor: 'pointer', padding: 5, display: 'flex', alignItems: 'center' }}>
@@ -267,16 +269,16 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: 8, color: '#f0b429', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2, fontWeight: 700 }}>
-                    STRATEGY: MMM PEAK & ZONE SNIPER
+                    STRATEGY: SMC 4-CONFLUENCE A+ SNIPER
                   </div>
-                  <div style={{ fontSize: 22, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: signalColor, lineHeight: 1, fontFamily: "'Space Mono', monospace" }}>{displayState.confidence}%</div>
                   <div style={{ fontSize: 10, color: signalColor, fontWeight: 700, letterSpacing: 1, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
                     {statusLabel}
                   </div>
                 </div>
               </div>
 
-              {/* Actionable Trigger Condition Banner (Synchronized for Active vs Waiting states) */}
+              {/* Actionable Trigger Condition Banner */}
               {isLocked && analysis?.tradeSetup ? (
                 <div style={{
                   background: `${signalColor}15`,
@@ -284,7 +286,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   padding: '8px 10px', borderRadius: 6, fontSize: 10.5, lineHeight: 1.45,
                   color: '#f3f4f6', fontWeight: 600, flexShrink: 0
                 }}>
-                  {displayState.type === 'BUY' ? '🟢 BUY EXECUTING:' : '🔴 SELL EXECUTING:'} Entered @ <strong>{analysis.tradeSetup.entry}</strong>. Target 1: <strong>{analysis.tradeSetup.take_profit}</strong> | Stop Loss: <strong>{analysis.tradeSetup.stop_loss}</strong>.
+                  {displayState.type === 'BUY' ? '🟢 BUY EXECUTING:' : '🔴 SELL EXECUTING:'} Entered @ <span style={monoNumStyle}>{analysis.tradeSetup.entry}</span>. Target 1: <span style={monoNumStyle}>{analysis.tradeSetup.take_profit}</span> | Stop Loss: <span style={monoNumStyle}>{analysis.tradeSetup.stop_loss}</span>.
                 </div>
               ) : execPlan?.trigger_condition && (
                 <div style={{
@@ -297,12 +299,12 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
               )}
 
-              {/* Planned Trade Levels (While waiting or confirming in zone) */}
+              {/* Planned Trade Levels (While waiting or confirming in POI zone) */}
               {(target1 || target2) && !analysis?.tradeSetup && (
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, flexShrink: 0 }}>
                   <div style={{ background: 'rgba(41,98,255,0.10)', padding: '6px 3px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(41,98,255,0.35)' }}>
                     <div style={{ fontSize: 7.5, color: '#82b1ff', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>
-                      {displayState.bias === 'BULLISH' ? 'BUY ZONE' : 'SELL ZONE'}
+                      {displayState.bias === 'BULLISH' ? 'BUY POI' : 'SELL POI'}
                     </div>
                     <div style={{ fontSize: 10, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{poiLevel ?? '—'}</div>
                   </div>
@@ -350,10 +352,10 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
               )}
 
-              {/* 4-Step Strategy Checklist */}
+              {/* 4-Confluence Strategy Checklist */}
               <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 110, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
-                  <History size={12} /> 4-STEP ENTRY CHECKLIST
+                  <History size={12} /> 4-CONFLUENCE A+ CHECKLIST
                 </div>
                 <div style={{ fontSize: 10.5, color: '#d1d5db', lineHeight: 1.5, overflowY: 'auto', paddingTop: 2, paddingRight: 4 }}>
                   {analysis?.checklist && Array.isArray(analysis.checklist) ? (
@@ -405,17 +407,17 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '4px 0' }} />
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <ResultBox label="RECOMMENDED LOTS" value={lotSize || '—'} color="#f0b429" unit={lotSize ? 'standard lots' : 'awaiting zone'} />
+                <ResultBox label="RECOMMENDED LOTS" value={lotSize || '—'} color="#f0b429" unit={lotSize ? 'standard lots' : 'awaiting POI'} />
                 <ResultBox label="RISK AMOUNT"      value={`$${riskAmount}`} color="#ff4757" />
               </div>
 
               {calcEntry > 0 && (
                 <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)', fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
                   <div style={{ color: '#f0b429', marginBottom: 6, fontSize: 9, letterSpacing: 1, fontWeight: 700 }}>
-                    {analysis?.tradeSetup ? 'ACTIVE TRADE PARAMETERS' : 'PLANNED ZONE PARAMETERS'}
+                    {analysis?.tradeSetup ? 'ACTIVE TRADE PARAMETERS' : 'PLANNED POI PARAMETERS'}
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ color: '#9ca3af' }}>{analysis?.tradeSetup ? 'Live Entry' : 'Planned Zone Entry'}</span>
+                    <span style={{ color: '#9ca3af' }}>{analysis?.tradeSetup ? 'Live Entry' : 'Planned POI Entry'}</span>
                     <span style={{ color: '#fff' }}>{calcEntry}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
@@ -470,7 +472,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                     return b.includes('BULL') || b.includes('BEAR');
                   }).length / mtfData.length * 100) : 0}%
                 </div>
-                <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with cycle</div>
+                <div style={{ fontSize: 10, color: '#6b7a8d', marginTop: 2 }}>timeframes aligned with structure</div>
               </div>
             </div>
           )}

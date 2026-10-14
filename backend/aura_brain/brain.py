@@ -24,14 +24,14 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PEAK CONFIRMATION & STRICT INSTITUTIONAL TUNING
+# SMC 4-CONFLUENCE A+ STRATEGY TUNING (BOS/CHoCH + POI OB + FVG + LIQUIDITY)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
-FLIP_BUFFER_ATR              = 0.25
-FLIP_CONFIRM_BARS            = 2
-ANCHOR_MIN_MOVE_ATR          = 1.5
-SWING_PROMINENCE_ATR         = 0.90
-DOUBLE_PATTERN_TOLERANCE_ATR = 0.65
+FLIP_BUFFER_ATR              = 0.20
+FLIP_CONFIRM_BARS            = 1
+ANCHOR_MIN_MOVE_ATR          = 1.4
+SWING_PROMINENCE_ATR         = 0.85
+MIN_FVG_SIZE_ATR             = 0.08
 MIN_ALLOWED_RR               = 1.8
 
 logging.basicConfig(level=logging.INFO)
@@ -141,7 +141,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE — True Structural Peak, Neckline Retest & Deterministic Signals
+# CORE ENGINE — 4-Confluence SMC Strategy (BOS/CHoCH + Origin POI + FVG + IDM)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -239,7 +239,6 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
     targets = []
 
     if is_bullish:
-        # Strictly filter indices to `< total` so sliced dataframes never throw IndexError!
         candidate_indices = set(int(i) for i in raw_highs if 0 <= int(i) < total)
         if anchor_idx < total - 1:
             cycle_max_idx = anchor_idx + int(np.argmax(highs[anchor_idx:]))
@@ -340,15 +339,165 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
     return targets
 
 
-def build_structural_entry_zone(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: np.ndarray,
-                                atr: float, is_bullish: bool, anchor_idx: int,
-                                anchor_price: float, decimals: int) -> List[Dict]:
+def find_origin_poi_with_fvg(df: pd.DataFrame, is_bullish: bool, origin_start_idx: int,
+                             break_idx: int, atr: float, decimals: int) -> Dict:
     """
-    INSTITUTIONAL STRUCTURE RULE (No Floating Mid-Air Chop Boxes!):
-    An entry zone is ONLY placed at:
-      1. The Peak Formation Zone itself (for a 2nd-Leg W or M retest), OR
-      2. A confirmed Structural Swing High/Low (BOS / Flip Zone) where a real
-         swing point formed and broke structure.
+    CONFLUENCE #2 & #3 (Origin Order Block POI + Mandatory 3-Candle Fair Value Gap):
+    Walks the Origin range right before the BOS/CHoCH impulse to locate the
+    LAST opposite/reaction candle before the break that left a 3-candle FVG.
+    """
+    opens  = df['Open'].values
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    total  = len(closes)
+
+    origin_start_idx = int(np.clip(origin_start_idx, 0, max(0, total - 4)))
+    break_idx        = int(np.clip(break_idx, origin_start_idx + 1, max(origin_start_idx + 1, total - 2)))
+
+    best_poi = None
+
+    search_lo = max(0, origin_start_idx - 3)
+    search_hi = min(total - 3, break_idx + 2)
+
+    if is_bullish:
+        # Walk backwards from the break impulse to find the last reaction candle with a Bullish FVG
+        for k in range(search_hi, search_lo - 1, -1):
+            fvg_bot = float(highs[k])
+            fvg_top = float(lows[k + 2])
+            fvg_sz  = fvg_top - fvg_bot
+            is_disp = (closes[k + 1] > opens[k + 1]) and ((closes[k + 1] - opens[k + 1]) >= 0.25 * atr)
+
+            if fvg_sz >= (MIN_FVG_SIZE_ATR * atr) and is_disp:
+                # Refinement: pick the reaction candle (or lowest candle at k / k-1) right before the impulse
+                ob_idx = k
+                if k > search_lo and lows[k - 1] < lows[k] and closes[k - 1] <= opens[k - 1]:
+                    ob_idx = k - 1
+
+                ob_bot  = float(min(lows[ob_idx], lows[k]))
+                ob_top  = float(max(highs[ob_idx], opens[ob_idx], closes[ob_idx]))
+                if (ob_top - ob_bot) > 1.15 * atr:
+                    ob_top = ob_bot + 0.55 * atr
+                if (ob_top - ob_bot) < 0.18 * atr:
+                    ob_top = ob_bot + 0.28 * atr
+
+                best_poi = {
+                    "poi_idx":    int(ob_idx),
+                    "poi_time":   int(dates[ob_idx]),
+                    "poi_top":    round(ob_top, decimals),
+                    "poi_bottom": round(ob_bot, decimals),
+                    "has_fvg":    True,
+                    "fvg_time":   int(dates[k + 1]),
+                    "fvg_top":    round(fvg_top, decimals),
+                    "fvg_bottom": round(fvg_bot, decimals),
+                    "fvg_size":   round(fvg_sz, decimals),
+                }
+                break
+
+        if best_poi is None:
+            # Fallback to the lowest candle in the origin range if no strict 3-bar gap remained open
+             local_min_idx = search_lo + int(np.argmin(lows[search_lo : search_hi + 1]))
+            ob_bot = float(lows[local_min_idx])
+            ob_top = float(min(highs[local_min_idx], ob_bot + 0.45 * atr))
+            if (ob_top - ob_bot) < 0.20 * atr:
+                ob_top = ob_bot + 0.32 * atr
+
+            # Check if any 3-candle micro-imbalance exists near local_min_idx
+            has_micro_fvg = False
+            fvg_bot, fvg_top, fvg_t = ob_top, ob_top + 0.15 * atr, int(dates[local_min_idx])
+            for m in range(local_min_idx, min(total - 2, local_min_idx + 5)):
+                if lows[m + 2] > highs[m]:
+                    has_micro_fvg = True
+                    fvg_bot = float(highs[m])
+                    fvg_top = float(lows[m + 2])
+                    fvg_t   = int(dates[m + 1])
+                    break
+
+            best_poi = {
+                "poi_idx":    int(local_min_idx),
+                "poi_time":   int(dates[local_min_idx]),
+                "poi_top":    round(ob_top, decimals),
+                "poi_bottom": round(ob_bot, decimals),
+                "has_fvg":    has_micro_fvg,
+                "fvg_time":   fvg_t,
+                "fvg_top":    round(fvg_top, decimals),
+                "fvg_bottom": round(fvg_bot, decimals),
+                "fvg_size":   round(max(0.0, fvg_top - fvg_bot), decimals),
+            }
+
+    else:
+        for k in range(search_hi, search_lo - 1, -1):
+            fvg_top = float(lows[k])
+            fvg_bot = float(highs[k + 2])
+            fvg_sz  = fvg_top - fvg_bot
+            is_disp = (closes[k + 1] < opens[k + 1]) and ((opens[k + 1] - closes[k + 1]) >= 0.25 * atr)
+
+            if fvg_sz >= (MIN_FVG_SIZE_ATR * atr) and is_disp:
+                ob_idx = k
+                if k > search_lo and highs[k - 1] > highs[k] and closes[k - 1] >= opens[k - 1]:
+                    ob_idx = k - 1
+
+                ob_top  = float(max(highs[ob_idx], highs[k]))
+                ob_bot  = float(min(lows[ob_idx], opens[ob_idx], closes[ob_idx]))
+                if (ob_top - ob_bot) > 1.15 * atr:
+                    ob_bot = ob_top - 0.55 * atr
+                if (ob_top - ob_bot) < 0.18 * atr:
+                    ob_bot = ob_top - 0.28 * atr
+
+                best_poi = {
+                    "poi_idx":    int(ob_idx),
+                    "poi_time":   int(dates[ob_idx]),
+                    "poi_top":    round(ob_top, decimals),
+                    "poi_bottom": round(ob_bot, decimals),
+                    "has_fvg":    True,
+                    "fvg_time":   int(dates[k + 1]),
+                    "fvg_top":    round(fvg_top, decimals),
+                    "fvg_bottom": round(fvg_bot, decimals),
+                    "fvg_size":   round(fvg_sz, decimals),
+                }
+                break
+
+        if best_poi is None:
+            local_max_idx = search_lo + int(np.argmax(highs[search_lo : search_hi + 1]))
+            ob_top = float(highs[local_max_idx])
+            ob_bot = float(max(lows[local_max_idx], ob_top - 0.45 * atr))
+            if (ob_top - ob_bot) < 0.20 * atr:
+                ob_bot = ob_top - 0.32 * atr
+
+            has_micro_fvg = False
+            fvg_top, fvg_bot, fvg_t = ob_bot, ob_bot - 0.15 * atr, int(dates[local_max_idx])
+            for m in range(local_max_idx, min(total - 2, local_max_idx + 5)):
+                if highs[m + 2] < lows[m]:
+                    has_micro_fvg = True
+                    fvg_top = float(lows[m])
+                    fvg_bot = float(highs[m + 2])
+                    fvg_t   = int(dates[m + 1])
+                    break
+
+            best_poi = {
+                "poi_idx":    int(local_max_idx),
+                "poi_time":   int(dates[local_max_idx]),
+                "poi_top":    round(ob_top, decimals),
+                "poi_bottom": round(ob_bot, decimals),
+                "has_fvg":    has_micro_fvg,
+                "fvg_time":   fvg_t,
+                "fvg_top":    round(fvg_top, decimals),
+                "fvg_bottom": round(fvg_bot, decimals),
+                "fvg_size":   round(max(0.0, fvg_top - fvg_bot), decimals),
+            }
+
+    return best_poi
+
+
+def find_liquidity_before_poi(df: pd.DataFrame, is_bullish: bool, poi_idx: int,
+                              poi_top: float, poi_bottom: float,
+                              raw_highs: np.ndarray, raw_lows: np.ndarray,
+                              atr: float, decimals: int) -> Dict:
+    """
+    CONFLUENCE #4 (Liquidity / Inducement Built & Swept Before POI):
+    Identifies Inducement (IDM), Equal Highs/Lows (Range Liquidity), or
+    internal pullback lows/highs sitting directly in front of the POI.
     """
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -356,58 +505,92 @@ def build_structural_entry_zone(df: pd.DataFrame, raw_highs: np.ndarray, raw_low
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     total  = len(closes)
 
-    anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
-    zone_thickness = 0.40 * atr
+    if poi_idx >= total - 3:
+        return {"has_liquidity": False, "swept": False, "liq_level": None, "liq_box": None, "liq_type": "None"}
 
     if is_bullish:
-        top_val = round(anchor_price + zone_thickness, decimals)
-        bot_val = round(anchor_price, decimals)
-        zone_time = int(dates[anchor_idx])
+        # Look for an internal swing low / inducement low formed after the impulse above the Buy POI
+        cand_lows = [
+            int(i) for i in raw_lows
+            if poi_idx + 2 < int(i) < total
+            and poi_top < lows[int(i)] <= poi_top + (3.2 * atr)
+        ]
+        if not cand_lows:
+            # Check for local pullback lows / range equal lows above POI
+            for j in range(poi_idx + 3, total - 1):
+                if lows[j] <= lows[j - 1] and lows[j] <= lows[j + 1]:
+                    if poi_top < lows[j] <= poi_top + (2.8 * atr):
+                        cand_lows.append(j)
 
-        post_swing_lows = [int(i) for i in raw_lows if anchor_idx + 4 <= int(i) <= total - 4]
-        for sl_idx in reversed(post_swing_lows):
-            sl_price = float(lows[sl_idx])
-            if sl_price > anchor_price and (np.max(highs[sl_idx:]) - sl_price) >= (1.5 * atr):
-                if np.min(lows[sl_idx:]) >= sl_price - (0.05 * atr) and closes[-1] >= sl_price:
-                    bot_val   = round(sl_price, decimals)
-                    top_val   = round(sl_price + zone_thickness, decimals)
-                    zone_time = int(dates[sl_idx])
-                    break
+        if cand_lows:
+            idm_idx   = cand_lows[0]
+            idm_price = float(lows[idm_idx])
+            # Detect if Equal Lows (Range Liquidity) or single Inducement Low
+            eq_lows   = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.25 * atr]
+            liq_type  = "Range Liquidity (EQL)" if len(eq_lows) >= 2 else "Inducement (IDM)"
 
-        return [{
-            "type":      "BULL_OB",
-            "top":       top_val,
-            "bottom":    bot_val,
-            "time":      zone_time,
-            "end_time":  int(dates[-1]),
-            "label":     f"BUY ZONE ({bot_val:.{decimals}f}–{top_val:.{decimals}f})",
-            "mitigated": False
-        }]
+            # Was this liquidity swept by a subsequent candle dipping below it into/toward the POI?
+            post_min = float(np.min(lows[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
+            swept    = bool(post_min < idm_price - (0.03 * atr))
+
+            band = 0.14 * atr
+            return {
+                "has_liquidity": True,
+                "swept":         swept,
+                "liq_type":      liq_type,
+                "liq_level":     round(idm_price, decimals),
+                "liq_idx":       int(idm_idx),
+                "liq_box": {
+                    "type":      "LIQ_ZONE",
+                    "top":       round(idm_price + band, decimals),
+                    "bottom":    round(idm_price - band, decimals),
+                    "time":      int(dates[idm_idx]),
+                    "end_time":  int(dates[-1]),
+                    "label":     f"$$$ {liq_type.upper()} ({idm_price:.{decimals}f})" + (" [SWEPT ✅]" if swept else ""),
+                    "mitigated": swept,
+                }
+            }
 
     else:
-        top_val = round(anchor_price, decimals)
-        bot_val = round(anchor_price - zone_thickness, decimals)
-        zone_time = int(dates[anchor_idx])
+        cand_highs = [
+            int(i) for i in raw_highs
+            if poi_idx + 2 < int(i) < total
+            and poi_bottom - (3.2 * atr) <= highs[int(i)] < poi_bottom
+        ]
+        if not cand_highs:
+            for j in range(poi_idx + 3, total - 1):
+                if highs[j] >= highs[j - 1] and highs[j] >= highs[j + 1]:
+                    if poi_bottom - (2.8 * atr) <= highs[j] < poi_bottom:
+                        cand_highs.append(j)
 
-        post_swing_highs = [int(i) for i in raw_highs if anchor_idx + 4 <= int(i) <= total - 4]
-        for sh_idx in reversed(post_swing_highs):
-            sh_price = float(highs[sh_idx])
-            if sh_price < anchor_price and (sh_price - np.min(lows[sh_idx:])) >= (1.5 * atr):
-                if np.max(highs[sh_idx:]) <= sh_price + (0.05 * atr) and closes[-1] <= sh_price:
-                    top_val   = round(sh_price, decimals)
-                    bot_val   = round(sh_price - zone_thickness, decimals)
-                    zone_time = int(dates[sh_idx])
-                    break
+        if cand_highs:
+            idm_idx   = cand_highs[0]
+            idm_price = float(highs[idm_idx])
+            eq_highs  = [idx for idx in cand_highs if abs(highs[idx] - idm_price) <= 0.25 * atr]
+            liq_type  = "Range Liquidity (EQH)" if len(eq_highs) >= 2 else "Inducement (IDM)"
 
-        return [{
-            "type":      "BEAR_OB",
-            "top":       top_val,
-            "bottom":    bot_val,
-            "time":      zone_time,
-            "end_time":  int(dates[-1]),
-            "label":     f"SELL ZONE ({bot_val:.{decimals}f}–{top_val:.{decimals}f})",
-            "mitigated": False
-        }]
+            post_max = float(np.max(highs[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
+            swept    = bool(post_max > idm_price + (0.03 * atr))
+
+            band = 0.14 * atr
+            return {
+                "has_liquidity": True,
+                "swept":         swept,
+                "liq_type":      liq_type,
+                "liq_level":     round(idm_price, decimals),
+                "liq_idx":       int(idm_idx),
+                "liq_box": {
+                    "type":      "LIQ_ZONE",
+                    "top":       round(idm_price + band, decimals),
+                    "bottom":    round(idm_price - band, decimals),
+                    "time":      int(dates[idm_idx]),
+                    "end_time":  int(dates[-1]),
+                    "label":     f"$$$ {liq_type.upper()} ({idm_price:.{decimals}f})" + (" [SWEPT ✅]" if swept else ""),
+                    "mitigated": swept,
+                }
+            }
+
+    return {"has_liquidity": False, "swept": False, "liq_level": None, "liq_box": None, "liq_type": "Building..."}
 
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
@@ -458,86 +641,6 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     return sweeps[-5:]
 
 
-def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray,
-                          atr: float, anchor_idx: Optional[int] = None, lookback: int = 150) -> Dict:
-    closes = df['Close'].values
-    highs  = df['High'].values
-    lows   = df['Low'].values
-    total  = len(closes)
-    cutoff = max(0, total - lookback)
-
-    price_tolerance   = atr * DOUBLE_PATTERN_TOLERANCE_ATR
-    middle_prominence = atr * 0.45
-
-    result = {
-        "w_confirmed": False, "w_low1": None, "w_low2": None, "w_middle": None, "w_low2_idx": None,
-        "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None, "m_high2_idx": None,
-    }
-
-    recent_lows  = sorted([int(i) for i in swing_lows if cutoff <= int(i) < total])
-    recent_highs = sorted([int(i) for i in swing_highs if cutoff <= int(i) < total])
-
-    for k in range(len(recent_lows) - 1, 0, -1):
-        low2_idx = recent_lows[k]
-        low1_idx = recent_lows[k - 1]
-        if (low2_idx - low1_idx) > 65:
-            continue
-        if anchor_idx is not None and abs(low1_idx - anchor_idx) > 25 and abs(low2_idx - anchor_idx) > 25 and k < len(recent_lows) - 1:
-            continue
-
-        low1_price = lows[low1_idx]
-        low2_price = lows[low2_idx]
-
-        if abs(low1_price - low2_price) <= price_tolerance:
-            between_highs = [h for h in range(low1_idx + 1, low2_idx)]
-            if between_highs:
-                middle_idx   = max(between_highs, key=lambda h: highs[h])
-                middle_price = highs[middle_idx]
-                if middle_price - min(low1_price, low2_price) >= middle_prominence:
-                    post_closes = closes[low2_idx + 1:]
-                    post_lows   = lows[low2_idx + 1:]
-                    if len(post_closes) > 0 and np.max(post_closes) > middle_price and np.min(post_lows) >= min(low1_price, low2_price) - (0.1 * atr):
-                        result.update({
-                            "w_confirmed": True,
-                            "w_low1": float(low1_price),
-                            "w_low2": float(low2_price),
-                            "w_middle": float(middle_price),
-                            "w_low2_idx": int(low2_idx),
-                        })
-                        break
-
-    for k in range(len(recent_highs) - 1, 0, -1):
-        high2_idx = recent_highs[k]
-        high1_idx = recent_highs[k - 1]
-        if (high2_idx - high1_idx) > 65:
-            continue
-        if anchor_idx is not None and abs(high1_idx - anchor_idx) > 25 and abs(high2_idx - anchor_idx) > 25 and k < len(recent_highs) - 1:
-            continue
-
-        high1_price = highs[high1_idx]
-        high2_price = highs[high2_idx]
-
-        if abs(high1_price - high2_price) <= price_tolerance:
-            between_lows = [l for l in range(high1_idx + 1, high2_idx)]
-            if between_lows:
-                middle_idx   = min(between_lows, key=lambda l: lows[l])
-                middle_price = lows[middle_idx]
-                if max(high1_price, high2_price) - middle_price >= middle_prominence:
-                    post_closes = closes[high2_idx + 1:]
-                    post_highs  = highs[high2_idx + 1:]
-                    if len(post_closes) > 0 and np.min(post_closes) < middle_price and np.max(post_highs) <= max(high1_price, high2_price) + (0.1 * atr):
-                        result.update({
-                            "m_confirmed": True,
-                            "m_high1": float(high1_price),
-                            "m_high2": float(high2_price),
-                            "m_middle": float(middle_price),
-                            "m_high2_idx": int(high2_idx),
-                        })
-                        break
-
-    return result
-
-
 def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                              swing_order_override: Optional[int] = None,
                              state_key: Optional[str] = None,
@@ -549,6 +652,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     lows   = df['Low'].values
     closes = df['Close'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    total  = len(closes)
     decimals = profile.get('decimals', 5)
 
     atr = calculate_atr(df, 14)
@@ -573,332 +677,202 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     ema_50_array  = df['Close'].ewm(span=50, adjust=False).mean().values
     ema_200_array = df['Close'].ewm(span=200, adjust=False).mean().values
 
-    def compute_structural_cycles(seed_bullish: bool):
-        highs_set = set(raw_highs.tolist())
-        lows_set  = set(raw_lows.tolist())
+    # ── Track BOS (Break of Structure) & CHoCH (Change of Character) Events ──
+    highs_set = set(raw_highs.tolist())
+    lows_set  = set(raw_lows.tolist())
 
-        is_bull = seed_bullish
-        cycle_start_idx = 0
-        extreme_price = highs[0] if is_bull else lows[0]
+    seed_idx = min(50, total - 1)
+    is_bull  = bool(ema_50_array[seed_idx] > ema_200_array[seed_idx])
 
-        protected_low_idx   = 0
-        protected_high_idx  = 0
-        last_confirmed_low  = None
-        last_confirmed_high = None
+    active_sh_idx  = 0
+    active_sl_idx  = 0
+    broken_sh_set  = set()
+    broken_sl_set  = set()
+    buf            = FLIP_BUFFER_ATR * atr
 
-        buf = FLIP_BUFFER_ATR * atr
-        pending = 0
-        events = []
+    structure_breaks = []
 
-        for i in range(len(closes)):
-            confirmed_bar = i - swing_order
-            if confirmed_bar in highs_set:
-                last_confirmed_high = confirmed_bar
-            if confirmed_bar in lows_set:
-                last_confirmed_low = confirmed_bar
+    for i in range(total):
+        confirmed_bar = i - swing_order
+        if confirmed_bar in highs_set:
+            active_sh_idx = confirmed_bar
+        if confirmed_bar in lows_set:
+            active_sl_idx = confirmed_bar
 
-            if is_bull:
-                if highs[i] >= extreme_price:
-                    extreme_price = highs[i]
-                    if last_confirmed_low is not None and last_confirmed_low >= cycle_start_idx:
-                        protected_low_idx = last_confirmed_low
+        # Check Bullish Break of last confirmed Swing High
+        if active_sh_idx > 0 and active_sh_idx not in broken_sh_set and i > active_sh_idx:
+            sh_lvl = float(highs[active_sh_idx])
+            if closes[i] > sh_lvl + buf:
+                broken_sh_set.add(active_sh_idx)
+                kind = "BOS" if is_bull else "CHoCH"
+                # Origin low is the lowest point between the broken Swing High and the break candle i
+                origin_low_idx = active_sh_idx + int(np.argmin(lows[active_sh_idx : i + 1]))
+                is_bull = True
+                structure_breaks.append({
+                    "kind":        kind,
+                    "direction":   "BULLISH",
+                    "bullish":     True,
+                    "level":       round(sh_lvl, decimals),
+                    "swing_idx":   int(active_sh_idx),
+                    "start_time":  int(dates[active_sh_idx]),
+                    "break_idx":   int(i),
+                    "end_time":    int(dates[i]),
+                    "origin_idx":  int(origin_low_idx),
+                    "origin_time": int(dates[origin_low_idx]),
+                    "origin_price": float(lows[origin_low_idx]),
+                })
 
-                if protected_low_idx == cycle_start_idx and last_confirmed_low is not None and last_confirmed_low > cycle_start_idx:
-                    if highs[i] - lows[last_confirmed_low] >= ANCHOR_MIN_MOVE_ATR * atr:
-                        protected_low_idx = last_confirmed_low
+        # Check Bearish Break of last confirmed Swing Low
+        if active_sl_idx > 0 and active_sl_idx not in broken_sl_set and i > active_sl_idx:
+            sl_lvl = float(lows[active_sl_idx])
+            if closes[i] < sl_lvl - buf:
+                broken_sl_set.add(active_sl_idx)
+                kind = "BOS" if (not is_bull) else "CHoCH"
+                # Origin high is the highest point between the broken Swing Low and the break candle i
+                origin_high_idx = active_sl_idx + int(np.argmax(highs[active_sl_idx : i + 1]))
+                is_bull = False
+                structure_breaks.append({
+                    "kind":        kind,
+                    "direction":   "BEARISH",
+                    "bullish":     False,
+                    "level":       round(sl_lvl, decimals),
+                    "swing_idx":   int(active_sl_idx),
+                    "start_time":  int(dates[active_sl_idx]),
+                    "break_idx":   int(i),
+                    "end_time":    int(dates[i]),
+                    "origin_idx":  int(origin_high_idx),
+                    "origin_time": int(dates[origin_high_idx]),
+                    "origin_price": float(highs[origin_high_idx]),
+                })
 
-                struct_broke = closes[i] < (lows[protected_low_idx] - buf)
-                ema_crash = (
-                    closes[i] < min(ema_50_array[i], ema_200_array[i]) - (1.2 * atr)
-                    and (extreme_price - closes[i]) >= (3.0 * atr)
-                )
-                broke = struct_broke or ema_crash
-                pending = pending + 1 if broke else 0
-
-                if pending >= FLIP_CONFIRM_BARS:
-                    true_peak_high_idx = cycle_start_idx + int(np.argmax(highs[cycle_start_idx : i + 1]))
-                    is_bull = False
-                    cycle_start_idx = true_peak_high_idx
-                    extreme_price = lows[i]
-                    protected_high_idx = true_peak_high_idx
-                    pending = 0
-                    events.append({
-                        "flip_idx":     i,
-                        "flip_time":    int(dates[i]),
-                        "bullish":      False,
-                        "anchor_idx":   true_peak_high_idx,
-                        "anchor_time":  int(dates[true_peak_high_idx]),
-                        "anchor_price": float(highs[true_peak_high_idx]),
-                    })
-            else:
-                if lows[i] <= extreme_price:
-                    extreme_price = lows[i]
-                    if last_confirmed_high is not None and last_confirmed_high >= cycle_start_idx:
-                        protected_high_idx = last_confirmed_high
-
-                if protected_high_idx == cycle_start_idx and last_confirmed_high is not None and last_confirmed_high > cycle_start_idx:
-                    if highs[last_confirmed_high] - lows[i] >= ANCHOR_MIN_MOVE_ATR * atr:
-                        protected_high_idx = last_confirmed_high
-
-                struct_broke = closes[i] > (highs[protected_high_idx] + buf)
-                ema_surge = (
-                    closes[i] > max(ema_50_array[i], ema_200_array[i]) + (1.2 * atr)
-                    and (closes[i] - extreme_price) >= (3.0 * atr)
-                )
-                broke = struct_broke or ema_surge
-                pending = pending + 1 if broke else 0
-
-                if pending >= FLIP_CONFIRM_BARS:
-                    true_peak_low_idx = cycle_start_idx + int(np.argmin(lows[cycle_start_idx : i + 1]))
-                    is_bull = True
-                    cycle_start_idx = true_peak_low_idx
-                    extreme_price = highs[i]
-                    protected_low_idx = true_peak_low_idx
-                    pending = 0
-                    events.append({
-                        "flip_idx":     i,
-                        "flip_time":    int(dates[i]),
-                        "bullish":      True,
-                        "anchor_idx":   true_peak_low_idx,
-                        "anchor_time":  int(dates[true_peak_low_idx]),
-                        "anchor_price": float(lows[true_peak_low_idx]),
-                    })
-
-        return events, is_bull
-
-    seed_idx = min(50, len(closes) - 1)
-    seed_bullish = bool(ema_50_array[seed_idx] > ema_200_array[seed_idx])
-    cycle_events, is_bullish = compute_structural_cycles(seed_bullish)
-
-    matching_events = [e for e in cycle_events if e["bullish"] == is_bullish]
-    if matching_events:
-        latest_event       = matching_events[-1]
-        fresh_flip_time    = latest_event["flip_time"]
-        fresh_anchor_idx   = latest_event["anchor_idx"]
-        fresh_anchor_time  = latest_event["anchor_time"]
-        fresh_anchor_price = latest_event["anchor_price"]
+    # ── Select Active Recent Structure Break (Focus on the Recent Trend!) ───
+    if structure_breaks:
+        latest_break = structure_breaks[-1]
+        is_bullish   = latest_break["bullish"]
+        break_kind   = latest_break["kind"]
+        anchor_idx   = latest_break["origin_idx"]
+        anchor_time  = latest_break["origin_time"]
+        anchor_price = latest_break["origin_price"]
+        break_idx    = latest_break["break_idx"]
     else:
-        fresh_flip_time    = 0
-        fresh_anchor_idx   = int(np.argmin(lows)) if is_bullish else int(np.argmax(highs))
-        fresh_anchor_time  = int(dates[fresh_anchor_idx])
-        fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
+        is_bullish   = is_bull
+        break_kind   = "BOS"
+        anchor_idx   = int(np.argmin(lows[-80:])) + max(0, total - 80) if is_bullish else int(np.argmax(highs[-80:])) + max(0, total - 80)
+        anchor_time  = int(dates[anchor_idx])
+        anchor_price = float(lows[anchor_idx]) if is_bullish else float(highs[anchor_idx])
+        break_idx    = min(total - 1, anchor_idx + 5)
 
-    current_idx = len(closes) - 1
-    if (current_idx - fresh_anchor_idx) > 120:
-        dist_atr = abs(closes[-1] - fresh_anchor_price) / atr if atr > 0 else 0
-        if dist_atr > 5.5:
-            recent_start = max(0, current_idx - 110)
-            if is_bullish:
-                cand_lows = [
-                    idx for idx in raw_lows
-                    if recent_start <= idx <= current_idx - swing_order
-                    and (highs[idx:].max() - lows[idx]) >= (ANCHOR_MIN_MOVE_ATR * atr)
-                    and closes[-1] > lows[idx] + (1.0 * atr)
-                ]
-                if cand_lows:
-                    new_idx = min(cand_lows, key=lambda idx: lows[idx])
-                    fresh_anchor_idx   = int(new_idx)
-                    fresh_anchor_time  = int(dates[fresh_anchor_idx])
-                    fresh_anchor_price = float(lows[fresh_anchor_idx])
-            else:
-                cand_highs = [
-                    idx for idx in raw_highs
-                    if recent_start <= idx <= current_idx - swing_order
-                    and (highs[idx] - lows[idx:].min()) >= (ANCHOR_MIN_MOVE_ATR * atr)
-                    and closes[-1] < highs[idx] - (1.0 * atr)
-                ]
-                if cand_highs:
-                    new_idx = max(cand_highs, key=lambda idx: highs[idx])
-                    fresh_anchor_idx   = int(new_idx)
-                    fresh_anchor_time  = int(dates[fresh_anchor_idx])
-                    fresh_anchor_price = float(highs[fresh_anchor_idx])
+    # ── Detect Ranging Market (Equal Highs & Equal Lows Compression) ────────
+    recent_window = min(45, total)
+    recent_range  = float(np.max(highs[-recent_window:]) - np.min(lows[-recent_window:]))
+    bars_since_break = (total - 1) - break_idx
+    is_ranging = bool(recent_range < (2.0 * atr) and bars_since_break > 35)
 
-    # ── Strict Anti-Bounce Cycle & Anchor Lock ──────────────────────────────
-    if state_key:
-        st = CYCLE_STATE.get(state_key)
-        if st is None:
-            CYCLE_STATE[state_key] = {
-                "bullish":      is_bullish,
-                "flip_time":    fresh_flip_time,
-                "anchor_time":  fresh_anchor_time,
-                "anchor_price": fresh_anchor_price,
-                "confirmed":    False,
-            }
-            st = CYCLE_STATE[state_key]
-        else:
-            if is_bullish != st["bullish"] and fresh_flip_time > st["flip_time"]:
-                CYCLE_STATE[state_key] = {
-                    "bullish":      is_bullish,
-                    "flip_time":    fresh_flip_time,
-                    "anchor_time":  fresh_anchor_time,
-                    "anchor_price": fresh_anchor_price,
-                    "confirmed":    False,
-                }
-                st = CYCLE_STATE[state_key]
-            else:
-                is_bullish = st["bullish"]
-                locked_matches = np.where(dates == st["anchor_time"])[0]
-                locked_idx = int(locked_matches[0]) if len(locked_matches) > 0 else 0
-                if (current_idx - locked_idx) > 120 and fresh_anchor_time > st["anchor_time"]:
-                    st["anchor_time"]  = fresh_anchor_time
-                    st["anchor_price"] = fresh_anchor_price
-                    st["confirmed"]    = False
-
-        time_matches = np.where(dates == st["anchor_time"])[0]
-        if len(time_matches) > 0:
-            anchor_idx_found = int(time_matches[0])
-        else:
-            anchor_idx_found = int(np.searchsorted(dates, st["anchor_time"]))
-            anchor_idx_found = int(np.clip(anchor_idx_found, 0, len(closes) - 1))
-
-        if is_bullish:
-            post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
-            if lows[post_min_idx] < st["anchor_price"]:
-                anchor_idx_found   = post_min_idx
-                st["anchor_time"]  = int(dates[post_min_idx])
-                st["anchor_price"] = float(lows[post_min_idx])
-                st["confirmed"]    = False
-        else:
-            post_max_idx = anchor_idx_found + int(np.argmax(highs[anchor_idx_found:]))
-            if highs[post_max_idx] > st["anchor_price"]:
-                anchor_idx_found   = post_max_idx
-                st["anchor_time"]  = int(dates[post_max_idx])
-                st["anchor_price"] = float(highs[post_max_idx])
-                st["confirmed"]    = False
-
-        anchor_price = float(st["anchor_price"])
-        anchor_time  = int(st["anchor_time"])
-    else:
-        anchor_idx_found = fresh_anchor_idx
-        if is_bullish:
-            post_min_idx = anchor_idx_found + int(np.argmin(lows[anchor_idx_found:]))
-            if lows[post_min_idx] < lows[anchor_idx_found]:
-                anchor_idx_found = post_min_idx
-            anchor_price = float(lows[anchor_idx_found])
-        else:
-            post_max_idx = anchor_idx_found + int(np.argmax(highs[anchor_idx_found:]))
-            if highs[post_max_idx] > highs[anchor_idx_found]:
-                anchor_idx_found = post_max_idx
-            anchor_price = float(highs[anchor_idx_found])
-        anchor_time = int(dates[anchor_idx_found])
-
-    # ── Candidate vs CONFIRMED peak ─────────────────────────────────────────
-    if is_bullish:
-        move = float(highs[anchor_idx_found:].max() - anchor_price)
-        extreme_held = bool(lows[anchor_idx_found:].min() >= anchor_price - 1e-9)
-    else:
-        move = float(anchor_price - lows[anchor_idx_found:].min())
-        extreme_held = bool(highs[anchor_idx_found:].max() <= anchor_price + 1e-9)
-
-    peak_move_atr  = move / atr if atr > 0 else 0.0
-    peak_confirmed = bool(extreme_held and move >= ANCHOR_MIN_MOVE_ATR * atr)
-
-    if state_key and state_key in CYCLE_STATE:
-        if peak_confirmed:
-            CYCLE_STATE[state_key]["confirmed"] = True
-        elif CYCLE_STATE[state_key]["confirmed"] and extreme_held:
-            peak_confirmed = True
-
-    if not is_bullish:
-        cycle      = "BEARISH CYCLE (Peak M)"
-        anchor_idx = anchor_idx_found
-        if peak_confirmed:
-            pattern_name = f"Peak Formation High ({anchor_price:.{decimals}f})"
-            anchor_color = "rgba(255, 59, 59, 1)"
-        else:
-            pattern_name = f"Peak Candidate High ({anchor_price:.{decimals}f})"
-            anchor_color = "rgba(255, 59, 59, 0.45)"
-    else:
-        cycle      = "BULLISH CYCLE (Peak W)"
-        anchor_idx = anchor_idx_found
-        if peak_confirmed:
-            pattern_name = f"Peak Formation Low ({anchor_price:.{decimals}f})"
-            anchor_color = "rgba(59, 255, 130, 1)"
-        else:
-            pattern_name = f"Peak Candidate Low ({anchor_price:.{decimals}f})"
-            anchor_color = "rgba(59, 255, 130, 0.45)"
-
-    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
-    pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr, anchor_idx=anchor_idx)
-
-    zone_boxes = build_structural_entry_zone(
-        df, raw_highs, raw_lows, atr, is_bullish, int(anchor_idx), anchor_price, decimals
+    # ── Locate Origin POI Order Block + Mandatory 3-Candle FVG ──────────────
+    poi_data = find_origin_poi_with_fvg(
+        df, is_bullish, anchor_idx, break_idx, atr, decimals
     )
 
-    # ── Strictly Unbroken Anchor-Pinned Trendline ───────────────────────────
-    trendline_data = None
-    swing_pts_idx = raw_lows if is_bullish else raw_highs
-    swing_pts_idx = swing_pts_idx[(swing_pts_idx > anchor_idx) & (swing_pts_idx <= current_idx)]
+    # If the Origin POI was already completely violated (broken through), advance to most recent intact swing origin
+    poi_violated = False
+    if is_bullish and closes[-1] < poi_data["poi_bottom"] - (0.15 * atr):
+        poi_violated = True
+    elif (not is_bullish) and closes[-1] > poi_data["poi_top"] + (0.15 * atr):
+        poi_violated = True
 
-    if len(swing_pts_idx) >= 1 and current_idx > anchor_idx:
-        x1 = int(anchor_idx)
-        y1 = float(lows[x1]) if is_bullish else float(highs[x1])
-        best_x2 = None
-        best_slope = None
+    if poi_violated and len(structure_breaks) >= 2:
+        # Check if price is still respecting the macro origin
+        prev_same = [b for b in structure_breaks[:-1] if b["bullish"] == is_bullish]
+        if prev_same:
+            alt_b = prev_same[-1]
+            alt_poi = find_origin_poi_with_fvg(df, is_bullish, alt_b["origin_idx"], alt_b["break_idx"], atr, decimals)
+            if (is_bullish and closes[-1] >= alt_poi["poi_bottom"]) or ((not is_bullish) and closes[-1] <= alt_poi["poi_top"]):
+                poi_data     = alt_poi
+                anchor_idx   = alt_b["origin_idx"]
+                anchor_time  = alt_b["origin_time"]
+                anchor_price = alt_b["origin_price"]
+                break_idx    = alt_b["break_idx"]
 
-        for x2_cand in swing_pts_idx:
-            x2_cand = int(x2_cand)
-            if x2_cand <= x1 + 2:
-                continue
-            y2_cand = float(lows[x2_cand]) if is_bullish else float(highs[x2_cand])
-            slope_cand = (y2_cand - y1) / (x2_cand - x1)
+    poi_top    = poi_data["poi_top"]
+    poi_bottom = poi_data["poi_bottom"]
+    poi_idx    = poi_data["poi_idx"]
+    poi_time   = poi_data["poi_time"]
+    has_fvg    = poi_data["has_fvg"]
 
-            if is_bullish and slope_cand <= 0:
-                continue
-            if (not is_bullish) and slope_cand >= 0:
-                continue
+    # ── Confluence #4: Liquidity / Inducement Before POI ────────────────────
+    liq_data = find_liquidity_before_poi(
+        df, is_bullish, poi_idx, poi_top, poi_bottom, raw_highs, raw_lows, atr, decimals
+    )
 
-            indices = np.arange(x1 + 1, current_idx + 1)
-            line_vals = y1 + slope_cand * (indices - x1)
-            if is_bullish:
-                if np.any(closes[x1 + 1 : current_idx + 1] < line_vals - (0.15 * atr)):
-                    continue
-            else:
-                if np.any(closes[x1 + 1 : current_idx + 1] > line_vals + (0.15 * atr)):
-                    continue
-
-            if best_slope is None:
-                best_slope = slope_cand
-                best_x2 = x2_cand
-            elif is_bullish and slope_cand < best_slope:
-                best_slope = slope_cand
-                best_x2 = x2_cand
-            elif (not is_bullish) and slope_cand > best_slope:
-                best_slope = slope_cand
-                best_x2 = x2_cand
-
-        if best_x2 is not None and best_slope is not None:
-            end_level = float(y1 + best_slope * (current_idx - x1))
-            trendline_data = {
-                "start_time":  int(dates[x1]),
-                "start_level": float(y1),
-                "end_time":    int(dates[current_idx]),
-                "end_level":   end_level,
-                "start_idx":   int(x1),
-                "slope":       float(best_slope),
-                "type":        "Demand Trendline" if is_bullish else "Supply Trendline",
-                "color":       "rgba(59, 255, 130, 0.8)" if is_bullish else "rgba(255, 59, 59, 0.8)",
-            }
-
-    active_ob = zone_boxes[0]
+    # ── Build Chart Zone Boxes (Origin POI + FVG + Liquidity Zone) ──────────
+    zone_boxes = []
     if is_bullish:
-        poi_level = max(trendline_data["end_level"], active_ob["top"]) if trendline_data else active_ob["top"]
+        poi_label = f"BUY POI / OB ({poi_bottom:.{decimals}f}–{poi_top:.{decimals}f})" + (" + FVG ✅" if has_fvg else "")
+        zone_boxes.append({
+            "type":      "BULL_OB",
+            "top":       poi_top,
+            "bottom":    poi_bottom,
+            "time":      poi_time,
+            "end_time":  int(dates[-1]),
+            "label":     poi_label,
+            "mitigated": False,
+        })
     else:
-        poi_level = min(trendline_data["end_level"], active_ob["bottom"]) if trendline_data else active_ob["bottom"]
+        poi_label = f"SELL POI / OB ({poi_bottom:.{decimals}f}–{poi_top:.{decimals}f})" + (" + FVG ✅" if has_fvg else "")
+        zone_boxes.append({
+            "type":      "BEAR_OB",
+            "top":       poi_top,
+            "bottom":    poi_bottom,
+            "time":      poi_time,
+            "end_time":  int(dates[-1]),
+            "label":     poi_label,
+            "mitigated": False,
+        })
 
+    if has_fvg and poi_data["fvg_size"] > 0:
+        zone_boxes.append({
+            "type":      "BULL_FVG" if is_bullish else "BEAR_FVG",
+            "top":       poi_data["fvg_top"],
+            "bottom":    poi_data["fvg_bottom"],
+            "time":      poi_data["fvg_time"],
+            "end_time":  int(dates[-1]),
+            "label":     f"FVG ({poi_data['fvg_bottom']:.{decimals}f}–{poi_data['fvg_top']:.{decimals}f})",
+            "mitigated": False,
+        })
+
+    if liq_data.get("liq_box"):
+        zone_boxes.append(liq_data["liq_box"])
+
+    poi_level = poi_top if is_bullish else poi_bottom
     closed_price_val = float(closes[-1])
+
     targets = find_structural_targets(
-        df, raw_highs, raw_lows, is_bullish, closed_price_val, int(anchor_idx), anchor_price, atr, decimals
+        df, raw_highs, raw_lows, is_bullish, poi_level, int(anchor_idx), anchor_price, atr, decimals
     )
 
-    all_lines = [{
-        "level":      round(anchor_price, decimals),
-        "start_time": anchor_time,
-        "end_time":   int(dates[-1]),
-        "type":       pattern_name,
-        "color":      anchor_color,
-        "is_choch":   False
-    }]
+    # ── Build BOS / CHoCH Structure Lines + Target Lines ────────────────────
+    all_lines = []
+    recent_breaks = structure_breaks[-3:] if len(structure_breaks) >= 3 else structure_breaks
+    for sb in recent_breaks:
+        sb_bull  = sb["bullish"]
+        sb_kind  = sb["kind"]
+        sb_arrow = "▲" if sb_bull else "▼"
+        sb_color = (
+            "rgba(0, 230, 118, 0.95)" if (sb_bull and sb_kind == "CHoCH")
+            else "rgba(38, 166, 154, 0.85)" if sb_bull
+            else "rgba(255, 82, 82, 0.95)" if sb_kind == "CHoCH"
+            else "rgba(239, 83, 80, 0.85)"
+        )
+        all_lines.append({
+            "level":      sb["level"],
+            "start_time": sb["start_time"],
+            "end_time":   sb["end_time"],
+            "type":       f"{sb_kind} {sb_arrow} ({sb['level']:.{decimals}f})",
+            "color":      sb_color,
+            "is_struct":  True,
+            "is_choch":   sb_kind == "CHoCH",
+        })
+
     target_line_color = "rgba(255, 193, 7, 0.95)"
     for t in targets:
         all_lines.append({
@@ -907,7 +881,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "end_time":   t["end_time"],
             "type":       t["label"],
             "color":      target_line_color,
-            "is_choch":   True
+            "is_struct":  False,
+            "is_choch":   False,
         })
 
     step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
@@ -917,27 +892,39 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         {"time": int(dates[-1] + step_seconds * 16), "price": targets[-1]["level"], "label": targets[-1]["label"]},
     ]
 
+    if is_ranging:
+        cycle = "RANGING MARKET (Equal H/L)"
+    elif is_bullish:
+        cycle = f"BULLISH STRUCTURE ({break_kind} ▲)"
+    else:
+        cycle = f"BEARISH STRUCTURE ({break_kind} ▼)"
+
+    sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
+    structure_confirmed = bool(len(structure_breaks) > 0 and not is_ranging)
+
     return {
-        "cycle":           cycle,
-        "is_bullish":      is_bullish,
-        "lines":           all_lines,
-        "anchor":          anchor_price,
-        "anchor_idx":      int(anchor_idx),
-        "atr":             atr,
-        "peak_confirmed":  peak_confirmed,
-        "peak_move_atr":   round(peak_move_atr, 2),
-        "sweeps":          sweeps,
-        "w_confirmed":     pattern_info["w_confirmed"],
-        "m_confirmed":     pattern_info["m_confirmed"],
-        "pattern_info":    pattern_info,
-        "swing_order":     swing_order,
-        "raw_highs":       raw_highs.tolist(),
-        "raw_lows":        raw_lows.tolist(),
-        "trendline":       trendline_data,
-        "zone_boxes":      zone_boxes,
-        "poi_level":       round(poi_level, decimals),
-        "targets":         targets,
-        "projection_path": projection_path,
+        "cycle":               cycle,
+        "is_bullish":          is_bullish,
+        "is_ranging":          is_ranging,
+        "break_kind":          break_kind,
+        "latest_break":        structure_breaks[-1] if structure_breaks else None,
+        "lines":               all_lines,
+        "anchor":              anchor_price,
+        "anchor_idx":          int(anchor_idx),
+        "break_idx":           int(break_idx),
+        "atr":                 atr,
+        "peak_confirmed":      structure_confirmed,
+        "poi_data":            poi_data,
+        "liq_data":            liq_data,
+        "sweeps":              sweeps,
+        "swing_order":         swing_order,
+        "raw_highs":           raw_highs.tolist(),
+        "raw_lows":            raw_lows.tolist(),
+        "trendline":           None,
+        "zone_boxes":          zone_boxes,
+        "poi_level":           round(poi_level, decimals),
+        "targets":             targets,
+        "projection_path":     projection_path,
     }
 
 
@@ -946,11 +933,16 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                           htf_aligned: bool, decimals: int, pip_size: float,
                           state_key: Optional[str] = None) -> Dict:
     is_bullish     = ms["is_bullish"]
+    is_ranging     = ms.get("is_ranging", False)
+    break_kind     = ms.get("break_kind", "BOS")
+    latest_break   = ms.get("latest_break")
     peak_confirmed = ms["peak_confirmed"]
     anchor_price   = ms["anchor"]
     anchor_idx     = ms["anchor_idx"]
+    break_idx      = ms.get("break_idx", anchor_idx)
     atr            = ms["atr"]
-    trendline      = ms["trendline"]
+    poi_data       = ms["poi_data"]
+    liq_data       = ms["liq_data"]
     zone_boxes     = ms["zone_boxes"]
     poi_level      = ms["poi_level"]
     targets        = ms["targets"]
@@ -965,6 +957,40 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     active_ob = zone_boxes[0]
     t1_level  = targets[0]["level"]
     t2_level  = targets[1]["level"]
+
+    has_fvg       = bool(poi_data.get("has_fvg", False))
+    has_liquidity = bool(liq_data.get("has_liquidity", False))
+    liq_swept     = bool(liq_data.get("swept", False))
+    liq_type      = liq_data.get("liq_type", "Inducement")
+    liq_level     = liq_data.get("liq_level")
+    break_lvl_str = f"{latest_break['level']:.{decimals}f}" if latest_break else f"{anchor_price:.{decimals}f}"
+
+    # ── 0. RANGING MARKET FILTER ("Fold your hands and watch!") ─────────────
+    if is_ranging:
+        checklist = [
+            {"step": "1. Market Structure (BOS / CHoCH)", "done": False, "detail": "RANGING (Equal H/L)"},
+            {"step": "2. Origin POI + Fair Value Gap (FVG)", "done": False, "detail": "Wait for Breakout"},
+            {"step": "3. Liquidity (IDM / Range) Swept", "done": False, "detail": "Waiting"},
+            {"step": "4. 1H Rejection Close in POI", "done": False, "detail": "Fold Hands & Watch"},
+        ]
+        note = "⏸️ RANGING MARKET DETECTED (Equal Highs & Equal Lows): No clear directional structure. Fold your hands and wait for a clean BOS/CHoCH breakout."
+        return {
+            "signal":     "WAIT",
+            "confidence": 35,
+            "setup_name": "Ranging Market — Fold Hands & Watch",
+            "checklist":  checklist,
+            "execution_plan": {
+                "stage":             "AWAITING_PULLBACK",
+                "trigger_condition": note,
+                "planned_entry":     round(poi_level, decimals),
+                "planned_sl":        round(active_ob["bottom"] - 0.35 * atr if is_bullish else active_ob["top"] + 0.35 * atr, decimals),
+                "planned_tp1":       round(t1_level, decimals),
+                "planned_tp2":       round(t2_level, decimals),
+                "risk_reward":       0.0,
+            },
+            "entry_note":   note,
+            "trade_levels": None,
+        }
 
     # ── 1. CHECK IN-MEMORY FROZEN TRADE VAULT FIRST ─────────────────────────
     if state_key and state_key in ACTIVE_TRADES:
@@ -982,11 +1008,12 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         if closed_out:
             del ACTIVE_TRADES[state_key]
 
-    # ── 2. SCAN FOR A DETERMINISTIC, UNCLOSED SIGNAL CANDLE AFTER PEAK CONFIRMATION ──
+    # ── 2. SCAN FOR A DETERMINISTIC, UNCLOSED 1H SIGNAL CANDLE IN THE POI ───
     locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
+    poi_idx      = int(poi_data.get("poi_idx", anchor_idx))
 
-    if locked_trade is None and peak_confirmed and total > anchor_idx + 4:
-        search_start = max(anchor_idx + 4, total - 35)
+    if locked_trade is None and peak_confirmed and total > max(poi_idx, break_idx) + 1:
+        search_start = max(poi_idx + 2, break_idx + 1, total - 35)
         for k in range(search_start, total):
             c_open  = float(opens[k])
             c_close = float(closes[k])
@@ -1000,28 +1027,23 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             l_wick  = min(c_open, c_close) - c_low
 
             if is_bullish:
-                touched_ob = (min(c_low, p_low) <= active_ob["top"] + 0.15 * atr) and (c_close >= active_ob["bottom"])
-                touched_tl = False
-                tl_k = None
-                if trendline and k > trendline["start_idx"] + 2:
-                    tl_k = trendline["start_level"] + trendline["slope"] * (k - trendline["start_idx"])
-                    touched_tl = (min(c_low, p_low) <= tl_k + 0.20 * atr) and (c_close >= tl_k - 0.05 * atr)
-
-                if not (touched_ob or touched_tl):
+                # Price taps into the BUY POI Order Block (or attached FVG) and holds above OB bottom
+                tap_ceil   = max(active_ob["top"], poi_data.get("fvg_top", active_ob["top"]))
+                touched_ob = (min(c_low, p_low) <= tap_ceil + 0.12 * atr) and (c_close >= active_ob["bottom"] - 0.05 * atr)
+                if not touched_ob:
                     continue
 
-                zone_ref = tl_k if (touched_tl and tl_k is not None) else active_ob["top"]
                 is_bull_rej = (
                     ((c_close > c_open) and (body_sz >= 0.10 * atr))
-                    or (l_wick >= 0.20 * atr and c_close >= c_low + 0.55 * max(c_high - c_low, 1e-9))
+                    or (l_wick >= 0.18 * atr and c_close >= c_low + 0.55 * max(c_high - c_low, 1e-9))
                 )
-                not_chasing = (c_close - zone_ref) <= (0.65 * atr)
+                not_chasing = (c_close - active_ob["top"]) <= (0.65 * atr)
                 if not (is_bull_rej and not_chasing):
                     continue
 
                 entry_k = round(c_close, decimals)
-                floor_k = min(active_ob["bottom"], c_low, p_low) if touched_ob else min(tl_k, c_low, p_low)
-                sl_k    = round(min(floor_k - 0.30 * atr, entry_k - 0.50 * atr), decimals)
+                floor_k = min(active_ob["bottom"], c_low, p_low)
+                sl_k    = round(min(floor_k - 0.28 * atr, entry_k - 0.45 * atr), decimals)
                 risk_k  = max(abs(entry_k - sl_k), 1e-6)
 
                 t_list  = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, anchor_idx, anchor_price, atr, decimals)
@@ -1048,35 +1070,29 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     "target_1":    tp1_k,
                     "target_2":    tp2_k,
                     "risk_reward": rr_k,
-                    "zone_name":   "Demand Trendline" if touched_tl else "Buy Zone / OB",
+                    "zone_name":   "Origin Buy POI + FVG" if has_fvg else "Origin Buy POI",
                 }
                 if state_key:
                     ACTIVE_TRADES[state_key] = locked_trade
                 break
 
             else:
-                touched_ob = (max(c_high, p_high) >= active_ob["bottom"] - 0.15 * atr) and (c_close <= active_ob["top"])
-                touched_tl = False
-                tl_k = None
-                if trendline and k > trendline["start_idx"] + 2:
-                    tl_k = trendline["start_level"] + trendline["slope"] * (k - trendline["start_idx"])
-                    touched_tl = (max(c_high, p_high) >= tl_k - 0.20 * atr) and (c_close <= tl_k + 0.05 * atr)
-
-                if not (touched_ob or touched_tl):
+                tap_floor  = min(active_ob["bottom"], poi_data.get("fvg_bottom", active_ob["bottom"]))
+                touched_ob = (max(c_high, p_high) >= tap_floor - 0.12 * atr) and (c_close <= active_ob["top"] + 0.05 * atr)
+                if not touched_ob:
                     continue
 
-                zone_ref = tl_k if (touched_tl and tl_k is not None) else active_ob["bottom"]
                 is_bear_rej = (
                     ((c_close < c_open) and (body_sz >= 0.10 * atr))
-                    or (u_wick >= 0.20 * atr and c_close <= c_high - 0.55 * max(c_high - c_low, 1e-9))
+                    or (u_wick >= 0.18 * atr and c_close <= c_high - 0.55 * max(c_high - c_low, 1e-9))
                 )
-                not_chasing = (zone_ref - c_close) <= (0.65 * atr)
+                not_chasing = (active_ob["bottom"] - c_close) <= (0.65 * atr)
                 if not (is_bear_rej and not_chasing):
                     continue
 
                 entry_k = round(c_close, decimals)
-                ceil_k  = max(active_ob["top"], c_high, p_high) if touched_ob else max(tl_k, c_high, p_high)
-                sl_k    = round(max(ceil_k + 0.30 * atr, entry_k + 0.50 * atr), decimals)
+                ceil_k  = max(active_ob["top"], c_high, p_high)
+                sl_k    = round(max(ceil_k + 0.28 * atr, entry_k + 0.45 * atr), decimals)
                 risk_k  = max(abs(sl_k - entry_k), 1e-6)
 
                 t_list  = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, anchor_idx, anchor_price, atr, decimals)
@@ -1103,12 +1119,13 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     "target_1":    tp1_k,
                     "target_2":    tp2_k,
                     "risk_reward": rr_k,
-                    "zone_name":   "Supply Trendline" if touched_tl else "Sell Zone / OB",
+                    "zone_name":   "Origin Sell POI + FVG" if has_fvg else "Origin Sell POI",
                 }
                 if state_key:
                     ACTIVE_TRADES[state_key] = locked_trade
                 break
 
+    # ── 3. IF AN ACTIVE NON-REPAINTING TRADE IS LOCKED ──────────────────────
     if locked_trade:
         f_entry = locked_trade["entry"]
         f_sl    = locked_trade["stop_loss"]
@@ -1135,11 +1152,14 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         ]
 
         checklist = [
-            {"step": f"1. Peak Formation {'Low (W)' if is_bullish else 'High (M)'} Locked", "done": True, "detail": f"{anchor_price:.{decimals}f}"},
-            {"step": f"2. {'Pullback' if is_bullish else 'Rally'} Tap into {z_name}", "done": True, "detail": f"Tapped @ {f_entry:.{decimals}f} ✅"},
-            {"step": f"3. 1H {'Bullish' if is_bullish else 'Bearish'} Rejection Candle", "done": True, "detail": "Confirmed ✅"},
-            {"step": f"4. Reward-to-Risk ≥ 1:{MIN_ALLOWED_RR}", "done": True, "detail": f"1:{f_rr}"},
+            {"step": f"1. Market Structure ({break_kind} {'▲' if is_bullish else '▼'})", "done": True, "detail": f"Cleared {break_lvl_str} ✅"},
+            {"step": "2. Origin POI + Fair Value Gap (FVG)", "done": True, "detail": f"{active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f} ✅"},
+            {"step": f"3. Liquidity ({liq_type}) Swept", "done": True, "detail": f"Swept into POI ✅"},
+            {"step": f"4. 1H POI Rejection (RR 1:{f_rr})", "done": True, "detail": f"Entered @ {f_entry:.{decimals}f} ✅"},
         ]
+
+        # Base 85% + bonuses for FVG, Liquidity Sweep, and HTF alignment
+        active_conf = 80 + (5 if has_fvg else 0) + (5 if has_liquidity else 0) + (4 if htf_aligned else 0)
 
         trigger_note = (
             f"{'🟢 BUY' if is_bullish else '🔴 SELL'} EXECUTING: Locked Entry @ {f_entry:.{decimals}f} ({z_name}) | "
@@ -1148,8 +1168,8 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
         return {
             "signal":     f_dir,
-            "confidence": 88 if htf_aligned else 82,
-            "setup_name": f"MMM {z_name} Sniper",
+            "confidence": min(96, active_conf),
+            "setup_name": f"SMC A+ {z_name}",
             "checklist":  checklist,
             "execution_plan": {
                 "stage":             "TRADE_ACTIVE",
@@ -1171,36 +1191,46 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             }
         }
 
+    # ── 4. WAITING FOR POI TAP OR CONFIRMING IN POI ZONE ────────────────────
     live_high = max(float(full_df['High'].iloc[-1]), current_price)
     live_low  = min(float(full_df['Low'].iloc[-1]), current_price)
     live_open = float(full_df['Open'].iloc[-1])
 
     if is_bullish:
-        in_zone_now = (live_low <= poi_level + 0.15 * atr) and (current_price >= active_ob["bottom"] - 0.10 * atr)
-        planned_sl  = round(min(active_ob["bottom"], poi_level) - (0.35 * atr), decimals)
+        in_zone_now = (live_low <= poi_level + 0.12 * atr) and (current_price >= active_ob["bottom"] - 0.10 * atr)
+        planned_sl  = round(min(active_ob["bottom"], poi_level) - (0.30 * atr), decimals)
         risk        = max(abs(poi_level - planned_sl), 1e-6)
         best_rr     = round(max(abs(t1_level - poi_level), abs(t2_level - poi_level)) / risk, 2)
 
+        liq_detail = (
+            f"Swept {liq_level:.{decimals}f} ✅" if (has_liquidity and (liq_swept or in_zone_now))
+            else f"Sweep {liq_level:.{decimals}f} first" if has_liquidity
+            else "Building above POI"
+        )
+
         checklist = [
-            {"step": "1. Peak Formation Low (W) Locked", "done": bool(peak_confirmed), "detail": f"{anchor_price:.{decimals}f}"},
-            {"step": "2. Pullback Tap into Buy Zone", "done": bool(in_zone_now), "detail": "IN ZONE 🎯" if in_zone_now else f"Wait for {poi_level:.{decimals}f}"},
-            {"step": "3. 1H Bullish Rejection Close", "done": False, "detail": "Watch 1H Close!" if in_zone_now else "Waiting"},
-            {"step": f"4. Reward-to-Risk ≥ 1:{MIN_ALLOWED_RR}", "done": bool(best_rr >= MIN_ALLOWED_RR), "detail": f"1:{best_rr}"},
+            {"step": f"1. Bullish {break_kind} ▲ Structure", "done": bool(peak_confirmed), "detail": f"Cleared {break_lvl_str}"},
+            {"step": "2. Origin Buy POI + FVG", "done": bool(has_fvg), "detail": f"{poi_level:.{decimals}f}" + (" (FVG ✅)" if has_fvg else " (No FVG)")},
+            {"step": f"3. {liq_type} Before POI", "done": bool(has_liquidity and (liq_swept or in_zone_now)), "detail": liq_detail},
+            {"step": f"4. 1H Rejection in POI (RR 1:{best_rr})", "done": False, "detail": "Watch 1H Close!" if in_zone_now else f"Wait for {poi_level:.{decimals}f}"},
         ]
 
         if in_zone_now:
             stage = "IN_ZONE_CONFIRMING"
             trig_lvl = round(max(live_open, poi_level), decimals)
-            note = f"🎯 PRICE IS IN BUY ZONE ({poi_level:.{decimals}f})! Wait for the current 1H candle to close GREEN above {trig_lvl:.{decimals}f} to lock BUY entry."
+            note = f"🎯 PRICE TAPPED BUY POI ({poi_level:.{decimals}f})! Wait for the current 1H candle to close GREEN above {trig_lvl:.{decimals}f} to lock BUY."
         else:
             stage = "AWAITING_PULLBACK"
             pips_away = round(abs(current_price - poi_level) / max(pip_size, 1e-6), 1)
-            note = f"⏳ NO TRADE YET: Price is {pips_away} pips away from Buy Zone ({poi_level:.{decimals}f}). Do not enter in mid-air."
+            liq_hint = f" Watch for price to sweep {liq_type} ({liq_level:.{decimals}f}) into the POI." if has_liquidity and not liq_swept else ""
+            note = f"⏳ AWAITING PULLBACK TO ORIGIN POI: Price is {pips_away} pips above Buy POI ({poi_level:.{decimals}f}).{liq_hint}"
+
+        wait_conf = 68 if in_zone_now else (56 if (has_fvg and has_liquidity) else 48)
 
         return {
             "signal":     "WAIT",
-            "confidence": 68 if in_zone_now else 50,
-            "setup_name": "MMM Bullish Sniper — " + ("In Buy Zone" if in_zone_now else "Awaiting Pullback"),
+            "confidence": wait_conf,
+            "setup_name": "SMC Bullish A+ — " + ("In Buy POI" if in_zone_now else "Awaiting POI Tap"),
             "checklist":  checklist,
             "execution_plan": {
                 "stage":             stage,
@@ -1216,31 +1246,40 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         }
 
     else:
-        in_zone_now = (live_high >= poi_level - 0.15 * atr) and (current_price <= active_ob["top"] + 0.10 * atr)
-        planned_sl  = round(max(active_ob["top"], poi_level) + (0.35 * atr), decimals)
+        in_zone_now = (live_high >= poi_level - 0.12 * atr) and (current_price <= active_ob["top"] + 0.10 * atr)
+        planned_sl  = round(max(active_ob["top"], poi_level) + (0.30 * atr), decimals)
         risk        = max(abs(planned_sl - poi_level), 1e-6)
         best_rr     = round(max(abs(poi_level - t1_level), abs(poi_level - t2_level)) / risk, 2)
 
+        liq_detail = (
+            f"Swept {liq_level:.{decimals}f} ✅" if (has_liquidity and (liq_swept or in_zone_now))
+            else f"Sweep {liq_level:.{decimals}f} first" if has_liquidity
+            else "Building below POI"
+        )
+
         checklist = [
-            {"step": "1. Peak Formation High (M) Locked", "done": bool(peak_confirmed), "detail": f"{anchor_price:.{decimals}f}"},
-            {"step": "2. Rally Tap into Sell Zone", "done": bool(in_zone_now), "detail": "IN ZONE 🎯" if in_zone_now else f"Wait for {poi_level:.{decimals}f}"},
-            {"step": "3. 1H Bearish Rejection Close", "done": False, "detail": "Watch 1H Close!" if in_zone_now else "Waiting"},
-            {"step": f"4. Reward-to-Risk ≥ 1:{MIN_ALLOWED_RR}", "done": bool(best_rr >= MIN_ALLOWED_RR), "detail": f"1:{best_rr}"},
+            {"step": f"1. Bearish {break_kind} ▼ Structure", "done": bool(peak_confirmed), "detail": f"Cleared {break_lvl_str}"},
+            {"step": "2. Origin Sell POI + FVG", "done": bool(has_fvg), "detail": f"{poi_level:.{decimals}f}" + (" (FVG ✅)" if has_fvg else " (No FVG)")},
+            {"step": f"3. {liq_type} Before POI", "done": bool(has_liquidity and (liq_swept or in_zone_now)), "detail": liq_detail},
+            {"step": f"4. 1H Rejection in POI (RR 1:{best_rr})", "done": False, "detail": "Watch 1H Close!" if in_zone_now else f"Wait for {poi_level:.{decimals}f}"},
         ]
 
         if in_zone_now:
             stage = "IN_ZONE_CONFIRMING"
             trig_lvl = round(min(live_open, poi_level), decimals)
-            note = f"🎯 PRICE IS IN SELL ZONE ({poi_level:.{decimals}f})! Wait for the current 1H candle to close RED below {trig_lvl:.{decimals}f} to lock SELL entry."
+            note = f"🎯 PRICE TAPPED SELL POI ({poi_level:.{decimals}f})! Wait for the current 1H candle to close RED below {trig_lvl:.{decimals}f} to lock SELL."
         else:
             stage = "AWAITING_PULLBACK"
             pips_away = round(abs(poi_level - current_price) / max(pip_size, 1e-6), 1)
-            note = f"⏳ NO TRADE YET: Price is {pips_away} pips away from Sell Zone ({poi_level:.{decimals}f}). Do not short in mid-air."
+            liq_hint = f" Watch for price to sweep {liq_type} ({liq_level:.{decimals}f}) into the POI." if has_liquidity and not liq_swept else ""
+            note = f"⏳ AWAITING RALLY TO ORIGIN POI: Price is {pips_away} pips below Sell POI ({poi_level:.{decimals}f}).{liq_hint}"
+
+        wait_conf = 68 if in_zone_now else (56 if (has_fvg and has_liquidity) else 48)
 
         return {
             "signal":     "WAIT",
-            "confidence": 68 if in_zone_now else 50,
-            "setup_name": "MMM Bearish Sniper — " + ("In Sell Zone" if in_zone_now else "Awaiting Rally"),
+            "confidence": wait_conf,
+            "setup_name": "SMC Bearish A+ — " + ("In Sell POI" if in_zone_now else "Awaiting POI Tap"),
             "checklist":  checklist,
             "execution_plan": {
                 "stage":             stage,
@@ -1298,19 +1337,19 @@ async def analyze(req: AnalysisRequest):
         zone_boxes     = ms.get('zone_boxes', [])
         targets        = ms.get('targets', [])
 
-        bias_str = 'BULLISH' if cycle.startswith('BULLISH') else 'BEARISH'
+        bias_str = 'NEUTRAL' if ms.get('is_ranging') else ('BULLISH' if ms['is_bullish'] else 'BEARISH')
 
         htf_aligned = False
+        htf_bias_str = "NEUTRAL"
         if req.htf_candles and len(req.htf_candles) > 50:
             htf_df = process_live_candles(req.htf_candles)
             if htf_df is not None:
-                htf_ema50  = safe_float(EMAIndicator(close=htf_df['Close'], window=50).ema_indicator().iloc[-1])
-                htf_ema200 = safe_float(EMAIndicator(close=htf_df['Close'], window=200).ema_indicator().iloc[-1])
-                htf_aligned = (cycle.startswith('BULLISH') and htf_ema50 > htf_ema200) or \
-                              (cycle.startswith('BEARISH') and htf_ema50 < htf_ema200)
+                htf_ms = analyze_market_structure(htf_df, profile, drop_forming=False)
+                htf_bias_str = "NEUTRAL" if htf_ms.get("is_ranging") else ("BULLISH" if htf_ms["is_bullish"] else "BEARISH")
+                htf_aligned = (htf_bias_str == bias_str) and (bias_str != "NEUTRAL")
         else:
-            htf_aligned = (cycle.startswith('BULLISH') and ema_50 > ema_200) or \
-                          (cycle.startswith('BEARISH') and ema_50 < ema_200)
+            htf_aligned = (ms['is_bullish'] and ema_50 > ema_200) or ((not ms['is_bullish']) and ema_50 < ema_200)
+            htf_bias_str = bias_str if htf_aligned else "NEUTRAL"
 
         eval_df = df.iloc[:-1].reset_index(drop=True) if (DROP_FORMING_CANDLE and data_source == "LIVE_NODE_DATA" and len(df) > 60) else df
         entry_eval = evaluate_entry_signal(
@@ -1354,8 +1393,8 @@ async def analyze(req: AnalysisRequest):
                 "projection_path": ms["projection_path"],
             },
             "mtf_confluence": [
-                {"tf": "4H", "bias": "BULLISH" if htf_aligned and cycle.startswith("BULLISH") else "BEARISH" if htf_aligned else "NEUTRAL", "strength": 85 if htf_aligned else 45},
-                {"tf": "1H", "bias": bias_str, "strength": 80 if peak_confirmed else 55},
+                {"tf": "4H", "bias": htf_bias_str, "strength": 88 if htf_aligned else 50},
+                {"tf": "1H", "bias": bias_str, "strength": 85 if (peak_confirmed and ms["poi_data"]["has_fvg"]) else 60},
             ],
             "tradeSetup":     entry_eval["trade_levels"],
             "dataSource":     data_source,
@@ -1381,11 +1420,12 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v6.1 (Bounds-Safe Deterministic Sniper)",
+            "✅ ENGINE VERSION": "AuraBrain v7.0 (SMC 4-Confluence A+ Sniper)",
             "📊 INSTRUMENT":     req.currency,
-            "🎯 CYCLE":          ms['cycle'],
-            "⚓ ANCHOR":          ms['anchor'],
-            "🎯 POI ZONE":       ms['poi_level'],
+            "🎯 STRUCTURE":      ms['cycle'],
+            "⚓ ORIGIN ANCHOR":  ms['anchor'],
+            "📦 POI + FVG":      ms['poi_data'],
+            "💧 LIQUIDITY":      ms['liq_data'],
             "🎯 TARGETS":        ms.get('targets', []),
             "🔒 ACTIVE TRADES":  ACTIVE_TRADES,
         }
