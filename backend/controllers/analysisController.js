@@ -1,14 +1,11 @@
 const axios = require('axios');
 const Candle = require('../models/Candle');
 const NewsEvent = require('../models/NewsEvent');
+const Trade = require('../models/Trade');
 const { openPaperTradeIfEligible } = require('./tradeController');
 
-// ⚙️ CONFIGURATION
 const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
 
-// ==========================================
-// 🕵️ NEWS ANALYZER (UNCHANGED LEGACY)
-// ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
         if (!targetEvent) return null;
@@ -67,9 +64,6 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     }
 };
 
-// ==========================================
-// 🚀 MAIN CONTROLLER (MULTI-TIMEFRAME MATRIX)
-// ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
         const { timeframe, eventName, currency, symbol } = req.body;
@@ -88,8 +82,6 @@ exports.analyzePattern = async (req, res) => {
                 });
             }
         }
-
-        console.log(`⏱️ Fetching 1H and 4H Data Matrix for ${targetSymbol}...`);
 
         const [raw1HCandles, raw4HCandles] = await Promise.all([
              Candle.find({ timeframe: '1h', symbol: targetSymbol }).sort({ time: -1 }).limit(3000).lean(),
@@ -119,8 +111,6 @@ exports.analyzePattern = async (req, res) => {
             forecast: { $ne: null }
         }).sort({ time: -1 }).lean();
 
-        console.log(`📡 Contacting SMC Brain for ${targetSymbol}: [1H: ${clean1HCandles.length}] + [4H: ${clean4HCandles.length}] + News...`);
-
         try {
             const pythonResponse = await axios.post(PYTHON_API_URL, {
                 timeframe: timeframe || '1h',
@@ -133,23 +123,44 @@ exports.analyzePattern = async (req, res) => {
 
             const aiResult = pythonResponse.data;
 
-            // Open a new paper trade if eligible, OR retrieve the currently OPEN paper trade on this symbol
+            // Check if there is an existing OPEN trade with bad legacy RR (< 1.5) or opposite cycle direction
+            const existingOpen = await Trade.findOne({ symbol: targetSymbol, status: 'OPEN' });
+            if (existingOpen) {
+                const risk = Math.max(Math.abs(existingOpen.entry - existingOpen.sl), 1e-6);
+                const rr   = Math.abs(existingOpen.tp - existingOpen.entry) / risk;
+                const cycleIsBull = (aiResult.trend || '').toUpperCase().includes('BULLISH');
+                const tradeIsBuy  = existingOpen.action === 'Buy';
+
+                if (rr < 1.5 || cycleIsBull !== tradeIsBuy) {
+                    // Purge stale legacy mid-air trade (like USD/JPY RR 1.09)
+                    await Trade.deleteOne({ _id: existingOpen._id });
+                }
+            }
+
             const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
 
-            // If there is an active OPEN trade on this symbol, keep its Entry/SL/TP pinned on the chart!
             if (activeTrade && activeTrade.status === 'OPEN') {
                 const risk = Math.max(Math.abs(activeTrade.entry - activeTrade.sl), 1e-6);
-                const rr   = parseFloat((Math.abs(activeTrade.tp - activeTrade.entry) / risk).toFixed(2));
-                aiResult.signal     = activeTrade.action.toUpperCase(); // 'BUY' or 'SELL'
-                aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 72);
+                const t1   = activeTrade.tp;
+                const t2   = aiResult.keyLevels?.target2 || activeTrade.tp;
+                const rr   = parseFloat((Math.max(Math.abs(t1 - activeTrade.entry), Math.abs(t2 - activeTrade.entry)) / risk).toFixed(2));
+
+                aiResult.signal     = activeTrade.action.toUpperCase();
+                aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 75);
                 aiResult.tradeSetup = {
                     entry:       activeTrade.entry,
                     stop_loss:   activeTrade.sl,
-                    take_profit: activeTrade.tp,
-                    target_1:    activeTrade.tp,
-                    target_2:    aiResult.keyLevels?.target2 || activeTrade.tp,
+                    take_profit: t1,
+                    target_1:    t1,
+                    target_2:    t2,
                     risk_reward: rr
                 };
+
+                // Align the projected arrow directly from current price -> Target 1 -> Target 2 while trade is active!
+                if (aiResult.visuals && Array.isArray(aiResult.visuals.projection_path) && aiResult.visuals.projection_path.length >= 3) {
+                    aiResult.visuals.projection_path[1].price = t1;
+                    aiResult.visuals.projection_path[2].price = t2;
+                }
             }
 
             return res.json(aiResult);

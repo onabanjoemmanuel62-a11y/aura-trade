@@ -1,15 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, Lock, Target, Shield, Crosshair, Calculator, Layers } from 'lucide-react';
+import { TrendingUp, Activity, RefreshCw, History, AlertTriangle, Clock, Lock, Shield, Crosshair, Calculator, Layers } from 'lucide-react';
 import axios from 'axios';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-const ENTRY_THRESHOLD   = 65;
-const EXIT_THRESHOLD    = 50;
-const FLIP_THRESHOLD    = 72;
-const LOCK_EXPIRY_HOURS = 4;
+const ENTRY_THRESHOLD = 65;
+const EXIT_THRESHOLD  = 50;
+const FLIP_THRESHOLD  = 72;
 
-// ── Session detection (UTC) ──
 const SESSIONS = [
   { name: 'TOKYO',    start: 0,  end: 9,  color: '#7c3aed' },
   { name: 'LONDON',   start: 8,  end: 17, color: '#0ea5e9' },
@@ -25,7 +23,6 @@ const getActiveSession = () => {
   }) || null;
 };
 
-// ── Accurate Lot Size Calculator (Handles Forex, JPY, and Gold XAU/USD) ──
 const calcLotSize = (balance, riskPct, entryPrice, slPrice, pipValue = 10) => {
   if (!balance || !entryPrice || !slPrice) return 0;
   const riskAmount = (balance * riskPct) / 100;
@@ -34,13 +31,10 @@ const calcLotSize = (balance, riskPct, entryPrice, slPrice, pipValue = 10) => {
 
   let slPips;
   if (entryPrice > 500) {
-    // Gold (XAU/USD): 1 pip = $0.10 move (or $1.00 per standard lot per $0.01)
     slPips = priceDiff * 10;
   } else if (entryPrice > 20) {
-    // JPY pairs: 1 pip = 0.01
     slPips = priceDiff * 100;
   } else {
-    // Standard Forex pairs: 1 pip = 0.0001
     slPips = priceDiff * 10000;
   }
 
@@ -53,15 +47,13 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const [analysis,      setAnalysis]      = useState(null);
   const [upcomingNews,  setUpcomingNews]  = useState([]);
   const [now,           setNow]           = useState(Date.now());
-  const [activeTab,     setActiveTab]     = useState('signal'); // 'signal' | 'risk' | 'mtf'
+  const [activeTab,     setActiveTab]     = useState('signal');
   const [activeSession, setActiveSession] = useState(getActiveSession());
 
-  // Risk calculator state
   const [balance,  setBalance]  = useState(10000);
   const [riskPct,  setRiskPct]  = useState(1);
   const [pipValue, setPipValue] = useState(10);
 
-  // Per-pair signal lock memory so EUR/USD never bleeds onto USD/JPY or Gold
   const locksByPairRef = useRef({});
   const [displayState, setDisplayState] = useState({
     type: 'WAIT',
@@ -91,7 +83,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     let nextType = 'WAIT';
     let locked   = false;
 
-    // ONLY lock BUY or SELL when Python actually fires BUY or SELL with a valid tradeSetup!
     if ((rawSignal === 'BUY' || rawSignal === 'SELL') && hasValidTradeSetup && rawConf >= ENTRY_THRESHOLD) {
       nextType = rawSignal;
       locked   = true;
@@ -120,7 +111,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     setDisplayState(newState);
   };
 
-  // Fetch upcoming High-Impact USD News (for countdown alert banner ONLY — never overwrites chart analysis!)
   const fetchDailyNews = async () => {
     try {
       const res   = await axios.get(`${API_URL}/api/news`);
@@ -154,7 +144,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     return `${h}h ${String(m).padStart(2, '0')}m ${String(sec).padStart(2, '0')}s`;
   };
 
-  // Color & Label Logic: Never show "SELL" on a Bullish Wait!
   const signalColor = displayState.type === 'BUY'  ? '#00e676'
                     : displayState.type === 'SELL' ? '#ff4757'
                     : displayState.bias === 'BULLISH' ? '#00e676'
@@ -182,9 +171,10 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   );
   const riskAmount = ((balance * riskPct) / 100).toFixed(2);
 
-  const mtfData = analysis?.mtf_confluence || [];
-  const target1 = analysis?.keyLevels?.target1 || analysis?.tradeSetup?.target_1;
-  const target2 = analysis?.keyLevels?.target2 || analysis?.tradeSetup?.target_2;
+  const mtfData  = analysis?.mtf_confluence || [];
+  const poiLevel = analysis?.keyLevels?.poi;
+  const target1  = analysis?.keyLevels?.target1 || analysis?.tradeSetup?.target_1;
+  const target2  = analysis?.keyLevels?.target2 || analysis?.tradeSetup?.target_2;
 
   const tabBtnStyle = (id) => ({
     flex: 1, padding: '7px 4px', background: activeTab === id ? 'rgba(240,180,41,0.1)' : 'transparent',
@@ -223,7 +213,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             </div>
           ) : (
             <div style={{ fontSize: 9, background: 'rgba(240,180,41,0.1)', color: '#f0b429', border: '1px solid rgba(240,180,41,0.3)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-              SCANNING
+              WAITING FOR ZONE
             </div>
           )}
           <button onClick={onRefresh} disabled={isBusy} style={{ background: 'rgba(255,255,255,0.05)', border: 'none', color: '#9ca3af', borderRadius: 5, cursor: 'pointer', padding: 5, display: 'flex', alignItems: 'center' }}>
@@ -239,7 +229,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         <button style={tabBtnStyle('mtf')}    onClick={() => setActiveTab('mtf')}><Layers size={10} style={{ display: 'inline', marginRight: 4 }} />MTF</button>
       </div>
 
-      {/* Loading state */}
       {isBusy && !analysis ? (
         <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 8, color: '#6b7a8d' }}>
           <RefreshCw size={18} style={{ animation: 'spin 1s linear infinite' }} />
@@ -251,12 +240,12 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           {/* ─── TAB: SIGNAL ─── */}
           {activeTab === 'signal' && (
             <>
-              {/* Probability ring */}
+              {/* Readiness ring + Strategy Name */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: 'rgba(255,255,255,0.02)', padding: 12, borderRadius: 8, border: '1px solid rgba(255,255,255,0.04)', flexShrink: 0 }}>
-                <div style={{ position: 'relative', width: 76, height: 76, flexShrink: 0 }}>
-                  <svg width="76" height="76" style={{ transform: 'rotate(-90deg)' }}>
-                    <circle cx="38" cy="38" r="32" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
-                    <circle cx="38" cy="38" r="32" stroke={signalColor} strokeWidth="6" fill="transparent"
+                <div style={{ position: 'relative', width: 72, height: 72, flexShrink: 0 }}>
+                  <svg width="72" height="72" style={{ transform: 'rotate(-90deg)' }}>
+                    <circle cx="36" cy="36" r="30" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
+                    <circle cx="36" cy="36" r="30" stroke={signalColor} strokeWidth="6" fill="transparent"
                       strokeDasharray={circumference} strokeDashoffset={dashOffset} strokeLinecap="round"
                       style={{ transition: 'stroke-dashoffset 0.8s ease-in-out' }} />
                   </svg>
@@ -267,29 +256,37 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   </div>
                 </div>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2 }}>SETUP READINESS</div>
-                  <div style={{ fontSize: 26, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
+                  <div style={{ fontSize: 8, color: '#f0b429', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2, fontWeight: 700 }}>
+                    STRATEGY: MMM PEAK & ZONE SNIPER
+                  </div>
+                  <div style={{ fontSize: 24, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
                   <div style={{ fontSize: 11, color: signalColor, fontWeight: 700, letterSpacing: 1.5, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
                     {statusLabel}
                   </div>
                 </div>
               </div>
 
-              {/* Structural Target Roadmap (Always visible so traders see Target 1 & Target 2 clearly) */}
+              {/* Planned Entry Zone + Targets Roadmap (Shown while waiting for price to tap the zone) */}
               {(target1 || target2) && !analysis?.tradeSetup && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, flexShrink: 0 }}>
-                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '7px 8px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
-                    <div style={{ fontSize: 9, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1 🎯</div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target1 ?? '—'}</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 5, flexShrink: 0 }}>
+                  <div style={{ background: 'rgba(41,98,255,0.10)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(41,98,255,0.35)' }}>
+                    <div style={{ fontSize: 8, color: '#82b1ff', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>
+                      {displayState.bias === 'BULLISH' ? 'BUY ZONE 🎯' : 'SELL ZONE 🎯'}
+                    </div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{poiLevel ?? '—'}</div>
                   </div>
-                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '7px 8px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
-                    <div style={{ fontSize: 9, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2 🚀</div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target2 ?? '—'}</div>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 8, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1</div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target1 ?? '—'}</div>
+                  </div>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 8, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2 🚀</div>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target2 ?? '—'}</div>
                   </div>
                 </div>
               )}
 
-              {/* Active Trade Setup Levels (Shown immediately when BUY or SELL triggers) */}
+              {/* Active Trade Setup Levels (Shown when BUY or SELL triggers) */}
               {analysis?.tradeSetup && (
                 <div style={{ background: 'rgba(0,0,0,0.32)', padding: 10, borderRadius: 7, border: `1px solid ${signalColor}40`, flexShrink: 0 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
@@ -312,22 +309,21 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                       <div style={{ fontSize: 10, color: '#b9f6ca', fontFamily: "'Space Mono', monospace" }}>{analysis.tradeSetup.target_2 || analysis.tradeSetup.take_profit}</div>
                     </div>
                   </div>
-                  <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#9ca3af', fontFamily: "'Space Mono', monospace" }}>
-                    RR 1:{analysis.tradeSetup.risk_reward}
+                  <div style={{ textAlign: 'center', marginTop: 6, fontSize: 10, color: '#00e676', fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+                    REWARD / RISK 1:{analysis.tradeSetup.risk_reward}
                   </div>
                 </div>
               )}
 
-              {/* Strategy logic (Fixed clipping & increased height so all lines read cleanly) */}
-              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 110, display: 'flex', flexDirection: 'column' }}>
+              {/* 4-Step Strategy Checklist */}
+              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 120, display: 'flex', flexDirection: 'column' }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
-                  <History size={12} /> STRATEGY LOGIC
+                  <History size={12} /> 4-STEP ENTRY CHECKLIST
                 </div>
                 <div style={{ fontSize: 11, color: '#d1d5db', lineHeight: 1.55, overflowY: 'auto', paddingTop: 2, paddingRight: 4 }}>
                   {analysis?.reasoning && Array.isArray(analysis.reasoning)
                     ? analysis.reasoning.map((r, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 5 }}>
-                          <span style={{ color: signalColor, lineHeight: 1.4 }}>•</span>
+                        <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 6 }}>
                           <span style={{ flex: 1 }}>{r}</span>
                         </div>
                       ))
@@ -335,7 +331,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
               </div>
 
-              {/* News alerts */}
               {upcomingNews.length > 0 && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 5, color: '#ef5350', fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
@@ -391,10 +386,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   </div>
                 </div>
               )}
-
-              <div style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace", lineHeight: 1.5, marginTop: 4 }}>
-                * Automatically scales pip calculation for Forex Majors, JPY pairs, and Gold (XAU/USD).
-              </div>
             </div>
           )}
 
@@ -452,7 +443,6 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   );
 };
 
-// ── Risk input row ──
 const RiskInput = ({ label, value, onChange, min, max, step, decimals = 0 }) => (
   <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
     <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -469,7 +459,6 @@ const RiskInput = ({ label, value, onChange, min, max, step, decimals = 0 }) => 
   </div>
 );
 
-// ── Result display box ──
 const ResultBox = ({ label, value, color, unit }) => (
   <div style={{ background: 'rgba(0,0,0,0.3)', padding: '10px 12px', borderRadius: 6, border: `1px solid ${color}25`, textAlign: 'center' }}>
     <div style={{ fontSize: 9, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>{label}</div>
