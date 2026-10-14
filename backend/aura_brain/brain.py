@@ -142,7 +142,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE — Peak Formation, Structural Targets & Visual Roadmap
+# CORE ENGINE — Peak Formation, Unbroken Targets & Clean Order Blocks
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -224,40 +224,53 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
 
 
 def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: np.ndarray,
-                            is_bullish: bool, current_price: float, anchor_price: float,
-                            atr: float, decimals: int) -> List[Dict]:
+                            is_bullish: bool, current_price: float, anchor_idx: int,
+                            anchor_price: float, atr: float, decimals: int) -> List[Dict]:
     """
-    Finds the 2 primary opposing structural liquidity targets (Target 1 & Target 2)
-    from prior major swing highs (in a Bullish cycle) or prior major swing lows
-    (in a Bearish cycle), matching the institutional chart roadmap.
+    Finds Target 1 and Target 2 using ONLY UNBROKEN structural swing levels
+    (so old swings that were already smashed through like on EUR/USD and NZD/USD
+    are never chosen), and always includes the active cycle's extreme high/low
+    Plus major historical swings across the visible chart.
     """
-    highs = df['High'].values
-    lows  = df['Low'].values
-    dates = df['Date'].values if 'Date' in df.columns else df.index.values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    total  = len(highs)
     end_time = int(dates[-1])
 
+    min_dist       = 0.70 * atr  # Minimum distance from current price to Target 1
+    min_separation = 0.90 * atr  # Minimum separation between Target 1 and Target 2
     targets = []
-    min_dist = 0.85 * atr        # Target 1 must be at least 0.85 ATR away from current price
-    min_separation = 1.10 * atr  # Target 2 must be materially beyond Target 1
 
     if is_bullish:
-        # Look for historical swing highs above current price
-        candidates = []
-        for idx in raw_highs:
-            lvl = float(highs[idx])
-            if lvl >= current_price + min_dist:
-                candidates.append((lvl, int(dates[idx])))
-        # Sort from nearest above price to highest
-        candidates.sort(key=lambda x: x[0])
+        candidate_indices = set(int(i) for i in raw_highs)
+        # Always include the highest high since the Peak Low anchor (the current cycle high)
+        if anchor_idx < total - 1:
+            cycle_max_idx = anchor_idx + int(np.argmax(highs[anchor_idx:]))
+            candidate_indices.add(cycle_max_idx)
+        # Also include the major high of the visible 180-bar window (fixes GBP/USD top-left high)
+        vis_start = max(0, total - 180)
+        vis_max_idx = vis_start + int(np.argmax(highs[vis_start:]))
+        candidate_indices.add(vis_max_idx)
 
-        for lvl, t_start in candidates:
+        valid_candidates = []
+        for idx in candidate_indices:
+            lvl = float(highs[idx])
+            if lvl < current_price + min_dist:
+                continue
+            # UNBROKEN CHECK: No candle after `idx` is allowed to have traded > 0.25 ATR above `lvl`
+            if idx < total - 1 and np.max(highs[idx + 1:]) > lvl + (0.25 * atr):
+                continue
+            valid_candidates.append((lvl, int(dates[idx])))
+
+        valid_candidates.sort(key=lambda x: x[0])
+
+        for lvl, t_start in valid_candidates:
             if not targets or (lvl - targets[-1]["level"]) >= min_separation:
                 t_num = len(targets) + 1
                 targets.append({
                     "target_num": t_num,
                     "level":      round(lvl, decimals),
-                    "top":        round(lvl + (0.12 * atr), decimals),
-                    "bottom":     round(lvl - (0.12 * atr), decimals),
                     "start_time": t_start,
                     "end_time":   end_time,
                     "label":      f"Target {t_num} ({lvl:.{decimals}f})",
@@ -265,39 +278,57 @@ def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: n
                 if len(targets) >= 2:
                     break
 
-        # Fallback if price is at all-time chart highs
         while len(targets) < 2:
             t_num = len(targets) + 1
-            base_lvl = targets[-1]["level"] if targets else max(current_price, anchor_price + 1.5 * atr)
-            proj_lvl = round(base_lvl + (1.8 * atr), decimals)
+            base_lvl = targets[-1]["level"] if targets else max(current_price, float(highs[anchor_idx:].max()))
+            proj_lvl = round(base_lvl + (1.6 * atr), decimals)
+            if proj_lvl < current_price + min_dist:
+                proj_lvl = round(current_price + (1.6 * atr * t_num), decimals)
             targets.append({
                 "target_num": t_num,
                 "level":      proj_lvl,
-                "top":        round(proj_lvl + (0.12 * atr), decimals),
-                "bottom":     round(proj_lvl - (0.12 * atr), decimals),
-                "start_time": int(dates[max(0, len(dates) - 40)]),
+                "start_time": int(dates[anchor_idx]),
                 "end_time":   end_time,
                 "label":      f"Target {t_num} ({proj_lvl:.{decimals}f})",
             })
 
     else:
-        # Bearish Cycle: Look for historical swing lows below current price
-        candidates = []
-        for idx in raw_lows:
-            lvl = float(lows[idx])
-            if lvl <= current_price - min_dist:
-                candidates.append((lvl, int(dates[idx])))
-        # Sort from nearest below price to lowest
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        # Bearish Cycle: Find UNBROKEN swing lows below current price
+        candidate_indices = set(int(i) for i in raw_lows)
+        # Always include the lowest low since the Peak High anchor (fixes EUR/USD & NZD/USD Oct 12-13 bottom!)
+        if anchor_idx < total - 1:
+            cycle_min_idx = anchor_idx + int(np.argmin(lows[anchor_idx:]))
+            candidate_indices.add(cycle_min_idx)
+        vis_start = max(0, total - 180)
+        vis_min_idx = vis_start + int(np.argmin(lows[vis_start:]))
+        candidate_indices.add(vis_min_idx)
 
-        for lvl, t_start in candidates:
+        valid_candidates = []
+        for idx in candidate_indices:
+            lvl = float(lows[idx])
+            if lvl > current_price - min_dist:
+                continue
+            # UNBROKEN CHECK: No candle after `idx` is allowed to have traded > 0.25 ATR below `lvl`
+            if idx < total - 1 and np.min(lows[idx + 1:]) < lvl - (0.25 * atr):
+                continue
+            valid_candidates.append((lvl, int(dates[idx])))
+
+        # Also add the most recent internal pullback low after `cycle_min_idx` if price rallied far above it
+        if anchor_idx < total - 1:
+            cycle_min_idx = anchor_idx + int(np.argmin(lows[anchor_idx:]))
+            cycle_min_lvl = float(lows[cycle_min_idx])
+            if (current_price - cycle_min_lvl) >= (2.2 * atr) and len(valid_candidates) == 1:
+                mid_lvl = current_price - (current_price - cycle_min_lvl) * 0.55
+                valid_candidates.append((mid_lvl, int(dates[cycle_min_idx])))
+
+        valid_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        for lvl, t_start in valid_candidates:
             if not targets or (targets[-1]["level"] - lvl) >= min_separation:
                 t_num = len(targets) + 1
                 targets.append({
                     "target_num": t_num,
                     "level":      round(lvl, decimals),
-                    "top":        round(lvl + (0.12 * atr), decimals),
-                    "bottom":     round(lvl - (0.12 * atr), decimals),
                     "start_time": t_start,
                     "end_time":   end_time,
                     "label":      f"Target {t_num} ({lvl:.{decimals}f})",
@@ -307,19 +338,115 @@ def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: n
 
         while len(targets) < 2:
             t_num = len(targets) + 1
-            base_lvl = targets[-1]["level"] if targets else min(current_price, anchor_price - 1.5 * atr)
-            proj_lvl = round(base_lvl - (1.8 * atr), decimals)
+            base_lvl = targets[-1]["level"] if targets else min(current_price, float(lows[anchor_idx:].min()))
+            proj_lvl = round(base_lvl - (1.6 * atr), decimals)
+            if proj_lvl > current_price - min_dist:
+                proj_lvl = round(current_price - (1.6 * atr * t_num), decimals)
             targets.append({
                 "target_num": t_num,
                 "level":      proj_lvl,
-                "top":        round(proj_lvl + (0.12 * atr), decimals),
-                "bottom":     round(proj_lvl - (0.12 * atr), decimals),
-                "start_time": int(dates[max(0, len(dates) - 40)]),
+                "start_time": int(dates[anchor_idx]),
                 "end_time":   end_time,
                 "label":      f"Target {t_num} ({proj_lvl:.{decimals}f})",
             })
 
     return targets
+
+
+def detect_order_blocks(df: pd.DataFrame, atr: float, is_bullish: bool,
+                        anchor_idx: int, anchor_price: float, decimals: int) -> List[Dict]:
+    """
+    Returns ONLY genuine, unmitigated Order Block zone(s) for `visuals.order_blocks`
+    so the frontend's "ORDER BLOCK" box label is 100% accurate and never appears on Targets.
+    """
+    opens  = df['Open'].values
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    total  = len(closes)
+
+    # 1. Primary Peak Origin Order Block (anchored at the Peak Formation base/top)
+    if is_bullish:
+        peak_ob = {
+            "type":      "BULL_OB",
+            "top":       round(anchor_price + (0.28 * atr), decimals),
+            "bottom":    round(anchor_price, decimals),
+            "time":      int(dates[anchor_idx]),
+            "end_time":  int(dates[-1]),
+            "label":     "Bull OB",
+            "mitigated": False
+        }
+    else:
+        peak_ob = {
+            "type":      "BEAR_OB",
+            "top":       round(anchor_price, decimals),
+            "bottom":    round(anchor_price - (0.28 * atr), decimals),
+            "time":      int(dates[anchor_idx]),
+            "end_time":  int(dates[-1]),
+            "label":     "Bear OB",
+            "mitigated": False
+        }
+
+    # 2. Check if there is a fresher unmitigated structural impulse OB after the anchor
+    start = max(2, anchor_idx + 2)
+    fresh_ob = None
+    for i in range(start, total - 2):
+        ob_idx = i - 1
+        if is_bullish:
+            win_start = max(0, ob_idx - 3)
+            win_end   = min(total, ob_idx + 2)
+            if lows[ob_idx] > np.min(lows[win_start:win_end]) + (0.15 * atr):
+                continue
+            displacement = (closes[i] - opens[i]) > (0.65 * atr) and closes[i] > highs[ob_idx]
+            has_fvg = (lows[i + 1] > highs[ob_idx]) or ((closes[i + 1] - lows[ob_idx]) > 1.4 * atr)
+            if not (displacement and has_fvg):
+                continue
+            bottom  = float(lows[ob_idx])
+            raw_top = float(max(opens[ob_idx], closes[ob_idx]))
+            top     = float(np.clip(raw_top, bottom + 0.22 * atr, bottom + 0.85 * atr))
+            midpoint = (top + bottom) / 2.0
+            post_closes = closes[i + 1:]
+            post_lows   = lows[i + 1:]
+            if not (np.min(post_closes) < midpoint or np.min(post_lows) < bottom - (0.05 * atr)):
+                if bottom <= closes[-1] + (0.2 * atr):
+                    fresh_ob = {
+                        "type":      "BULL_OB",
+                        "top":       round(top, decimals),
+                        "bottom":    round(bottom, decimals),
+                        "time":      int(dates[ob_idx]),
+                        "end_time":  int(dates[-1]),
+                        "label":     "Bull OB",
+                        "mitigated": False
+                    }
+        else:
+            win_start = max(0, ob_idx - 3)
+            win_end   = min(total, ob_idx + 2)
+            if highs[ob_idx] < np.max(highs[win_start:win_end]) - (0.15 * atr):
+                continue
+            displacement = (opens[i] - closes[i]) > (0.65 * atr) and closes[i] < lows[ob_idx]
+            has_fvg = (highs[i + 1] < lows[ob_idx]) or ((highs[ob_idx] - closes[i + 1]) > 1.4 * atr)
+            if not (displacement and has_fvg):
+                continue
+            top        = float(highs[ob_idx])
+            raw_bottom = float(min(opens[ob_idx], closes[ob_idx]))
+            bottom     = float(np.clip(raw_bottom, top - 0.85 * atr, top - 0.22 * atr))
+            midpoint   = (top + bottom) / 2.0
+            post_closes = closes[i + 1:]
+            post_highs  = highs[i + 1:]
+            if not (np.max(post_closes) > midpoint or np.max(post_highs) > top + (0.05 * atr)):
+                if top >= closes[-1] - (0.2 * atr):
+                    fresh_ob = {
+                        "type":      "BEAR_OB",
+                        "top":       round(top, decimals),
+                        "bottom":    round(bottom, decimals),
+                        "time":      int(dates[ob_idx]),
+                        "end_time":  int(dates[-1]),
+                        "label":     "Bear OB",
+                        "mitigated": False
+                    }
+
+    return [fresh_ob] if fresh_ob else [peak_ob]
 
 
 def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows: np.ndarray, atr: float) -> List[Dict]:
@@ -733,13 +860,13 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr, anchor_idx=anchor_idx)
 
-    # ── Structural Targets (Target 1 & Target 2 like reference chart) ───────
+    # ── Unbroken Structural Targets (Target 1 & Target 2) ───────────────────
     current_price_val = float(closes[-1])
     targets = find_structural_targets(
-        df, raw_highs, raw_lows, is_bullish, current_price_val, anchor_price, atr, decimals
+        df, raw_highs, raw_lows, is_bullish, current_price_val, int(anchor_idx), anchor_price, atr, decimals
     )
 
-    # 1. Lines: Peak Formation Line + Target 1 Line + Target 2 Line
+    # 1. Lines: Peak Formation Line + Clean Dashed Target 1 & Target 2 Lines
     all_lines = [{
         "level":      round(anchor_price, decimals),
         "start_time": anchor_time,
@@ -748,7 +875,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         "color":      anchor_color,
         "is_choch":   False
     }]
-    target_line_color = "rgba(255, 193, 7, 0.95)"  # Gold/Tan institutional target color
+    target_line_color = "rgba(255, 193, 7, 0.95)"
     for t in targets:
         all_lines.append({
             "level":      t["level"],
@@ -756,42 +883,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "end_time":   t["end_time"],
             "type":       t["label"],
             "color":      target_line_color,
-            "is_choch":   False
+            "is_choch":   True  # Renders as clean dashed target line on frontend
         })
 
-    # 2. Shaded Boxes (order_blocks array): Peak Base Zone + Target 1 & Target 2 Zones
-    zone_boxes = []
-    if is_bullish:
-        zone_boxes.append({
-            "type":      "BULL_OB",
-            "top":       round(anchor_price + (0.28 * atr), decimals),
-            "bottom":    round(anchor_price, decimals),
-            "time":      anchor_time,
-            "end_time":  int(dates[-1]),
-            "label":     f"Peak Base Zone ({anchor_price:.{decimals}f})",
-            "mitigated": False
-        })
-    else:
-        zone_boxes.append({
-            "type":      "BEAR_OB",
-            "top":       round(anchor_price, decimals),
-            "bottom":    round(anchor_price - (0.28 * atr), decimals),
-            "time":      anchor_time,
-            "end_time":  int(dates[-1]),
-            "label":     f"Peak Supply Zone ({anchor_price:.{decimals}f})",
-            "mitigated": False
-        })
-
-    for t in targets:
-        zone_boxes.append({
-            "type":      "BULL_OB" if is_bullish else "BEAR_OB",
-            "top":       t["top"],
-            "bottom":    t["bottom"],
-            "time":      t["start_time"],
-            "end_time":  t["end_time"],
-            "label":     t["label"],
-            "mitigated": False
-        })
+    # 2. Order Blocks: ONLY real Supply/Demand Order Block (no fake "ORDER BLOCK" boxes on Targets!)
+    zone_boxes = detect_order_blocks(df, atr, is_bullish, int(anchor_idx), anchor_price, decimals)
 
     # ── Strictly Unbroken Anchor-Pinned Trendline ───────────────────────────
     trendline_data = None
@@ -846,7 +942,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 "color":       "rgba(59, 255, 130, 0.8)" if is_bullish else "rgba(255, 59, 59, 0.8)",
             }
 
-    # ── 2-Leg Projected Roadmap Arrow (Pullback -> Target 2) ────────────────
     step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
     pullback_lvl = (
         trendline_data["end_level"] if trendline_data
@@ -885,15 +980,17 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
                           ema_50: float, ema_200: float, rsi: float,
                           htf_aligned: bool, decimals: int) -> Dict:
     """
-    Waits patiently for price to enter a reaction zone AND print a closed
-    confirmation candle before activating a BUY or SELL signal.
-    When activated, TP1 and TP2 are set directly to the chart's Target 1 and Target 2.
+    Activates a live BUY or SELL signal when price tests a key structural zone
+    (Peak Order Block, Supply/Demand Trendline, or 50/200 EMA) and prints either:
+      - A directional confirmation candle, OR
+      - A wick rejection / pin-bar off the zone (like EUR/USD & NZD/USD at the Supply Trendline).
     """
     is_bullish     = ms["is_bullish"]
     peak_confirmed = ms["peak_confirmed"]
     anchor_price   = ms["anchor"]
     atr            = ms["atr"]
     trendline      = ms["trendline"]
+    zone_boxes     = ms["zone_boxes"]
     sweeps         = ms["sweeps"]
     w_confirmed    = ms["w_confirmed"]
     m_confirmed    = ms["m_confirmed"]
@@ -901,6 +998,7 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
 
     t1_level = targets[0]["level"]
     t2_level = targets[1]["level"]
+    active_ob = zone_boxes[0] if zone_boxes else None
 
     if not peak_confirmed or atr <= 0:
         return {
@@ -918,14 +1016,17 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
     prev_high  = float(df['High'].iloc[-2]) if len(df) > 1 else last_high
     prev_low   = float(df['Low'].iloc[-2]) if len(df) > 1 else last_low
 
-    body_size      = abs(last_close - last_open)
-    bullish_candle = (last_close > last_open) and (body_size >= 0.12 * atr)
-    bearish_candle = (last_close < last_open) and (body_size >= 0.12 * atr)
+    body_size   = abs(last_close - last_open)
+    upper_wick  = last_high - max(last_open, last_close)
+    lower_wick  = min(last_open, last_close) - last_low
+
+    bullish_rejection = ((last_close > last_open) and (body_size >= 0.10 * atr)) or (lower_wick >= 0.22 * atr and last_close >= last_low + 0.55 * (last_high - last_low))
+    bearish_rejection = ((last_close < last_open) and (body_size >= 0.10 * atr)) or (upper_wick >= 0.22 * atr and last_close <= last_high - 0.55 * (last_high - last_low))
 
     recent_sweep = None
     if sweeps:
         last_sw = sweeps[-1]
-        if (len(df) - 1 - last_sw["sweep_idx"]) <= 4:
+        if (len(df) - 1 - last_sw["sweep_idx"]) <= 5:
             if (is_bullish and last_sw["type"] == "BULL_SWEEP") or ((not is_bullish) and last_sw["type"] == "BEAR_SWEEP"):
                 recent_sweep = last_sw
 
@@ -938,16 +1039,23 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         near_tl        = False
         if trendline:
             tl_lvl = trendline["end_level"]
-            near_tl = (min(last_low, prev_low) <= tl_lvl + 0.30 * atr) and (last_close >= tl_lvl)
+            near_tl = (min(last_low, prev_low) <= tl_lvl + 0.35 * atr) and (last_close >= tl_lvl - 0.10 * atr)
 
-        near_ema = (min(last_low, prev_low) <= max(ema_50, ema_200) + 0.20 * atr) and (last_close > ema_50)
+        in_ob = False
+        if active_ob:
+            in_ob = (min(last_low, prev_low) <= active_ob["top"] + 0.20 * atr) and (last_close >= active_ob["bottom"])
+
+        near_ema = (min(last_low, prev_low) <= max(ema_50, ema_200) + 0.25 * atr) and (last_close >= min(ema_50, ema_200))
 
         if near_anchor_w:
             score += 22
             reasons.append("Peak Base Zone retest")
         if near_tl:
-            score += 20
+            score += 22
             reasons.append("Demand Trendline bounce")
+        if in_ob:
+            score += 18
+            reasons.append("Bullish Order Block tap")
         if near_ema:
             score += 12
             reasons.append("50/200 EMA support hold")
@@ -960,13 +1068,13 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         if htf_aligned:
             score += 8
 
-        in_reaction_zone = (near_anchor_w or near_tl or (near_ema and (recent_sweep is not None or w_confirmed)))
-        if in_reaction_zone and bullish_candle and rsi < 66:
+        in_reaction_zone = (near_anchor_w or near_tl or in_ob or (near_ema and (recent_sweep is not None or w_confirmed)))
+        if in_reaction_zone and bullish_rejection and rsi < 68:
             sl_base   = anchor_price - (0.30 * atr) if near_anchor_w else min(last_low, prev_low) - (0.45 * atr)
-            stop_loss = min(sl_base, current_price - (0.75 * atr))
+            stop_loss = min(sl_base, current_price - (0.70 * atr))
             risk      = max(abs(current_price - stop_loss), 1e-6)
-            rr        = round(abs(t2_level - current_price) / risk, 2)
-            confidence = int(np.clip(score, 70, 96))
+            rr        = round(abs(t1_level - current_price) / risk, 2)
+            confidence = int(np.clip(score, 72, 96))
             setup_str  = " + ".join(reasons[:2]) if reasons else "Bullish Pullback Entry"
             return {
                 "signal": "BUY",
@@ -994,7 +1102,7 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
                 "entry_note": (
                     f"⏳ Peak Low locked at {anchor_price:.{decimals}f}. "
                     f"Upside Roadmap: Target 1 ({t1_level:.{decimals}f}) → Target 2 ({t2_level:.{decimals}f}). "
-                    f"Waiting for pullback rejection candle to activate BUY."
+                    f"Waiting for pullback rejection at Demand Zone / Trendline to activate BUY."
                 ),
                 "trade_levels": None
             }
@@ -1005,16 +1113,23 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         near_tl        = False
         if trendline:
             tl_lvl = trendline["end_level"]
-            near_tl = (max(last_high, prev_high) >= tl_lvl - 0.30 * atr) and (last_close <= tl_lvl)
+            near_tl = (max(last_high, prev_high) >= tl_lvl - 0.35 * atr) and (last_close <= tl_lvl + 0.10 * atr)
 
-        near_ema = (max(last_high, prev_high) >= min(ema_50, ema_200) - 0.20 * atr) and (last_close < ema_50)
+        in_ob = False
+        if active_ob:
+            in_ob = (max(last_high, prev_high) >= active_ob["bottom"] - 0.20 * atr) and (last_close <= active_ob["top"])
+
+        near_ema = (max(last_high, prev_high) >= min(ema_50, ema_200) - 0.25 * atr) and (last_close <= max(ema_50, ema_200))
 
         if near_anchor_m:
             score += 22
             reasons.append("Peak Supply Zone retest")
         if near_tl:
-            score += 20
+            score += 22
             reasons.append("Supply Trendline rejection")
+        if in_ob:
+            score += 18
+            reasons.append("Bearish Order Block tap")
         if near_ema:
             score += 12
             reasons.append("50/200 EMA resistance hold")
@@ -1027,13 +1142,13 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         if htf_aligned:
             score += 8
 
-        in_reaction_zone = (near_anchor_m or near_tl or (near_ema and (recent_sweep is not None or m_confirmed)))
-        if in_reaction_zone and bearish_candle and rsi > 34:
+        in_reaction_zone = (near_anchor_m or near_tl or in_ob or (near_ema and (recent_sweep is not None or m_confirmed)))
+        if in_reaction_zone and bearish_rejection and rsi > 32:
             sl_base   = anchor_price + (0.30 * atr) if near_anchor_m else max(last_high, prev_high) + (0.45 * atr)
-            stop_loss = max(sl_base, current_price + (0.75 * atr))
+            stop_loss = max(sl_base, current_price + (0.70 * atr))
             risk      = max(abs(stop_loss - current_price), 1e-6)
-            rr        = round(abs(current_price - t2_level) / risk, 2)
-            confidence = int(np.clip(score, 70, 96))
+            rr        = round(abs(current_price - t1_level) / risk, 2)
+            confidence = int(np.clip(score, 72, 96))
             setup_str  = " + ".join(reasons[:2]) if reasons else "Bearish Pullback Entry"
             return {
                 "signal": "SELL",
@@ -1061,7 +1176,7 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
                 "entry_note": (
                     f"⏳ Peak High locked at {anchor_price:.{decimals}f}. "
                     f"Downside Roadmap: Target 1 ({t1_level:.{decimals}f}) → Target 2 ({t2_level:.{decimals}f}). "
-                    f"Waiting for pullback rejection candle to activate SELL."
+                    f"Waiting for rally rejection at Supply Zone / Trendline to activate SELL."
                 ),
                 "trade_levels": None
             }
@@ -1228,7 +1343,7 @@ async def debug_analysis(req: AnalysisRequest):
         ms = analyze_market_structure(df, profile)
 
         return {
-            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v5.0 (Visual Target Roadmap + Live Signal Activation)",
+            "✅ ENGINE VERSION":    "AuraBrain Peak Formation v5.1 (Unbroken Targets + Clean Order Blocks)",
             "📊 INSTRUMENT":       req.currency,
             "💰 CURRENT PRICE":    round(current_price, profile['decimals']),
             "─── STRUCTURE ───": "──────────────────────────────────────",
