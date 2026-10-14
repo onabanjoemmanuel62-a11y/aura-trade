@@ -6,7 +6,7 @@ import io from 'socket.io-client';
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🧮 HELPER: Precision & Curved EMAs on the Frontend
+// 🧮 HELPER: Precision, Safe Time Coordinate Lookup & Curved EMAs
 // ─────────────────────────────────────────────────────────────────────────────
 const getPriceFormat = (sym = '') => {
   const s = sym.toUpperCase();
@@ -17,6 +17,30 @@ const getPriceFormat = (sym = '') => {
     return { type: 'price', precision: 3, minMove: 0.001 };
   }
   return { type: 'price', precision: 5, minMove: 0.00001 };
+};
+
+// Guarantees timeToCoordinate never returns null if a timestamp is between bars or slightly older/newer
+const safeTimeToX = (timeScale, candles, targetTime) => {
+  if (!timeScale || targetTime == null) return null;
+  const direct = timeScale.timeToCoordinate(targetTime);
+  if (direct !== null) return direct;
+  if (!candles || !candles.length) return null;
+
+  const lastTime  = candles[candles.length - 1].time;
+  const firstTime = candles[0].time;
+  if (targetTime >= lastTime) return timeScale.timeToCoordinate(lastTime);
+  if (targetTime <= firstTime) return timeScale.timeToCoordinate(firstTime);
+
+  // Binary search nearest candle timestamp
+  let lo = 0, hi = candles.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (candles[mid].time === targetTime) return timeScale.timeToCoordinate(candles[mid].time);
+    if (candles[mid].time < targetTime) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  const nearestIdx = Math.min(candles.length - 1, Math.max(0, lo));
+  return timeScale.timeToCoordinate(candles[nearestIdx].time);
 };
 
 const calculateEMA = (data, period) => {
@@ -45,9 +69,9 @@ class LineRenderer {
 
       this._data.forEach((line) => {
         if (line.x1 === null || line.x2 === null || line.y === null) return;
-        const x1 = line.x1 * hPR;
+        const x1 = Math.max(0, line.x1 * hPR);
         const x2 = Math.min(line.x2 * hPR, rightEdge);
-        const y  = line.y  * vPR;
+        const y  = line.y * vPR;
         if (x1 >= rightEdge) return;
 
         ctx.beginPath();
@@ -59,7 +83,7 @@ class LineRenderer {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        const labelX  = Math.min(x2 + 8 * hPR, rightEdge - 145 * hPR);
+        const labelX  = Math.min(x2 + 8 * hPR, rightEdge - 150 * hPR);
         ctx.font      = `bold ${11 * hPR}px monospace`;
         ctx.fillStyle = line.color;
         ctx.fillText(line.label, labelX, y - 5 * vPR);
@@ -79,13 +103,13 @@ class LinePrimitive {
     this._paneViews    = [new LinePaneView(this)];
   }
 
-  setData(lines, series, timeScale) {
+  setData(lines, series, timeScale, candles) {
     if (!lines || !Array.isArray(lines)) { this._rendererData = []; return; }
     this._rendererData = lines.map((line) => {
       if (!line.start_time || !line.end_time || line.level == null) return null;
       try {
-        const x1 = timeScale.timeToCoordinate(line.start_time);
-        const x2 = timeScale.timeToCoordinate(line.end_time);
+        const x1 = safeTimeToX(timeScale, candles, line.start_time);
+        const x2 = safeTimeToX(timeScale, candles, line.end_time);
         const y  = series.priceToCoordinate(line.level);
         if (x1 === null || x2 === null || y === null) return null;
 
@@ -117,7 +141,7 @@ class TrendlineRenderer {
       const { x1, y1, x2, y2, color, label } = this._data;
       if (x1 === null || y1 === null || x2 === null || y2 === null) return;
 
-      const px1 = x1 * hPR, py1 = y1 * vPR;
+      const px1 = Math.max(0, x1 * hPR), py1 = y1 * vPR;
       const px2 = Math.min(x2, rightEdge / hPR) * hPR, py2 = y2 * vPR;
       if (px1 >= rightEdge) return;
 
@@ -146,14 +170,14 @@ class TrendlinePrimitive {
     this._paneViews    = [new TrendlinePaneView(this)];
   }
 
-  setData(tl, series, timeScale) {
+  setData(tl, series, timeScale, candles) {
     if (!tl || !tl.start_time || !tl.end_time || tl.start_level == null || tl.end_level == null) {
       this._rendererData = null;
       return;
     }
     try {
-      const x1 = timeScale.timeToCoordinate(tl.start_time);
-      const x2 = timeScale.timeToCoordinate(tl.end_time);
+      const x1 = safeTimeToX(timeScale, candles, tl.start_time);
+      const x2 = safeTimeToX(timeScale, candles, tl.end_time);
       const y1 = series.priceToCoordinate(tl.start_level);
       const y2 = series.priceToCoordinate(tl.end_level);
       if (x1 === null || x2 === null || y1 === null || y2 === null) {
@@ -183,7 +207,7 @@ class OBZoneRenderer {
 
       this._data.forEach((zone) => {
         if (zone.x1 === null || zone.yTop === null) return;
-        const x1      = zone.x1 * hPR;
+        const x1      = Math.max(0, zone.x1 * hPR);
         const x2      = rightEdge;
         const yTop    = zone.yTop * vPR;
         const yBottom = zone.yBottom * vPR;
@@ -214,12 +238,12 @@ class OBZonePrimitive {
     this._paneViews    = [new OBZonePaneView(this)];
   }
 
-  setData(obs, series, timeScale) {
+  setData(obs, series, timeScale, candles) {
     if (!obs || !Array.isArray(obs)) { this._rendererData = []; return; }
     this._rendererData = obs.map((ob) => {
       if (!ob.time || ob.top == null || ob.bottom == null) return null;
       try {
-        const x1      = timeScale.timeToCoordinate(ob.time);
+        const x1      = safeTimeToX(timeScale, candles, ob.time);
         const yTop    = series.priceToCoordinate(ob.top);
         const yBottom = series.priceToCoordinate(ob.bottom);
         if (x1 === null || yTop === null || yBottom === null) return null;
@@ -256,7 +280,6 @@ class ProjectionRenderer {
 
       const x0 = p0.x * hPR;
       const y0 = p0.y * vPR;
-      // Project 2 legs neatly into the right-margin whitespace (like reference chart)
       const x1 = Math.min(x0 + 28 * hPR, rightEdge - 65 * hPR);
       const y1 = p1.y * vPR;
       const x2 = Math.min(x0 + 78 * hPR, rightEdge - 20 * hPR);
@@ -304,13 +327,13 @@ class ProjectionPrimitive {
     this._paneViews    = [new ProjectionPaneView(this)];
   }
 
-  setData(path, series, timeScale) {
+  setData(path, series, timeScale, candles) {
     if (!path || !Array.isArray(path) || path.length < 3) {
       this._rendererData = null;
       return;
     }
     try {
-      const x0 = timeScale.timeToCoordinate(path[0].time);
+      const x0 = safeTimeToX(timeScale, candles, path[0].time);
       const y0 = series.priceToCoordinate(path[0].price);
       const y1 = series.priceToCoordinate(path[1].price);
       const y2 = series.priceToCoordinate(path[2].price);
@@ -318,7 +341,7 @@ class ProjectionPrimitive {
         this._rendererData = null;
         return;
       }
-      const isBull = path[2].price > path[1].price;
+      const isBull = path[2].price > path[0].price;
       this._rendererData = {
         points: [
           { x: x0, y: y0 },
@@ -368,7 +391,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(data, 200));
   }, []);
 
-  // Update precision & wipe chart on symbol change
   useEffect(() => {
     symbolRef.current = symbol;
     if (candleSeriesRef.current) {
@@ -395,7 +417,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i);
   }, []);
 
-  // Chart init (once)
   useEffect(() => {
     if (!chartContainerRef.current) return;
     const chart = createChart(chartContainerRef.current, {
@@ -482,7 +503,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     finally { isLoadingRef.current = false; }
   };
 
-  // Load on timeframe / symbol change
   useEffect(() => {
     if (!isChartReady.current) return;
     const load = async () => {
@@ -520,19 +540,20 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       }
 
       if (chartRef.current && candleSeriesRef.current) {
-        const ts = chartRef.current.timeScale();
+        const ts      = chartRef.current.timeScale();
+        const candles = allDataRef.current;
 
         if (linePrimitiveRef.current) {
-          linePrimitiveRef.current.setData(visuals?.bos_lines || [], candleSeriesRef.current, ts);
+          linePrimitiveRef.current.setData(visuals?.bos_lines || [], candleSeriesRef.current, ts, candles);
         }
         if (trendlinePrimitiveRef.current) {
-          trendlinePrimitiveRef.current.setData(visuals?.trendline, candleSeriesRef.current, ts);
+          trendlinePrimitiveRef.current.setData(visuals?.trendline, candleSeriesRef.current, ts, candles);
         }
         if (obZonePrimitiveRef.current) {
-          obZonePrimitiveRef.current.setData(visuals?.order_blocks || [], candleSeriesRef.current, ts);
+          obZonePrimitiveRef.current.setData(visuals?.order_blocks || [], candleSeriesRef.current, ts, candles);
         }
         if (projectionPrimitiveRef.current) {
-          projectionPrimitiveRef.current.setData(visuals?.projection_path, candleSeriesRef.current, ts);
+          projectionPrimitiveRef.current.setData(visuals?.projection_path, candleSeriesRef.current, ts, candles);
         }
       }
       rafId = requestAnimationFrame(loop);
@@ -541,7 +562,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     return () => cancelAnimationFrame(rafId);
   }, [visuals]);
 
-  // News markers
   useEffect(() => {
     const fetch = async () => {
       try {
@@ -565,7 +585,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     } catch { /* silent */ }
   }, [newsData]);
 
-  // Price lines (Active Trade Setups)
   useEffect(() => {
     if (!candleSeriesRef.current || !isChartReady.current) return;
     activeLinesRef.current.forEach(l => { try { candleSeriesRef.current.removePriceLine(l); } catch { /* silent */ } });
@@ -587,7 +606,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     }
   }, [levels, tradeSetup]);
 
-  // Socket
   useEffect(() => {
     const socket = io(API_URL, { transports: ['polling'], path: '/socket.io/' });
     socket.on('connect',    () => setConnectionStatus('Connected'));
@@ -625,7 +643,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     <div style={{ position: 'relative', width: '100%', backgroundColor: '#161A25', borderRadius: 8, overflow: 'hidden' }}
          onMouseEnter={() => setIsHoveringControls(true)} onMouseLeave={() => setIsHoveringControls(false)}>
 
-      {/* Status + timeframe switcher */}
       <div style={{ position: 'absolute', top: 15, left: 15, right: 15, zIndex: 20, display: 'flex', justifyContent: 'space-between' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(42,46,57,0.85)', padding: '4px 10px', borderRadius: 4, borderLeft: `3px solid ${statusColor}` }}>
           <span style={{ fontSize: 11, fontWeight: 600, color: '#FFF' }}>{connectionStatus}</span>
@@ -640,7 +657,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         </div>
       </div>
 
-      {/* Zoom / scroll controls */}
       <div style={{ position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 30, display: 'flex', gap: 8, opacity: isHoveringControls ? 1 : 0, transition: 'opacity 0.2s', background: 'rgba(42,46,57,0.9)', padding: '8px 12px', borderRadius: 30, border: '1px solid #374357' }}>
         <ControlButton onClick={() => handleScroll('left')}  label="<"     />
         <ControlButton onClick={handleZoomOut}               label="−"     />
