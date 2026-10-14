@@ -4,8 +4,12 @@ const NewsEvent = require('../models/NewsEvent');
 const Trade = require('../models/Trade');
 const { openPaperTradeIfEligible } = require('./tradeController');
 
+// ⚙️ CONFIGURATION
 const PYTHON_API_URL = process.env.PYTHON_API_URL || 'http://127.0.0.1:8000/api/analyze';
 
+// ==========================================
+// 🕵️ NEWS ANALYZER (UNCHANGED LEGACY)
+// ==========================================
 const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     try {
         if (!targetEvent) return null;
@@ -64,6 +68,9 @@ const analyzeNewsImpact = async (targetEvent, targetCurrency) => {
     }
 };
 
+// ==========================================
+// 🚀 MAIN CONTROLLER (MULTI-TIMEFRAME MATRIX)
+// ==========================================
 exports.analyzePattern = async (req, res) => {
     try {
         const { timeframe, eventName, currency, symbol } = req.body;
@@ -123,66 +130,78 @@ exports.analyzePattern = async (req, res) => {
 
             const aiResult = pythonResponse.data;
 
-            // Purge any stale legacy OPEN trade with RR < 1.5 or opposite cycle direction
+            // Purge any stale legacy OPEN trade with missing SL/TP, RR < 1.5, or opposite cycle direction
             const existingOpen = await Trade.findOne({ symbol: targetSymbol, status: 'OPEN' });
             if (existingOpen) {
-                const risk = Math.max(Math.abs(existingOpen.entry - existingOpen.sl), 1e-6);
-                const rr   = Math.abs(existingOpen.tp - existingOpen.entry) / risk;
-                const cycleIsBull = (aiResult.trend || '').toUpperCase().includes('BULLISH');
-                const tradeIsBuy  = existingOpen.action === 'Buy';
-
-                if (rr < 1.5 || cycleIsBull !== tradeIsBuy) {
+                if (existingOpen.sl == null || existingOpen.tp == null) {
                     await Trade.deleteOne({ _id: existingOpen._id });
+                } else {
+                    const risk = Math.max(Math.abs(existingOpen.entry - existingOpen.sl), 1e-6);
+                    const rr   = Math.abs(existingOpen.tp - existingOpen.entry) / risk;
+                    const cycleIsBull = (aiResult.trend || '').toUpperCase().includes('BULLISH');
+                    const tradeIsBuy  = existingOpen.action === 'Buy';
+
+                    if (rr < 1.5 || cycleIsBull !== tradeIsBuy) {
+                        await Trade.deleteOne({ _id: existingOpen._id });
+                    }
                 }
             }
 
             const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
 
-            // If an OPEN trade is active on this symbol, synchronize the entire UI payload!
+            // If an OPEN trade is active on this symbol, lock its exact Entry, SL, TP1, and TP2 into the response!
             if (activeTrade && activeTrade.status === 'OPEN') {
-                const risk = Math.max(Math.abs(activeTrade.entry - activeTrade.sl), 1e-6);
-                const t1   = activeTrade.tp;
-                const t2   = aiResult.keyLevels?.target2 || activeTrade.tp;
-                const rr   = parseFloat((Math.max(Math.abs(t1 - activeTrade.entry), Math.abs(t2 - activeTrade.entry)) / risk).toFixed(2));
-                const dir  = activeTrade.action.toUpperCase(); // 'BUY' or 'SELL'
+                const lockedEntry = Number(activeTrade.entry);
+                const lockedSL    = Number(activeTrade.sl);
+                const lockedTP1   = Number(activeTrade.tp);
+                const rawTP2      = Number(aiResult.tradeSetup?.target_2 || aiResult.keyLevels?.target2 || lockedTP1);
+                const isBuy       = activeTrade.action === 'Buy';
+                const lockedTP2   = isBuy ? Math.max(lockedTP1, rawTP2) : Math.min(lockedTP1, rawTP2);
+
+                const risk = Math.max(Math.abs(lockedEntry - lockedSL), 1e-6);
+                const rr   = parseFloat((Math.max(Math.abs(lockedTP1 - lockedEntry), Math.abs(lockedTP2 - lockedEntry)) / risk).toFixed(2));
+                const dir  = isBuy ? 'BUY' : 'SELL';
 
                 aiResult.signal     = dir;
                 aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 80);
                 aiResult.tradeSetup = {
-                    entry:       activeTrade.entry,
-                    stop_loss:   activeTrade.sl,
-                    take_profit: t1,
-                    target_1:    t1,
-                    target_2:    t2,
+                    entry:       lockedEntry,
+                    stop_loss:   lockedSL,
+                    take_profit: lockedTP1,
+                    target_1:    lockedTP1,
+                    target_2:    lockedTP2,
                     risk_reward: rr
                 };
 
-                // Synchronize executionPlan & 4-Step Checklist so the sidebar never shows "Watch 1H Close!" during an active trade
+                if (aiResult.keyLevels) {
+                    aiResult.keyLevels.target1 = lockedTP1;
+                    aiResult.keyLevels.target2 = lockedTP2;
+                }
+
                 aiResult.executionPlan = {
                     ...(aiResult.executionPlan || {}),
                     stage:             'TRADE_ACTIVE',
-                    trigger_condition: `${dir === 'BUY' ? '🟢 BUY' : '🔴 SELL'} TRADE EXECUTING @ ${activeTrade.entry} — Target 1: ${t1} | Stop Loss: ${activeTrade.sl}`,
-                    planned_entry:     activeTrade.entry,
-                    planned_sl:        activeTrade.sl,
-                    planned_tp1:       t1,
-                    planned_tp2:       t2,
+                    trigger_condition: `${isBuy ? '🟢 BUY' : '🔴 SELL'} EXECUTING: Locked Entry @ ${lockedEntry} | Target 1: ${lockedTP1} | Target 2: ${lockedTP2} | SL: ${lockedSL}`,
+                    planned_entry:     lockedEntry,
+                    planned_sl:        lockedSL,
+                    planned_tp1:       lockedTP1,
+                    planned_tp2:       lockedTP2,
                     risk_reward:       rr
                 };
 
                 if (Array.isArray(aiResult.checklist) && aiResult.checklist.length >= 4) {
                     aiResult.checklist[1].done   = true;
-                    aiResult.checklist[1].detail = `Tapped @ ${activeTrade.entry} ✅`;
+                    aiResult.checklist[1].detail = `Tapped @ ${lockedEntry} ✅`;
                     aiResult.checklist[2].done   = true;
                     aiResult.checklist[2].detail = 'Confirmed ✅';
                     aiResult.checklist[3].done   = true;
                     aiResult.checklist[3].detail = `1:${rr}`;
                 }
 
-                // Point the chart arrow smoothly from Entry -> Target 1 -> Target 2
                 if (aiResult.visuals && Array.isArray(aiResult.visuals.projection_path) && aiResult.visuals.projection_path.length >= 3) {
-                    aiResult.visuals.projection_path[0].price = activeTrade.entry;
-                    aiResult.visuals.projection_path[1].price = t1;
-                    aiResult.visuals.projection_path[2].price = t2;
+                    aiResult.visuals.projection_path[0].price = lockedEntry;
+                    aiResult.visuals.projection_path[1].price = lockedTP1;
+                    aiResult.visuals.projection_path[2].price = lockedTP2;
                 }
             }
 
