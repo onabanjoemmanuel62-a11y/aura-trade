@@ -3,11 +3,17 @@ import axios from 'axios';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
-// Normalizes raw price differences from older DB records into real Forex/Gold pips
+// Helper: A trade is only truly OPEN if its result is not already WON or LOST
+const isTradeOpen = (t) => {
+  const res = (t.result || '').toUpperCase();
+  const st  = (t.status || '').toUpperCase();
+  if (res === 'WON' || res === 'LOST') return false;
+  return st === 'OPEN' || res === 'PENDING' || !res;
+};
+
 const normalizePips = (trade) => {
   const raw = parseFloat(trade.profit);
   if (isNaN(raw) || raw === 0) return 0;
-  // If already stored as pips (abs >= 0.5 for non-gold), return as-is
   const sym = (trade.symbol || trade.pair || '').toUpperCase();
   if (Math.abs(raw) < 0.25 && !sym.includes('GC=F') && !sym.includes('XAU')) {
     if (sym.includes('JPY')) return parseFloat((raw * 100).toFixed(1));
@@ -53,12 +59,12 @@ const HistoryTable = () => {
   };
 
   const filtered = trades.filter(t => {
-    const status = (t.status || '').toUpperCase();
+    const open   = isTradeOpen(t);
     const result = (t.result || '').toUpperCase();
     if (filter === 'ALL')  return true;
-    if (filter === 'OPEN') return status === 'OPEN' || result === 'PENDING';
-    if (filter === 'WON')  return status === 'CLOSED' && result === 'WON';
-    if (filter === 'LOST') return status === 'CLOSED' && result === 'LOST';
+    if (filter === 'OPEN') return open;
+    if (filter === 'WON')  return !open && result === 'WON';
+    if (filter === 'LOST') return !open && result === 'LOST';
     return true;
   });
 
@@ -71,9 +77,9 @@ const HistoryTable = () => {
     return 0;
   });
 
-  // Accurate Stats Summary (Only count CLOSED trades for Win Rate & Losses!)
-  const openTrades   = trades.filter(t => (t.status || '').toUpperCase() === 'OPEN');
-  const closedTrades = trades.filter(t => (t.status || '').toUpperCase() === 'CLOSED');
+  // Accurate Stats Summary
+  const openTrades   = trades.filter(t => isTradeOpen(t));
+  const closedTrades = trades.filter(t => !isTradeOpen(t));
   const wins         = closedTrades.filter(t => (t.result || '').toUpperCase() === 'WON').length;
   const losses       = closedTrades.filter(t => (t.result || '').toUpperCase() === 'LOST').length;
   const winRate      = closedTrades.length > 0 ? Math.round((wins / closedTrades.length) * 100) : 0;
@@ -100,12 +106,12 @@ const HistoryTable = () => {
       {/* Stats summary bar */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
         {[
-          { label: 'SIGNALS',    value: trades.length,     color: '#9ca3af' },
-          { label: 'ACTIVE',     value: openTrades.length, color: '#2962FF' },
-          { label: 'WINS / LOSS',value: `${wins}W / ${losses}L`, color: '#00e676' },
-          { label: 'WIN RATE',   value: closedTrades.length > 0 ? `${winRate}%` : '—', color: winRate >= 60 ? '#00e676' : winRate >= 45 ? '#f0b429' : '#9ca3af' },
-          { label: 'TOTAL PIPS', value: `${totalPips > 0 ? '+' : ''}${totalPips.toFixed(1)}`, color: totalPips >= 0 ? '#00e676' : '#ff4757' },
-          { label: 'BEST TRADE', value: `+${bestTrade.toFixed(1)}p`, color: '#f0b429' },
+          { label: 'SIGNALS',     value: trades.length,     color: '#9ca3af' },
+          { label: 'ACTIVE',      value: openTrades.length, color: '#2962FF' },
+          { label: 'WINS / LOSS', value: `${wins}W / ${losses}L`, color: '#00e676' },
+          { label: 'WIN RATE',    value: closedTrades.length > 0 ? `${winRate}%` : '—', color: winRate >= 60 ? '#00e676' : winRate >= 45 ? '#f0b429' : '#9ca3af' },
+          { label: 'TOTAL PIPS',  value: `${totalPips > 0 ? '+' : ''}${totalPips.toFixed(1)}`, color: totalPips >= 0 ? '#00e676' : '#ff4757' },
+          { label: 'BEST TRADE',  value: `+${bestTrade.toFixed(1)}p`, color: '#f0b429' },
         ].map((stat, i) => (
           <div key={i} style={{ padding: '10px 14px', borderRight: i < 5 ? '1px solid rgba(255,255,255,0.05)' : 'none', textAlign: 'center' }}>
             <div style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>{stat.label}</div>
@@ -164,7 +170,7 @@ const HistoryTable = () => {
               <tr><td colSpan="7" style={{ padding: 24, textAlign: 'center', color: '#3d4d5e', fontFamily: "'Space Mono', monospace", fontSize: 11 }}>No trades found.</td></tr>
             ) : (
               sorted.map((trade, i) => {
-                const isOpen = (trade.status || '').toUpperCase() === 'OPEN';
+                const isOpen = isTradeOpen(trade);
                 const isWin  = !isOpen && (trade.result || '').toUpperCase() === 'WON';
                 const isBuy  = (trade.action || '').toUpperCase() === 'BUY';
                 const pips   = normalizePips(trade);
