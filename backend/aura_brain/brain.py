@@ -221,21 +221,26 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
     return np.array(filtered_highs, dtype=int), np.array(filtered_lows, dtype=int)
 
 
-def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: np.ndarray,
+def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
                             is_bullish: bool, ref_price: float, anchor_idx: int,
                             anchor_price: float, atr: float, decimals: int) -> List[Dict]:
     highs  = df['High'].values
     lows   = df['Low'].values
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     total  = len(highs)
-    end_time = int(dates[-1])
+    if total == 0:
+        return []
+
+    end_time   = int(dates[-1])
+    anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
 
     min_dist       = 0.90 * atr
     min_separation = 1.00 * atr
     targets = []
 
     if is_bullish:
-        candidate_indices = set(int(i) for i in raw_highs)
+        # Strictly filter indices to `< total` so sliced dataframes never throw IndexError!
+        candidate_indices = set(int(i) for i in raw_highs if 0 <= int(i) < total)
         if anchor_idx < total - 1:
             cycle_max_idx = anchor_idx + int(np.argmax(highs[anchor_idx:]))
             candidate_indices.add(cycle_max_idx)
@@ -245,6 +250,8 @@ def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: n
 
         valid_candidates = []
         for idx in candidate_indices:
+            if idx < 0 or idx >= total:
+                continue
             lvl = float(highs[idx])
             if lvl < ref_price + min_dist:
                 continue
@@ -282,7 +289,7 @@ def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: n
             })
 
     else:
-        candidate_indices = set(int(i) for i in raw_lows)
+        candidate_indices = set(int(i) for i in raw_lows if 0 <= int(i) < total)
         if anchor_idx < total - 1:
             cycle_min_idx = anchor_idx + int(np.argmin(lows[anchor_idx:]))
             candidate_indices.add(cycle_min_idx)
@@ -292,6 +299,8 @@ def find_structural_targets(df: pd.DataFrame, raw_highs: np.ndarray, raw_lows: n
 
         valid_candidates = []
         for idx in candidate_indices:
+            if idx < 0 or idx >= total:
+                continue
             lvl = float(lows[idx])
             if lvl > ref_price - min_dist:
                 continue
@@ -340,7 +349,6 @@ def build_structural_entry_zone(df: pd.DataFrame, raw_highs: np.ndarray, raw_low
       1. The Peak Formation Zone itself (for a 2nd-Leg W or M retest), OR
       2. A confirmed Structural Swing High/Low (BOS / Flip Zone) where a real
          swing point formed and broke structure.
-    Never on a random candle in the middle of a range!
     """
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -348,22 +356,18 @@ def build_structural_entry_zone(df: pd.DataFrame, raw_highs: np.ndarray, raw_low
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     total  = len(closes)
 
+    anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
     zone_thickness = 0.40 * atr
 
     if is_bullish:
-        # Default: Peak Formation Low (W) Base Zone
         top_val = round(anchor_price + zone_thickness, decimals)
         bot_val = round(anchor_price, decimals)
         zone_time = int(dates[anchor_idx])
 
-        # Only advance to a Higher Low Swing Zone if a CONFIRMED structural swing low (`raw_lows`)
-        # formed after the anchor AND price subsequently broke a swing high (BOS) from that low!
-        post_swing_lows = [int(i) for i in raw_lows if anchor_idx + 4 <= i <= total - 4]
+        post_swing_lows = [int(i) for i in raw_lows if anchor_idx + 4 <= int(i) <= total - 4]
         for sl_idx in reversed(post_swing_lows):
             sl_price = float(lows[sl_idx])
-            # Must be a Higher Low above the Peak Low, and price must have displaced >= 1.5 ATR above it
             if sl_price > anchor_price and (np.max(highs[sl_idx:]) - sl_price) >= (1.5 * atr):
-                # Ensure no candle after sl_idx broke below sl_price
                 if np.min(lows[sl_idx:]) >= sl_price - (0.05 * atr) and closes[-1] >= sl_price:
                     bot_val   = round(sl_price, decimals)
                     top_val   = round(sl_price + zone_thickness, decimals)
@@ -381,14 +385,11 @@ def build_structural_entry_zone(df: pd.DataFrame, raw_highs: np.ndarray, raw_low
         }]
 
     else:
-        # Default: Peak Formation High (M) Supply Zone
         top_val = round(anchor_price, decimals)
         bot_val = round(anchor_price - zone_thickness, decimals)
         zone_time = int(dates[anchor_idx])
 
-        # Only advance to a Lower High Swing Zone if a CONFIRMED structural swing high (`raw_highs`)
-        # formed after the anchor AND price displaced >= 1.5 ATR below it!
-        post_swing_highs = [int(i) for i in raw_highs if anchor_idx + 4 <= i <= total - 4]
+        post_swing_highs = [int(i) for i in raw_highs if anchor_idx + 4 <= int(i) <= total - 4]
         for sh_idx in reversed(post_swing_highs):
             sh_price = float(highs[sh_idx])
             if sh_price < anchor_price and (sh_price - np.min(lows[sh_idx:])) >= (1.5 * atr):
@@ -419,8 +420,8 @@ def detect_liquidity_sweeps(df: pd.DataFrame, swing_highs: np.ndarray, swing_low
     total    = len(closes)
     cutoff   = max(0, total - 200)
 
-    recent_highs = swing_highs[swing_highs >= cutoff]
-    recent_lows  = swing_lows[swing_lows >= cutoff]
+    recent_highs = [int(i) for i in swing_highs if cutoff <= int(i) < total]
+    recent_lows  = [int(i) for i in swing_lows if cutoff <= int(i) < total]
 
     for sh_idx in recent_highs:
         sh_price = highs[sh_idx]
@@ -473,8 +474,8 @@ def detect_double_pattern(df: pd.DataFrame, swing_highs: np.ndarray, swing_lows:
         "m_confirmed": False, "m_high1": None, "m_high2": None, "m_middle": None, "m_high2_idx": None,
     }
 
-    recent_lows  = sorted([int(i) for i in swing_lows if i >= cutoff])
-    recent_highs = sorted([int(i) for i in swing_highs if i >= cutoff])
+    recent_lows  = sorted([int(i) for i in swing_lows if cutoff <= int(i) < total])
+    recent_highs = sorted([int(i) for i in swing_highs if cutoff <= int(i) < total])
 
     for k in range(len(recent_lows) - 1, 0, -1):
         low2_idx = recent_lows[k]
@@ -820,7 +821,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     sweeps = detect_liquidity_sweeps(df, raw_highs, raw_lows, atr)
     pattern_info = detect_double_pattern(df, raw_highs, raw_lows, atr, anchor_idx=anchor_idx)
 
-    # ── True Structural Entry Zone (Never a random mid-air candle!) ─────────
     zone_boxes = build_structural_entry_zone(
         df, raw_highs, raw_lows, atr, is_bullish, int(anchor_idx), anchor_price, decimals
     )
@@ -945,17 +945,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                           ema_50: float, ema_200: float, rsi: float,
                           htf_aligned: bool, decimals: int, pip_size: float,
                           state_key: Optional[str] = None) -> Dict:
-    """
-    DETERMINISTIC NON-REPAINTING SNIPER ENGINE:
-      Instead of triggering on random mid-air candles or shifting the entry price every hour:
-      1. Scans historical bars after the initial Peak displacement to find the EXACT first
-         candle (`signal_idx`) that retested the Structural Zone / Trendline and printed a
-         rejection close STILL NEAR THE ZONE (within 0.65 ATR — never after a 25-pip dump!).
-      2. Verifies whether that deterministic trade is still active (hasn't hit SL or TP1 on any
-         subsequent bar). If still open, it locks `entry = closes[signal_idx]`!
-      3. Because `signal_idx` is a fixed historical candle in `df`, the Entry, SL, TP1, and TP2
-         will NEVER shift by even 0.1 pip as new candles form!
-    """
     is_bullish     = ms["is_bullish"]
     peak_confirmed = ms["peak_confirmed"]
     anchor_price   = ms["anchor"]
@@ -977,10 +966,26 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     t1_level  = targets[0]["level"]
     t2_level  = targets[1]["level"]
 
-    # ── 1. SCAN FOR A DETERMINISTIC, UNCLOSED SIGNAL CANDLE AFTER PEAK CONFIRMATION ──
-    # A retest can only happen after price first displaced away from the Peak (at least anchor_idx + 4)
-    locked_trade = None
-    if peak_confirmed and total > anchor_idx + 4:
+    # ── 1. CHECK IN-MEMORY FROZEN TRADE VAULT FIRST ─────────────────────────
+    if state_key and state_key in ACTIVE_TRADES:
+        lt = ACTIVE_TRADES[state_key]
+        live_high = max(float(full_df['High'].iloc[-1]), current_price)
+        live_low  = min(float(full_df['Low'].iloc[-1]), current_price)
+        closed_out = False
+        if lt["is_bullish"] != is_bullish:
+            closed_out = True
+        elif lt["is_bullish"] and (live_low <= lt["stop_loss"] or live_high >= lt["target_1"]):
+            closed_out = True
+        elif (not lt["is_bullish"]) and (live_high >= lt["stop_loss"] or live_low <= lt["target_1"]):
+            closed_out = True
+
+        if closed_out:
+            del ACTIVE_TRADES[state_key]
+
+    # ── 2. SCAN FOR A DETERMINISTIC, UNCLOSED SIGNAL CANDLE AFTER PEAK CONFIRMATION ──
+    locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
+
+    if locked_trade is None and peak_confirmed and total > anchor_idx + 4:
         search_start = max(anchor_idx + 4, total - 35)
         for k in range(search_start, total):
             c_open  = float(opens[k])
@@ -995,7 +1000,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             l_wick  = min(c_open, c_close) - c_low
 
             if is_bullish:
-                # Did candle k (or k-1) physically touch the Buy Zone or Demand Trendline?
                 touched_ob = (min(c_low, p_low) <= active_ob["top"] + 0.15 * atr) and (c_close >= active_ob["bottom"])
                 touched_tl = False
                 tl_k = None
@@ -1006,7 +1010,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 if not (touched_ob or touched_tl):
                     continue
 
-                # Rejection check + ANTI-CHASE RULE: c_close must be within 0.65 ATR of the zone!
                 zone_ref = tl_k if (touched_tl and tl_k is not None) else active_ob["top"]
                 is_bull_rej = (
                     ((c_close > c_open) and (body_sz >= 0.10 * atr))
@@ -1021,21 +1024,22 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 sl_k    = round(min(floor_k - 0.30 * atr, entry_k - 0.50 * atr), decimals)
                 risk_k  = max(abs(entry_k - sl_k), 1e-6)
 
-                # Calculate targets from the moment of entry_k
                 t_list  = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, anchor_idx, anchor_price, atr, decimals)
+                if len(t_list) < 2:
+                    continue
                 tp1_k   = t_list[0]["level"]
                 tp2_k   = t_list[1]["level"]
                 rr_k    = round(max(abs(tp1_k - entry_k), abs(tp2_k - entry_k)) / risk_k, 2)
                 if rr_k < MIN_ALLOWED_RR:
                     continue
 
-                # Check if any subsequent candle (from k+1 up to live tick) hit sl_k or tp1_k
                 post_lows  = list(lows[k + 1:]) + [float(full_df['Low'].iloc[-1]), current_price]
                 post_highs = list(highs[k + 1:]) + [float(full_df['High'].iloc[-1]), current_price]
                 if min(post_lows) <= sl_k or max(post_highs) >= tp1_k:
-                    continue  # Trade already finished; keep scanning for a newer setup
+                    continue
 
                 locked_trade = {
+                    "is_bullish":  True,
                     "signal":      "BUY",
                     "signal_idx":  k,
                     "signal_time": int(dates[k]),
@@ -1046,10 +1050,11 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     "risk_reward": rr_k,
                     "zone_name":   "Demand Trendline" if touched_tl else "Buy Zone / OB",
                 }
+                if state_key:
+                    ACTIVE_TRADES[state_key] = locked_trade
                 break
 
             else:
-                # Bearish Cycle: Did candle k (or k-1) physically touch the Sell Zone or Supply Trendline?
                 touched_ob = (max(c_high, p_high) >= active_ob["bottom"] - 0.15 * atr) and (c_close <= active_ob["top"])
                 touched_tl = False
                 tl_k = None
@@ -1060,8 +1065,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 if not (touched_ob or touched_tl):
                     continue
 
-                # Rejection check + ANTI-CHASE RULE: c_close must be within 0.65 ATR of the zone!
-                # Fixes EUR/USD & USD/CAD firing 20 pips below the Sell Zone after 3 giant red candles!
                 zone_ref = tl_k if (touched_tl and tl_k is not None) else active_ob["bottom"]
                 is_bear_rej = (
                     ((c_close < c_open) and (body_sz >= 0.10 * atr))
@@ -1077,6 +1080,8 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 risk_k  = max(abs(sl_k - entry_k), 1e-6)
 
                 t_list  = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, anchor_idx, anchor_price, atr, decimals)
+                if len(t_list) < 2:
+                    continue
                 tp1_k   = t_list[0]["level"]
                 tp2_k   = t_list[1]["level"]
                 rr_k    = round(max(abs(entry_k - tp1_k), abs(entry_k - tp2_k)) / risk_k, 2)
@@ -1089,6 +1094,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     continue
 
                 locked_trade = {
+                    "is_bullish":  False,
                     "signal":      "SELL",
                     "signal_idx":  k,
                     "signal_time": int(dates[k]),
@@ -1099,9 +1105,10 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     "risk_reward": rr_k,
                     "zone_name":   "Supply Trendline" if touched_tl else "Sell Zone / OB",
                 }
+                if state_key:
+                    ACTIVE_TRADES[state_key] = locked_trade
                 break
 
-    # ── 2. IF A VALID DETERMINISTIC TRADE IS ACTIVE, RETURN IT FROZEN ────────
     if locked_trade:
         f_entry = locked_trade["entry"]
         f_sl    = locked_trade["stop_loss"]
@@ -1164,7 +1171,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             }
         }
 
-    # ── 3. NO ACTIVE TRADE: CHECK IF LIVE PRICE IS IN ZONE OR AWAITING PULLBACK ──
     live_high = max(float(full_df['High'].iloc[-1]), current_price)
     live_low  = min(float(full_df['Low'].iloc[-1]), current_price)
     live_open = float(full_df['Open'].iloc[-1])
@@ -1375,12 +1381,13 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v6.0 (Deterministic Non-Repainting Structural Sniper)",
+            "✅ ENGINE VERSION": "AuraBrain v6.1 (Bounds-Safe Deterministic Sniper)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 CYCLE":          ms['cycle'],
             "⚓ ANCHOR":          ms['anchor'],
             "🎯 POI ZONE":       ms['poi_level'],
             "🎯 TARGETS":        ms.get('targets', []),
+            "🔒 ACTIVE TRADES":  ACTIVE_TRADES,
         }
     except Exception as e:
         import traceback
