@@ -58,6 +58,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
   const [displayState, setDisplayState] = useState({
     type: 'WAIT',
     bias: 'NEUTRAL',
+    stage: 'AWAITING_PULLBACK',
     confidence: 0,
     isLocked: false,
     timestamp: Date.now()
@@ -71,6 +72,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     const rawConf   = Math.max(0, newData.confidence || 0);
     const rawSignal = (newData.signal || 'WAIT').toUpperCase();
     const rawTrend  = (newData.trend  || '').toUpperCase();
+    const stage     = newData?.executionPlan?.stage || 'AWAITING_PULLBACK';
     const pairKey   = `${newData.trend || 'PAIR'}_${newData?.keyLevels?.ema200 || ''}`;
 
     const cycleBias = rawTrend.includes('BULLISH') ? 'BULLISH'
@@ -101,6 +103,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     const newState = {
       type:       nextType,
       bias:       cycleBias,
+      stage:      locked ? 'TRADE_ACTIVE' : stage,
       confidence: rawConf,
       isLocked:   locked,
       timestamp:  Date.now(),
@@ -144,35 +147,38 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
     return `${h}h ${String(m).padStart(2, '0')}m ${String(sec).padStart(2, '0')}s`;
   };
 
+  const isInZone = displayState.stage === 'IN_ZONE_CONFIRMING';
+  const isLocked = displayState.isLocked;
+
   const signalColor = displayState.type === 'BUY'  ? '#00e676'
                     : displayState.type === 'SELL' ? '#ff4757'
                     : displayState.bias === 'BULLISH' ? '#00e676'
                     : displayState.bias === 'BEARISH' ? '#ff4757'
                     : '#f0b429';
 
-  const statusLabel = displayState.type === 'BUY'  ? 'BUY ACTIVE'
-                    : displayState.type === 'SELL' ? 'SELL ACTIVE'
-                    : displayState.bias === 'BULLISH' ? 'WAIT FOR BUY'
-                    : displayState.bias === 'BEARISH' ? 'WAIT FOR SELL'
-                    : 'WAIT / NEUTRAL';
+  const statusLabel = displayState.type === 'BUY'  ? '🟢 BUY ACTIVE NOW'
+                    : displayState.type === 'SELL' ? '🔴 SELL ACTIVE NOW'
+                    : isInZone && displayState.bias === 'BULLISH' ? '🎯 IN BUY ZONE — WATCH 1H CLOSE'
+                    : isInZone && displayState.bias === 'BEARISH' ? '🎯 IN SELL ZONE — WATCH 1H CLOSE'
+                    : displayState.bias === 'BULLISH' ? '⏳ AWAITING BUY PULLBACK'
+                    : displayState.bias === 'BEARISH' ? '⏳ AWAITING SELL RALLY'
+                    : 'SCANNING STRUCTURE';
 
-  const isLocked = displayState.isLocked;
-  const isBusy   = loading;
+  const isBusy = loading;
 
-  const circumference = 2 * Math.PI * 32;
+  const circumference = 2 * Math.PI * 30;
   const dashOffset    = circumference - (displayState.confidence / 100) * circumference;
 
-  const lotSize = calcLotSize(
-    balance,
-    riskPct,
-    parseFloat(analysis?.tradeSetup?.entry) || 0,
-    parseFloat(analysis?.tradeSetup?.stop_loss) || 0,
-    pipValue
-  );
-  const riskAmount = ((balance * riskPct) / 100).toFixed(2);
+  const execPlan     = analysis?.executionPlan;
+  const calcEntry    = parseFloat(analysis?.tradeSetup?.entry || execPlan?.planned_entry) || 0;
+  const calcSL       = parseFloat(analysis?.tradeSetup?.stop_loss || execPlan?.planned_sl) || 0;
+  const calcRR       = analysis?.tradeSetup?.risk_reward || execPlan?.risk_reward || '—';
+  const lotSize      = calcLotSize(balance, riskPct, calcEntry, calcSL, pipValue);
+  const riskAmount   = ((balance * riskPct) / 100).toFixed(2);
 
   const mtfData  = analysis?.mtf_confluence || [];
-  const poiLevel = analysis?.keyLevels?.poi;
+  const poiLevel = execPlan?.planned_entry || analysis?.keyLevels?.poi;
+  const planSL   = execPlan?.planned_sl;
   const target1  = analysis?.keyLevels?.target1 || analysis?.tradeSetup?.target_1;
   const target2  = analysis?.keyLevels?.target2 || analysis?.tradeSetup?.target_2;
 
@@ -189,9 +195,9 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
       height: '100%', background: 'rgba(13,17,23,0.95)',
       border: upcomingNews.length > 0
         ? '1px solid rgba(239,83,80,0.5)'
-        : `1px solid ${isLocked ? signalColor + '55' : 'rgba(255,255,255,0.08)'}`,
-      borderRadius: 12, padding: 16, color: '#e8edf3',
-      display: 'flex', flexDirection: 'column', gap: 10,
+        : `1px solid ${isLocked ? signalColor + '65' : isInZone ? '#2962FF80' : 'rgba(255,255,255,0.08)'}`,
+      borderRadius: 12, padding: 14, color: '#e8edf3',
+      display: 'flex', flexDirection: 'column', gap: 9,
       transition: 'border 0.3s ease', overflow: 'hidden',
       fontFamily: "'Syne', sans-serif",
     }}>
@@ -208,8 +214,12 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           {isLocked ? (
-            <div style={{ fontSize: 9, background: `${signalColor}18`, color: signalColor, border: `1px solid ${signalColor}40`, padding: '2px 8px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
-              <Lock size={9} /> SIGNAL ACTIVE
+            <div style={{ fontSize: 9, background: `${signalColor}20`, color: signalColor, border: `1px solid ${signalColor}50`, padding: '2px 8px', borderRadius: 3, display: 'flex', alignItems: 'center', gap: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              <Lock size={9} /> TRADE ACTIVE
+            </div>
+          ) : isInZone ? (
+            <div style={{ fontSize: 9, background: 'rgba(41,98,255,0.2)', color: '#82b1ff', border: '1px solid rgba(41,98,255,0.5)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
+              🎯 ZONE TAPPED
             </div>
           ) : (
             <div style={{ fontSize: 9, background: 'rgba(240,180,41,0.1)', color: '#f0b429', border: '1px solid rgba(240,180,41,0.3)', padding: '2px 8px', borderRadius: 3, fontWeight: 700, fontFamily: "'Space Mono', monospace" }}>
@@ -235,17 +245,17 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
           <span style={{ fontSize: 11, fontFamily: "'Space Mono', monospace" }}>Simulating outcomes...</span>
         </div>
       ) : (
-        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto', minHeight: 0, paddingRight: 2 }}>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 8, overflowY: 'auto', minHeight: 0, paddingRight: 2 }}>
 
           {/* ─── TAB: SIGNAL ─── */}
           {activeTab === 'signal' && (
             <>
               {/* Readiness ring + Strategy Name */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: 'rgba(255,255,255,0.02)', padding: 12, borderRadius: 8, border: '1px solid rgba(255,255,255,0.04)', flexShrink: 0 }}>
-                <div style={{ position: 'relative', width: 72, height: 72, flexShrink: 0 }}>
-                  <svg width="72" height="72" style={{ transform: 'rotate(-90deg)' }}>
-                    <circle cx="36" cy="36" r="30" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
-                    <circle cx="36" cy="36" r="30" stroke={signalColor} strokeWidth="6" fill="transparent"
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.04)', flexShrink: 0 }}>
+                <div style={{ position: 'relative', width: 68, height: 68, flexShrink: 0 }}>
+                  <svg width="68" height="68" style={{ transform: 'rotate(-90deg)' }}>
+                    <circle cx="34" cy="34" r="30" stroke="rgba(255,255,255,0.06)" strokeWidth="6" fill="transparent" />
+                    <circle cx="34" cy="34" r="30" stroke={signalColor} strokeWidth="6" fill="transparent"
                       strokeDasharray={circumference} strokeDashoffset={dashOffset} strokeLinecap="round"
                       style={{ transition: 'stroke-dashoffset 0.8s ease-in-out' }} />
                   </svg>
@@ -259,29 +269,45 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                   <div style={{ fontSize: 8, color: '#f0b429', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 2, fontWeight: 700 }}>
                     STRATEGY: MMM PEAK & ZONE SNIPER
                   </div>
-                  <div style={{ fontSize: 24, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
-                  <div style={{ fontSize: 11, color: signalColor, fontWeight: 700, letterSpacing: 1.5, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
+                  <div style={{ fontSize: 22, fontWeight: 800, color: signalColor, lineHeight: 1 }}>{displayState.confidence}%</div>
+                  <div style={{ fontSize: 10, color: signalColor, fontWeight: 700, letterSpacing: 1, fontFamily: "'Space Mono', monospace", marginTop: 4 }}>
                     {statusLabel}
                   </div>
                 </div>
               </div>
 
-              {/* Planned Entry Zone + Targets Roadmap (Shown while waiting for price to tap the zone) */}
+              {/* Actionable Trigger Condition Banner (Tells user EXACTLY what to do right now) */}
+              {execPlan?.trigger_condition && (
+                <div style={{
+                  background: isLocked ? `${signalColor}15` : isInZone ? 'rgba(41,98,255,0.14)' : 'rgba(240,180,41,0.07)',
+                  border: `1px solid ${isLocked ? signalColor + '45' : isInZone ? 'rgba(41,98,255,0.45)' : 'rgba(240,180,41,0.25)'}`,
+                  padding: '8px 10px', borderRadius: 6, fontSize: 10.5, lineHeight: 1.45,
+                  color: '#f3f4f6', fontWeight: 600, flexShrink: 0
+                }}>
+                  {execPlan.trigger_condition}
+                </div>
+              )}
+
+              {/* Planned Trade Levels (While waiting or confirming in zone) */}
               {(target1 || target2) && !analysis?.tradeSetup && (
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 5, flexShrink: 0 }}>
-                  <div style={{ background: 'rgba(41,98,255,0.10)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(41,98,255,0.35)' }}>
-                    <div style={{ fontSize: 8, color: '#82b1ff', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>
-                      {displayState.bias === 'BULLISH' ? 'BUY ZONE 🎯' : 'SELL ZONE 🎯'}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4, flexShrink: 0 }}>
+                  <div style={{ background: 'rgba(41,98,255,0.10)', padding: '6px 3px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(41,98,255,0.35)' }}>
+                    <div style={{ fontSize: 7.5, color: '#82b1ff', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>
+                      {displayState.bias === 'BULLISH' ? 'BUY ZONE' : 'SELL ZONE'}
                     </div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{poiLevel ?? '—'}</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#fff', fontFamily: "'Space Mono', monospace" }}>{poiLevel ?? '—'}</div>
                   </div>
-                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
-                    <div style={{ fontSize: 8, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1</div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target1 ?? '—'}</div>
+                  <div style={{ background: 'rgba(255,71,87,0.10)', padding: '6px 3px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(255,71,87,0.25)' }}>
+                    <div style={{ fontSize: 7.5, color: '#ff4757', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>PLANNED SL</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#ffcdd2', fontFamily: "'Space Mono', monospace" }}>{planSL ?? '—'}</div>
                   </div>
-                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 4px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
-                    <div style={{ fontSize: 8, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2 🚀</div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target2 ?? '—'}</div>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 3px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 7.5, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 1</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target1 ?? '—'}</div>
+                  </div>
+                  <div style={{ background: 'rgba(240,180,41,0.07)', padding: '6px 3px', borderRadius: 5, textAlign: 'center', border: '1px solid rgba(240,180,41,0.25)' }}>
+                    <div style={{ fontSize: 7.5, color: '#f0b429', fontWeight: 700, fontFamily: "'Space Mono', monospace", marginBottom: 2 }}>TARGET 2</div>
+                    <div style={{ fontSize: 10, fontWeight: 700, color: '#ffe082', fontFamily: "'Space Mono', monospace" }}>{target2 ?? '—'}</div>
                   </div>
                 </div>
               )}
@@ -316,18 +342,27 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               )}
 
               {/* 4-Step Strategy Checklist */}
-              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 120, display: 'flex', flexDirection: 'column' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
+              <div style={{ background: 'rgba(255,255,255,0.02)', padding: '10px 12px', borderRadius: 7, borderLeft: `3px solid ${signalColor}`, flex: 1, minHeight: 110, display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 6, color: signalColor, fontSize: 10, fontWeight: 700, fontFamily: "'Space Mono', monospace", flexShrink: 0 }}>
                   <History size={12} /> 4-STEP ENTRY CHECKLIST
                 </div>
-                <div style={{ fontSize: 11, color: '#d1d5db', lineHeight: 1.55, overflowY: 'auto', paddingTop: 2, paddingRight: 4 }}>
-                  {analysis?.reasoning && Array.isArray(analysis.reasoning)
-                    ? analysis.reasoning.map((r, i) => (
-                        <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginBottom: 6 }}>
-                          <span style={{ flex: 1 }}>{r}</span>
-                        </div>
-                      ))
-                    : (analysis?.reason || 'Scanning market structure...')}
+                <div style={{ fontSize: 10.5, color: '#d1d5db', lineHeight: 1.5, overflowY: 'auto', paddingTop: 2, paddingRight: 4 }}>
+                  {analysis?.checklist && Array.isArray(analysis.checklist) ? (
+                    analysis.checklist.map((item, i) => (
+                      <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0', borderBottom: i < analysis.checklist.length - 1 ? '1px solid rgba(255,255,255,0.04)' : 'none' }}>
+                        <span style={{ color: item.done ? '#e8edf3' : '#9ca3af', fontWeight: item.done ? 600 : 400 }}>
+                          {item.done ? '✅ ' : '⏳ '}{item.step}
+                        </span>
+                        <span style={{ fontSize: 9.5, fontFamily: "'Space Mono', monospace", color: item.done ? '#00e676' : '#f0b429', fontWeight: 700, marginLeft: 6 }}>
+                          {item.detail}
+                        </span>
+                      </div>
+                    ))
+                  ) : (
+                    analysis?.reasoning?.map((r, i) => (
+                      <div key={i} style={{ marginBottom: 5 }}>{r}</div>
+                    ))
+                  )}
                 </div>
               </div>
 
@@ -349,7 +384,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             </>
           )}
 
-          {/* ─── TAB: RISK CALCULATOR ─── */}
+          {/* ─── TAB: RISK CALCULATOR (Works for both Planned & Active Setups!) ─── */}
           {activeTab === 'risk' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>POSITION SIZING</div>
@@ -361,28 +396,30 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
               <div style={{ height: 1, background: 'rgba(255,255,255,0.05)', margin: '4px 0' }} />
 
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <ResultBox label="LOT SIZE"    value={lotSize || '—'} color="#f0b429" unit={lotSize ? 'lots' : 'awaiting entry'} />
-                <ResultBox label="RISK AMOUNT" value={`$${riskAmount}`} color="#ff4757" />
+                <ResultBox label="RECOMMENDED LOTS" value={lotSize || '—'} color="#f0b429" unit={lotSize ? 'standard lots' : 'awaiting zone'} />
+                <ResultBox label="RISK AMOUNT"      value={`$${riskAmount}`} color="#ff4757" />
               </div>
 
-              {analysis?.tradeSetup && (
+              {calcEntry > 0 && (
                 <div style={{ background: 'rgba(255,255,255,0.02)', padding: 10, borderRadius: 6, border: '1px solid rgba(255,255,255,0.05)', fontSize: 11, fontFamily: "'Space Mono', monospace" }}>
-                  <div style={{ color: '#6b7a8d', marginBottom: 6, fontSize: 9, letterSpacing: 1 }}>ACTIVE TRADE SETUP</div>
+                  <div style={{ color: '#f0b429', marginBottom: 6, fontSize: 9, letterSpacing: 1, fontWeight: 700 }}>
+                    {analysis?.tradeSetup ? 'ACTIVE TRADE PARAMETERS' : 'PLANNED ZONE PARAMETERS'}
+                  </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ color: '#9ca3af' }}>Entry</span>
-                    <span style={{ color: '#fff' }}>{analysis.tradeSetup.entry}</span>
+                    <span style={{ color: '#9ca3af' }}>{analysis?.tradeSetup ? 'Live Entry' : 'Planned Zone Entry'}</span>
+                    <span style={{ color: '#fff' }}>{calcEntry}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                     <span style={{ color: '#9ca3af' }}>Stop Loss</span>
-                    <span style={{ color: '#ff4757' }}>{analysis.tradeSetup.stop_loss}</span>
+                    <span style={{ color: '#ff4757' }}>{calcSL}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                     <span style={{ color: '#9ca3af' }}>Target 1 / Target 2</span>
-                    <span style={{ color: '#00e676' }}>{analysis.tradeSetup.take_profit} / {analysis.tradeSetup.target_2 || '—'}</span>
+                    <span style={{ color: '#00e676' }}>{target1 ?? '—'} / {target2 ?? '—'}</span>
                   </div>
                   <div style={{ display: 'flex', justifyContent: 'space-between' }}>
-                    <span style={{ color: '#9ca3af' }}>RR</span>
-                    <span style={{ color: '#00e676' }}>1:{analysis.tradeSetup.risk_reward}</span>
+                    <span style={{ color: '#9ca3af' }}>Projected RR</span>
+                    <span style={{ color: '#00e676' }}>1:{calcRR}</span>
                   </div>
                 </div>
               )}
