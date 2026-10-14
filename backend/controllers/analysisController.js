@@ -123,7 +123,7 @@ exports.analyzePattern = async (req, res) => {
 
             const aiResult = pythonResponse.data;
 
-            // Check if there is an existing OPEN trade with bad legacy RR (< 1.5) or opposite cycle direction
+            // Purge any stale legacy OPEN trade with RR < 1.5 or opposite cycle direction
             const existingOpen = await Trade.findOne({ symbol: targetSymbol, status: 'OPEN' });
             if (existingOpen) {
                 const risk = Math.max(Math.abs(existingOpen.entry - existingOpen.sl), 1e-6);
@@ -132,21 +132,22 @@ exports.analyzePattern = async (req, res) => {
                 const tradeIsBuy  = existingOpen.action === 'Buy';
 
                 if (rr < 1.5 || cycleIsBull !== tradeIsBuy) {
-                    // Purge stale legacy mid-air trade (like USD/JPY RR 1.09)
                     await Trade.deleteOne({ _id: existingOpen._id });
                 }
             }
 
             const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
 
+            // If an OPEN trade is active on this symbol, synchronize the entire UI payload!
             if (activeTrade && activeTrade.status === 'OPEN') {
                 const risk = Math.max(Math.abs(activeTrade.entry - activeTrade.sl), 1e-6);
                 const t1   = activeTrade.tp;
                 const t2   = aiResult.keyLevels?.target2 || activeTrade.tp;
                 const rr   = parseFloat((Math.max(Math.abs(t1 - activeTrade.entry), Math.abs(t2 - activeTrade.entry)) / risk).toFixed(2));
+                const dir  = activeTrade.action.toUpperCase(); // 'BUY' or 'SELL'
 
-                aiResult.signal     = activeTrade.action.toUpperCase();
-                aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 75);
+                aiResult.signal     = dir;
+                aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 80);
                 aiResult.tradeSetup = {
                     entry:       activeTrade.entry,
                     stop_loss:   activeTrade.sl,
@@ -156,8 +157,30 @@ exports.analyzePattern = async (req, res) => {
                     risk_reward: rr
                 };
 
-                // Align the projected arrow directly from current price -> Target 1 -> Target 2 while trade is active!
+                // Synchronize executionPlan & 4-Step Checklist so the sidebar never shows "Watch 1H Close!" during an active trade
+                aiResult.executionPlan = {
+                    ...(aiResult.executionPlan || {}),
+                    stage:             'TRADE_ACTIVE',
+                    trigger_condition: `${dir === 'BUY' ? '🟢 BUY' : '🔴 SELL'} TRADE EXECUTING @ ${activeTrade.entry} — Target 1: ${t1} | Stop Loss: ${activeTrade.sl}`,
+                    planned_entry:     activeTrade.entry,
+                    planned_sl:        activeTrade.sl,
+                    planned_tp1:       t1,
+                    planned_tp2:       t2,
+                    risk_reward:       rr
+                };
+
+                if (Array.isArray(aiResult.checklist) && aiResult.checklist.length >= 4) {
+                    aiResult.checklist[1].done   = true;
+                    aiResult.checklist[1].detail = `Tapped @ ${activeTrade.entry} ✅`;
+                    aiResult.checklist[2].done   = true;
+                    aiResult.checklist[2].detail = 'Confirmed ✅';
+                    aiResult.checklist[3].done   = true;
+                    aiResult.checklist[3].detail = `1:${rr}`;
+                }
+
+                // Point the chart arrow smoothly from Entry -> Target 1 -> Target 2
                 if (aiResult.visuals && Array.isArray(aiResult.visuals.projection_path) && aiResult.visuals.projection_path.length >= 3) {
+                    aiResult.visuals.projection_path[0].price = activeTrade.entry;
                     aiResult.visuals.projection_path[1].price = t1;
                     aiResult.visuals.projection_path[2].price = t2;
                 }

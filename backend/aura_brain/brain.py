@@ -350,23 +350,27 @@ def detect_order_blocks(df: pd.DataFrame, atr: float, is_bullish: bool,
     total  = len(closes)
 
     if is_bullish:
+        top_val = round(anchor_price + (0.35 * atr), decimals)
+        bot_val = round(anchor_price, decimals)
         peak_ob = {
             "type":      "BULL_OB",
-            "top":       round(anchor_price + (0.35 * atr), decimals),
-            "bottom":    round(anchor_price, decimals),
+            "top":       top_val,
+            "bottom":    bot_val,
             "time":      int(dates[anchor_idx]),
             "end_time":  int(dates[-1]),
-            "label":     f"BUY ZONE / OB ({anchor_price:.{decimals}f})",
+            "label":     f"BUY ZONE / OB ({bot_val:.{decimals}f}–{top_val:.{decimals}f})",
             "mitigated": False
         }
     else:
+        top_val = round(anchor_price, decimals)
+        bot_val = round(anchor_price - (0.35 * atr), decimals)
         peak_ob = {
             "type":      "BEAR_OB",
-            "top":       round(anchor_price, decimals),
-            "bottom":    round(anchor_price - (0.35 * atr), decimals),
+            "top":       top_val,
+            "bottom":    bot_val,
             "time":      int(dates[anchor_idx]),
             "end_time":  int(dates[-1]),
-            "label":     f"SELL ZONE / OB ({anchor_price:.{decimals}f})",
+            "label":     f"SELL ZONE / OB ({bot_val:.{decimals}f}–{top_val:.{decimals}f})",
             "mitigated": False
         }
 
@@ -921,29 +925,26 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 "color":       "rgba(59, 255, 130, 0.8)" if is_bullish else "rgba(255, 59, 59, 0.8)",
             }
 
-    # ── Smart POI Entry Zone Level (Uses Dynamic EMA/OB if Peak is Far Away) ──
+    # ── Strictly Unified POI Entry Zone Level (Always matches the drawn Box/Trendline!) ──
     active_ob = zone_boxes[0] if zone_boxes else None
-    ema50_now = float(ema_50_array[-1])
     if is_bullish:
-        candidates = []
-        if trendline_data:
-            candidates.append(trendline_data["end_level"])
-        if active_ob:
-            candidates.append(active_ob["top"])
-        # If price has displaced > 3.5 ATR above the Peak Low and is holding above 50 EMA (like GBP/USD),
-        # include the 50 EMA dynamic support so the arrow doesn't dive all the way to the bottom of the screen!
-        if (current_price_val - anchor_price) > (3.5 * atr) and current_price_val > ema50_now:
-            candidates.append(ema50_now)
-        poi_level = max(candidates) if candidates else (current_price_val - 0.55 * atr)
+        if trendline_data and active_ob:
+            poi_level = max(trendline_data["end_level"], active_ob["top"])
+        elif active_ob:
+            poi_level = active_ob["top"]
+        elif trendline_data:
+            poi_level = trendline_data["end_level"]
+        else:
+            poi_level = current_price_val - (0.55 * atr)
     else:
-        candidates = []
-        if trendline_data:
-            candidates.append(trendline_data["end_level"])
-        if active_ob:
-            candidates.append(active_ob["bottom"])
-        if (anchor_price - current_price_val) > (3.5 * atr) and current_price_val < ema50_now:
-            candidates.append(ema50_now)
-        poi_level = min(candidates) if candidates else (current_price_val + 0.55 * atr)
+        if trendline_data and active_ob:
+            poi_level = min(trendline_data["end_level"], active_ob["bottom"])
+        elif active_ob:
+            poi_level = active_ob["bottom"]
+        elif trendline_data:
+            poi_level = trendline_data["end_level"]
+        else:
+            poi_level = current_price_val + (0.55 * atr)
 
     step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
     projection_path = [
@@ -979,13 +980,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
 def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
                           ema_50: float, ema_200: float, rsi: float,
                           htf_aligned: bool, decimals: int, pip_size: float) -> Dict:
-    """
-    3-Stage "MMM Peak & Zone Sniper" Execution Engine:
-      - Stage 1 (AWAITING_PULLBACK): Shows distance in pips to the Buy/Sell Zone + Planned Entry/SL/TP.
-      - Stage 2 (IN_ZONE_CONFIRMING): Price is INSIDE the Buy/Sell Zone right now! Tells user the exact
-                                      1H candle close price required to trigger the trade.
-      - Stage 3 (TRADE_ACTIVE): Rejection candle closed! Locks live Entry, SL, TP1, and TP2.
-    """
     is_bullish     = ms["is_bullish"]
     peak_confirmed = ms["peak_confirmed"]
     anchor_price   = ms["anchor"]
@@ -1040,13 +1034,11 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         if active_ob:
             in_ob = (min(last_low, prev_low) <= active_ob["top"] + 0.25 * atr) and (last_close >= active_ob["bottom"] - 0.05 * atr)
 
-        near_poi    = (min(last_low, prev_low) <= poi_level + 0.25 * atr) and (last_close >= poi_level - 0.15 * atr)
-        zone_tapped = near_anchor_w or near_tl or in_ob or near_poi
+        zone_tapped = near_anchor_w or near_tl or in_ob
         zone_name   = "Demand Trendline" if near_tl else ("Bullish Order Block" if in_ob else f"Buy Zone ({poi_level:.{decimals}f})")
 
-        # Calculate Stop Loss safely below the zone
         ref_entry  = current_price if zone_tapped else poi_level
-        zone_floor = active_ob["bottom"] if (in_ob and active_ob) else (trendline["end_level"] if (near_tl and trendline) else min(poi_level, last_low, prev_low))
+        zone_floor = active_ob["bottom"] if active_ob else (trendline["end_level"] if trendline else anchor_price)
         sl_base    = min(zone_floor, ref_entry) - (0.35 * atr)
         stop_loss  = round(min(sl_base, ref_entry - (0.55 * atr)), decimals)
 
@@ -1073,7 +1065,7 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
 
         if peak_confirmed and zone_tapped and bullish_rejection and rr_ok and rsi < 68:
             stage = "TRADE_ACTIVE"
-            trigger_note = f"🟢 BUY TRIGGERED @ {current_price:.{decimals}f} ({zone_name}) — Rejection candle confirmed!"
+            trigger_note = f"🟢 BUY EXECUTING @ {current_price:.{decimals}f} ({zone_name}) — Target 1: {t1_level:.{decimals}f} | Target 2: {t2_level:.{decimals}f}"
         elif zone_tapped:
             stage = "IN_ZONE_CONFIRMING"
             trigger_price = round(max(last_open, poi_level), decimals)
@@ -1098,8 +1090,8 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
             now_ts = int(df['Date'].iloc[-1]) if 'Date' in df.columns else 0
             ms["projection_path"] = [
                 {"time": now_ts, "price": round(current_price, decimals), "label": "Entry"},
-                {"time": now_ts + step_seconds * 6, "price": t1_level, "label": "Target 1"},
-                {"time": now_ts + step_seconds * 14, "price": t2_level, "label": "Target 2"},
+                {"time": now_ts + step_seconds * 4, "price": t1_level, "label": "TP1"},
+                {"time": now_ts + step_seconds * 8, "price": t2_level, "label": "TP2"},
             ]
             return {
                 "signal":         "BUY",
@@ -1129,7 +1121,6 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         }
 
     else:
-        # Bearish Cycle Evaluation
         near_anchor_m = (0.0 <= (anchor_price - current_price) <= 1.15 * atr)
         near_tl       = False
         if trendline:
@@ -1140,12 +1131,11 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
         if active_ob:
             in_ob = (max(last_high, prev_high) >= active_ob["bottom"] - 0.25 * atr) and (last_close <= active_ob["top"] + 0.05 * atr)
 
-        near_poi    = (max(last_high, prev_high) >= poi_level - 0.25 * atr) and (last_close <= poi_level + 0.15 * atr)
-        zone_tapped = near_anchor_m or near_tl or in_ob or near_poi
-        zone_name   = "Supply Trendline" if near_tl else ("Bearish Order Block" if in_ob else f"Sell Zone ({poi_level:.{decimals}f})")
+        zone_tapped  = near_anchor_m or near_tl or in_ob
+        zone_name    = "Supply Trendline" if near_tl else ("Bearish Order Block" if in_ob else f"Sell Zone ({poi_level:.{decimals}f})")
 
         ref_entry    = current_price if zone_tapped else poi_level
-        zone_ceiling = active_ob["top"] if (in_ob and active_ob) else (trendline["end_level"] if (near_tl and trendline) else max(poi_level, last_high, prev_high))
+        zone_ceiling = active_ob["top"] if active_ob else (trendline["end_level"] if trendline else anchor_price)
         sl_base      = max(zone_ceiling, ref_entry) + (0.35 * atr)
         stop_loss    = round(max(sl_base, ref_entry + (0.55 * atr)), decimals)
 
@@ -1172,7 +1162,7 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
 
         if peak_confirmed and zone_tapped and bearish_rejection and rr_ok and rsi > 32:
             stage = "TRADE_ACTIVE"
-            trigger_note = f"🔴 SELL TRIGGERED @ {current_price:.{decimals}f} ({zone_name}) — Rejection candle confirmed!"
+            trigger_note = f"🔴 SELL EXECUTING @ {current_price:.{decimals}f} ({zone_name}) — Target 1: {t1_level:.{decimals}f} | Target 2: {t2_level:.{decimals}f}"
         elif zone_tapped:
             stage = "IN_ZONE_CONFIRMING"
             trigger_price = round(min(last_open, poi_level), decimals)
@@ -1197,8 +1187,8 @@ def evaluate_entry_signal(df: pd.DataFrame, ms: Dict, current_price: float,
             now_ts = int(df['Date'].iloc[-1]) if 'Date' in df.columns else 0
             ms["projection_path"] = [
                 {"time": now_ts, "price": round(current_price, decimals), "label": "Entry"},
-                {"time": now_ts + step_seconds * 6, "price": t1_level, "label": "Target 1"},
-                {"time": now_ts + step_seconds * 14, "price": t2_level, "label": "Target 2"},
+                {"time": now_ts + step_seconds * 4, "price": t1_level, "label": "TP1"},
+                {"time": now_ts + step_seconds * 8, "price": t2_level, "label": "TP2"},
             ]
             return {
                 "signal":         "SELL",
@@ -1349,7 +1339,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v5.3 (3-Phase Execution Plan + Smart POI)",
+            "✅ ENGINE VERSION": "AuraBrain v5.4 (Unified POI Zone + 3-Phase Execution)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 CYCLE":          ms['cycle'],
             "⚓ ANCHOR":          ms['anchor'],

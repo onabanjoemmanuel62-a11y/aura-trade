@@ -276,11 +276,20 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
                 </div>
               </div>
 
-              {/* Actionable Trigger Condition Banner (Tells user EXACTLY what to do right now) */}
-              {execPlan?.trigger_condition && (
+              {/* Actionable Trigger Condition Banner (Synchronized for Active vs Waiting states) */}
+              {isLocked && analysis?.tradeSetup ? (
                 <div style={{
-                  background: isLocked ? `${signalColor}15` : isInZone ? 'rgba(41,98,255,0.14)' : 'rgba(240,180,41,0.07)',
-                  border: `1px solid ${isLocked ? signalColor + '45' : isInZone ? 'rgba(41,98,255,0.45)' : 'rgba(240,180,41,0.25)'}`,
+                  background: `${signalColor}15`,
+                  border: `1px solid ${signalColor}45`,
+                  padding: '8px 10px', borderRadius: 6, fontSize: 10.5, lineHeight: 1.45,
+                  color: '#f3f4f6', fontWeight: 600, flexShrink: 0
+                }}>
+                  {displayState.type === 'BUY' ? '🟢 BUY EXECUTING:' : '🔴 SELL EXECUTING:'} Entered @ <strong>{analysis.tradeSetup.entry}</strong>. Target 1: <strong>{analysis.tradeSetup.take_profit}</strong> | Stop Loss: <strong>{analysis.tradeSetup.stop_loss}</strong>.
+                </div>
+              ) : execPlan?.trigger_condition && (
+                <div style={{
+                  background: isInZone ? 'rgba(41,98,255,0.14)' : 'rgba(240,180,41,0.07)',
+                  border: `1px solid ${isInZone ? 'rgba(41,98,255,0.45)' : 'rgba(240,180,41,0.25)'}`,
                   padding: '8px 10px', borderRadius: 6, fontSize: 10.5, lineHeight: 1.45,
                   color: '#f3f4f6', fontWeight: 600, flexShrink: 0
                 }}>
@@ -384,7 +393,7 @@ const SignalCard = ({ externalData, loading, onRefresh }) => {
             </>
           )}
 
-          {/* ─── TAB: RISK CALCULATOR (Works for both Planned & Active Setups!) ─── */}
+          {/* ─── TAB: RISK CALCULATOR ─── */}
           {activeTab === 'risk' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
               <div style={{ fontSize: 10, color: '#6b7a8d', fontFamily: "'Space Mono', monospace", letterSpacing: 1 }}>POSITION SIZING</div>
