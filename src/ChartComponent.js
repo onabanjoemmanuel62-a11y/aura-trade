@@ -52,7 +52,7 @@ const calculateEMA = (data, period) => {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🔵 PEAK FORMATION, BOS/CHoCH STRUCTURE & TARGET LINES
+// 🔵 HORIZONTAL STRUCTURE & TARGET LINES
 // ─────────────────────────────────────────────────────────────────────────────
 class LineRenderer {
   constructor(data) { this._data = data; }
@@ -84,15 +84,15 @@ class LineRenderer {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        ctx.font      = `bold ${10.5 * hPR}px monospace`;
+        ctx.font      = `bold ${11 * hPR}px monospace`;
         ctx.fillStyle = line.color;
 
         if (line.isStruct) {
-          const midX = Math.min(Math.max(x1 + 4 * hPR, (x1 + x2) / 2 - 40 * hPR), rightEdge - 160 * hPR);
-          ctx.fillText(line.label, midX, y - 5 * vPR);
+          const midX = Math.min(Math.max(x1 + 6 * hPR, (x1 + x2) / 2 - 38 * hPR), rightEdge - 160 * hPR);
+          ctx.fillText(line.label, midX, y - 6 * vPR);
         } else {
           const labelX = Math.min(x2 + 8 * hPR, rightEdge - 165 * hPR);
-          ctx.fillText(line.label, labelX, y - 5 * vPR);
+          ctx.fillText(line.label, labelX, y - 6 * vPR);
         }
         ctx.restore();
       });
@@ -122,7 +122,7 @@ class LinePrimitive {
         if (x1 === null || x2 === null || y === null) return null;
 
         const isAnchor = Boolean(line.is_anchor || line.type?.includes('Peak'));
-        const isStruct = Boolean(line.is_struct || line.type?.includes('BOS') || line.type?.includes('CHoCH') || line.type?.includes('$$$'));
+        const isStruct = Boolean(line.is_struct || line.type?.includes('BOS') || line.type?.includes('CHoCH'));
         const color    = line.color || (isAnchor ? 'rgba(255,215,0,0.9)' : 'rgba(239,83,80,0.8)');
 
         return { x1, x2, y, color, label: line.type || 'LEVEL', isAnchor, isStruct };
@@ -134,7 +134,7 @@ class LinePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟩 DEMAND/SUPPLY TRENDLINE (Sloped — Anchored to the Peak)
+// 🟩 DEMAND/SUPPLY TRENDLINE
 // ─────────────────────────────────────────────────────────────────────────────
 class TrendlineRenderer {
   constructor(data) { this._data = data; }
@@ -201,7 +201,7 @@ class TrendlinePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🟨 ORIGIN POI / ORDER BLOCK ZONE
+// 🟨 KEY ZONE / POI ORDER BLOCK BOX
 // ─────────────────────────────────────────────────────────────────────────────
 class OBZoneRenderer {
   constructor(data) { this._data = data; }
@@ -217,7 +217,7 @@ class OBZoneRenderer {
       this._data.forEach((zone) => {
         if (zone.x1 === null || zone.yTop === null || zone.yBottom === null) return;
         const x1      = Math.max(0, zone.x1 * hPR);
-        const x2      = rightEdge;
+        const x2      = zone.x2 !== null ? Math.min(zone.x2 * hPR, rightEdge) : rightEdge;
         const yTop    = Math.min(zone.yTop, zone.yBottom) * vPR;
         const yBottom = Math.max(zone.yTop, zone.yBottom) * vPR;
         const boxH    = Math.max(4 * vPR, yBottom - yTop);
@@ -225,10 +225,10 @@ class OBZoneRenderer {
 
         ctx.save();
         ctx.fillStyle   = zone.isBullish ? 'rgba(38,166,154,0.13)' : 'rgba(239,83,80,0.13)';
-        ctx.fillRect(x1, yTop, x2 - x1, boxH);
+        ctx.fillRect(x1, yTop, Math.max(12 * hPR, x2 - x1), boxH);
         ctx.strokeStyle = zone.isBullish ? 'rgba(38,166,154,0.80)' : 'rgba(239,83,80,0.80)';
         ctx.lineWidth   = 1.2 * hPR;
-        ctx.strokeRect(x1, yTop, x2 - x1, boxH);
+        ctx.strokeRect(x1, yTop, Math.max(12 * hPR, x2 - x1), boxH);
 
         ctx.font      = `bold ${10 * hPR}px monospace`;
         ctx.fillStyle = zone.isBullish ? 'rgba(38,166,154,0.98)' : 'rgba(239,83,80,0.98)';
@@ -257,11 +257,13 @@ class OBZonePrimitive {
       if (!ob.time || ob.top == null || ob.bottom == null) return null;
       try {
         const x1      = safeTimeToX(timeScale, candles, ob.time);
+        const x2      = ob.end_time ? safeTimeToX(timeScale, candles, ob.end_time) : null;
         const yTop    = series.priceToCoordinate(ob.top);
         const yBottom = series.priceToCoordinate(ob.bottom);
         if (x1 === null || yTop === null || yBottom === null) return null;
         return {
           x1,
+          x2,
           yTop,
           yBottom,
           isBullish: ob.type?.includes('BULL'),
@@ -275,7 +277,7 @@ class OBZonePrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🏹 2-LEG PROJECTED ROADMAP ARROW (Now -> POI Entry Zone -> Target 2)
+// 🏹 2-LEG PROJECTED ROADMAP ARROW
 // ─────────────────────────────────────────────────────────────────────────────
 class ProjectionRenderer {
   constructor(data) { this._data = data; }
@@ -369,7 +371,7 @@ class ProjectionPrimitive {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 🚀 MAIN COMPONENT
+// 🚀 MAIN COMPONENT (With Fullscreen Expand Toggle!)
 // ─────────────────────────────────────────────────────────────────────────────
 const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef       = useRef(null);
@@ -395,6 +397,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const [connectionStatus,    setConnectionStatus]    = useState('Connecting...');
   const [newsData,            setNewsData]            = useState([]);
   const [isHoveringControls,  setIsHoveringControls]  = useState(false);
+  const [isExpanded,          setIsExpanded]          = useState(false);
 
   const updateChartData = useCallback((data) => {
     if (!candleSeriesRef.current || !data.length) return;
@@ -402,6 +405,29 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     if (ema50SeriesRef.current)  ema50SeriesRef.current.setData(calculateEMA(data, 50));
     if (ema200SeriesRef.current) ema200SeriesRef.current.setData(calculateEMA(data, 200));
   }, []);
+
+  // Resize chart when toggling Fullscreen / Expanded mode or window resize
+  useEffect(() => {
+    if (!chartRef.current || !chartContainerRef.current) return;
+    const timer = setTimeout(() => {
+      if (chartRef.current && chartContainerRef.current) {
+        chartRef.current.applyOptions({
+          width:  chartContainerRef.current.clientWidth,
+          height: isExpanded ? window.innerHeight : 500,
+        });
+      }
+    }, 30);
+    return () => clearTimeout(timer);
+  }, [isExpanded]);
+
+  // Allow ESC key to exit Fullscreen mode
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape' && isExpanded) setIsExpanded(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isExpanded]);
 
   useEffect(() => {
     symbolRef.current = symbol;
@@ -477,7 +503,12 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     isChartReady.current    = true;
 
     const onResize = () => {
-      if (chartContainerRef.current) chart.applyOptions({ width: chartContainerRef.current.clientWidth });
+      if (chartContainerRef.current && chartRef.current) {
+        chartRef.current.applyOptions({
+          width:  chartContainerRef.current.clientWidth,
+          height: chartContainerRef.current.clientHeight || 500,
+        });
+      }
     };
     window.addEventListener('resize', onResize);
 
@@ -534,7 +565,6 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     load();
   }, [timeframe, symbol, processCandles, updateChartData]);
 
-  // Render loop for Primitives & Live EMAs
   useEffect(() => {
     let rafId;
     const loop = () => {
@@ -651,21 +681,52 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const handleScroll  = (dir) => { const ts = chartRef.current?.timeScale(); if (ts) ts.scrollToPosition(ts.scrollPosition() + (dir === 'left' ? 10 : -10), true); };
   const statusColor   = connectionStatus === 'Connected' ? '#089981' : '#F23645';
 
+  const wrapperStyle = isExpanded
+    ? { position: 'fixed', inset: 0, width: '100vw', height: '100vh', zIndex: 9999, backgroundColor: '#161A25', overflow: 'hidden' }
+    : { position: 'relative', width: '100%', backgroundColor: '#161A25', borderRadius: 8, overflow: 'hidden' };
+
   return (
-    <div style={{ position: 'relative', width: '100%', backgroundColor: '#161A25', borderRadius: 8, overflow: 'hidden' }}
+    <div style={wrapperStyle}
          onMouseEnter={() => setIsHoveringControls(true)} onMouseLeave={() => setIsHoveringControls(false)}>
 
-      <div style={{ position: 'absolute', top: 15, left: 15, right: 15, zIndex: 20, display: 'flex', justifyContent: 'space-between' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'rgba(42,46,57,0.85)', padding: '4px 10px', borderRadius: 4, borderLeft: `3px solid ${statusColor}` }}>
+      <div style={{ position: 'absolute', top: 15, left: 15, right: 15, zIndex: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(42,46,57,0.85)', padding: '4px 10px', borderRadius: 4, borderLeft: `3px solid ${statusColor}` }}>
           <span style={{ fontSize: 11, fontWeight: 600, color: '#FFF' }}>{connectionStatus}</span>
+          {isExpanded && (
+            <span style={{ fontSize: 11, fontWeight: 700, color: '#f0b429', marginLeft: 6 }}>
+              {symbol} ({timeframe.toUpperCase()})
+            </span>
+          )}
         </div>
-        <div style={{ display: 'flex', gap: 2, background: '#2A2E39', padding: 2, borderRadius: 4 }}>
-          {['15m', '1h', '4h'].map(tf => (
-            <button key={tf} onClick={() => handleTimeframeChange(tf)}
-              style={{ padding: '6px 14px', background: timeframe === tf ? '#4B4B69' : 'transparent', color: timeframe === tf ? '#FFF' : '#787B86', border: 'none', cursor: 'pointer', borderRadius: 3 }}>
-              {tf.toUpperCase()}
-            </button>
-          ))}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', gap: 2, background: '#2A2E39', padding: 2, borderRadius: 4 }}>
+            {['15m', '1h', '4h'].map(tf => (
+              <button key={tf} onClick={() => handleTimeframeChange(tf)}
+                style={{ padding: '6px 14px', background: timeframe === tf ? '#4B4B69' : 'transparent', color: timeframe === tf ? '#FFF' : '#787B86', border: 'none', cursor: 'pointer', borderRadius: 3 }}>
+                {tf.toUpperCase()}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={() => setIsExpanded(prev => !prev)}
+            title={isExpanded ? 'Exit Fullscreen (ESC)' : 'Expand Chart Fullscreen'}
+            style={{
+              padding: '6px 12px',
+              background: isExpanded ? '#ef5350' : '#2A2E39',
+              color: '#FFF',
+              border: '1px solid rgba(255,255,255,0.12)',
+              cursor: 'pointer',
+              borderRadius: 4,
+              fontWeight: 700,
+              fontSize: 11,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 5
+            }}>
+            {isExpanded ? '✕ EXIT FULLSCREEN' : '⛶ EXPAND'}
+          </button>
         </div>
       </div>
 
@@ -677,7 +738,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         <ControlButton onClick={() => handleScroll('right')} label=">"     />
       </div>
 
-      <div ref={chartContainerRef} style={{ width: '100%', height: 500, position: 'relative' }} />
+      <div ref={chartContainerRef} style={{ width: '100%', height: isExpanded ? '100vh' : 500, position: 'relative' }} />
     </div>
   );
 };
