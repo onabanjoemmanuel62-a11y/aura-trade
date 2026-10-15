@@ -96,7 +96,10 @@ class LinePrimitive {
   }
 
   setData(lines, series, timeScale, candles) {
-    if (!lines || !Array.isArray(lines)) { this._rendererData = []; return; }
+    if (!lines || !Array.isArray(lines) || !candles || !candles.length) {
+      this._rendererData = [];
+      return;
+    }
     this._rendererData = lines.map((line) => {
       if (!line.start_time || !line.end_time || line.level == null) return null;
       try {
@@ -161,7 +164,7 @@ class TrendlinePrimitive {
   }
 
   setData(tl, series, timeScale, candles) {
-    if (!tl || !tl.start_time || !tl.end_time || tl.start_level == null || tl.end_level == null) {
+    if (!tl || !tl.start_time || !tl.end_time || tl.start_level == null || tl.end_level == null || !candles || !candles.length) {
       this._rendererData = null;
       return;
     }
@@ -230,7 +233,10 @@ class OBZonePrimitive {
   }
 
   setData(obs, series, timeScale, candles) {
-    if (!obs || !Array.isArray(obs)) { this._rendererData = []; return; }
+    if (!obs || !Array.isArray(obs) || !candles || !candles.length) {
+      this._rendererData = [];
+      return;
+    }
     this._rendererData = obs.map((ob) => {
       if (!ob.time || ob.top == null || ob.bottom == null) return null;
       try {
@@ -317,7 +323,7 @@ class ProjectionPrimitive {
   }
 
   setData(path, series, timeScale, candles) {
-    if (!path || !Array.isArray(path) || path.length < 3) {
+    if (!path || !Array.isArray(path) || path.length < 3 || !candles || !candles.length) {
       this._rendererData = null;
       return;
     }
@@ -356,6 +362,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const projectionPrimitiveRef  = useRef(null);
   const activeLinesRef          = useRef([]);
   const isChartReady            = useRef(false);
+  const isSymbolLoadedRef       = useRef(false);
   const currentBarRef           = useRef(null);
   const timeframeRef            = useRef('1h');
   const allDataRef              = useRef([]);
@@ -369,8 +376,15 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const [isHoveringControls,  setIsHoveringControls]  = useState(false);
   const [isExpanded,          setIsExpanded]          = useState(false);
 
+  const clearPrimitives = useCallback(() => {
+    if (linePrimitiveRef.current)       linePrimitiveRef.current.setData([], null, null, []);
+    if (trendlinePrimitiveRef.current)  trendlinePrimitiveRef.current.setData(null, null, null, []);
+    if (obZonePrimitiveRef.current)     obZonePrimitiveRef.current.setData([], null, null, []);
+    if (projectionPrimitiveRef.current) projectionPrimitiveRef.current.setData(null, null, null, []);
+  }, []);
+
   const updateChartData = useCallback((data) => {
-    if (!candleSeriesRef.current || !data.length) return;
+    if (!candleSeriesRef.current) return;
     candleSeriesRef.current.setData(data);
   }, []);
 
@@ -397,13 +411,15 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
   useEffect(() => {
     symbolRef.current = symbol;
+    isSymbolLoadedRef.current = false;
+    clearPrimitives();
     if (candleSeriesRef.current) {
       const pf = getPriceFormat(symbol);
       candleSeriesRef.current.applyOptions({ priceFormat: pf });
       allDataRef.current = [];
       updateChartData([]);
     }
-  }, [symbol, updateChartData]);
+  }, [symbol, updateChartData, clearPrimitives]);
 
   const processCandles = useCallback((rawData) => {
     if (!Array.isArray(rawData)) return [];
@@ -505,35 +521,42 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
   useEffect(() => {
     if (!isChartReady.current) return;
+    let cancelled = false;
+    isSymbolLoadedRef.current = false;
+    clearPrimitives();
+
     const load = async () => {
       try {
         const res = await axios.get(`${API_URL}/api/candles/${timeframe}`, {
           params: { symbol, limit: 1000, timestamp: Date.now() },
         });
+        if (cancelled || symbol !== symbolRef.current) return;
         const data = processCandles(res.data);
         if (isChartReady.current && candleSeriesRef.current) {
           allDataRef.current = data;
           updateChartData(data);
           if (data.length) currentBarRef.current = data[data.length - 1];
-          setTimeout(() => chartRef.current?.timeScale().fitContent(), 50);
+          chartRef.current?.timeScale().fitContent();
+          isSymbolLoadedRef.current = true;
         }
       } catch { /* silent */ }
     };
     load();
-  }, [timeframe, symbol, processCandles, updateChartData]);
+    return () => { cancelled = true; };
+  }, [timeframe, symbol, processCandles, updateChartData, clearPrimitives]);
 
   useEffect(() => {
     let rafId;
     const loop = () => {
       if (!isChartReady.current) return;
 
-      if (candleSeriesRef.current && latestCandleRef.current) {
+      if (candleSeriesRef.current && latestCandleRef.current && isSymbolLoadedRef.current) {
         candleSeriesRef.current.update(latestCandleRef.current);
         currentBarRef.current   = latestCandleRef.current;
         latestCandleRef.current = null;
       }
 
-      if (chartRef.current && candleSeriesRef.current) {
+      if (chartRef.current && candleSeriesRef.current && isSymbolLoadedRef.current && allDataRef.current.length > 0) {
         const ts      = chartRef.current.timeScale();
         const candles = allDataRef.current;
 
@@ -606,7 +629,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     socket.on('disconnect', () => setConnectionStatus('Disconnected'));
     socket.on('price-update', (data) => {
       if (data.symbol !== symbolRef.current) return;
-      if (!isChartReady.current || !currentBarRef.current) return;
+      if (!isChartReady.current || !currentBarRef.current || !isSymbolLoadedRef.current) return;
       const price = parseFloat(data.close || data.c);
       if (isNaN(price) || price <= 0) return;
       const last = allDataRef.current[allDataRef.current.length - 1];
