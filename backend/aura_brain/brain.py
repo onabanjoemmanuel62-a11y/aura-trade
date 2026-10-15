@@ -24,13 +24,14 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1: PEAK FORMATION + TRUE EXTERNAL CHoCH & BOS TUNING
+# STEP 1 & STEP 2: PEAK FORMATION + CHoCH/BOS + SINGLE ORIGIN POI TUNING
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.20
 FLIP_CONFIRM_BARS            = 2
 ANCHOR_MIN_MOVE_ATR          = 1.4
 SWING_PROMINENCE_ATR         = 0.75
+MIN_FVG_SIZE_ATR             = 0.06
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AuraBrain")
@@ -139,7 +140,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 ENGINE — Peak Formation + Non-Shifting External CHoCH & BOS
+# CORE ENGINE — Step 1 (Peak + CHoCH/BOS) & Step 2 (Single Origin POI + FVG)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -222,14 +223,6 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
 def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                                  raw_highs: np.ndarray, raw_lows: np.ndarray,
                                  atr: float, decimals: int) -> List[Dict]:
-    """
-    DETERMINISTIC NON-SHIFTING STEP 1 (Market Structure):
-    1. Strictly anchors CHoCH to the LAST Lower High (before a Peak Low) or LAST Higher Low
-       (before a Peak High) that originated the final leg into the Peak.
-       Never falls back to random post-peak swings if live price ticks!
-    2. Walks forward after CHoCH to chain every external BOS break where price made
-       a real pullback (>= 0.60 * ATR) and then broke the prior swing extreme.
-    """
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -241,7 +234,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     events     = []
 
     if is_bullish:
-        # ── 1. FIND THE LAST LOWER HIGH (PRE-PEAK SWING HIGH) THAT CAUSED THE PEAK LOW ──
         peak_low_val = float(lows[anchor_idx])
         search_left  = max(0, anchor_idx - 35)
 
@@ -271,7 +263,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 
         choch_lvl = float(highs[choch_swing_idx])
 
-        # Check if any candle after anchor_idx broke choch_lvl (never jumps to post_highs!)
         choch_break_idx = None
         for m in range(anchor_idx + 1, total):
             if closes[m] > choch_lvl + buf or (m >= total - 2 and highs[m] > choch_lvl + (0.08 * atr)):
@@ -286,7 +277,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 })
                 break
 
-        # ── 2. WALK FORWARD TO FIND EVERY SUBSEQUENT EXTERNAL BULLISH BOS ───
         if choch_break_idx is not None:
             leg_start = choch_break_idx
 
@@ -326,7 +316,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                     break
 
     else:
-        # ── 1. FIND THE LAST HIGHER LOW (PRE-PEAK SWING LOW) THAT CAUSED THE PEAK HIGH ──
         peak_high_val = float(highs[anchor_idx])
         search_left   = max(0, anchor_idx - 35)
 
@@ -370,7 +359,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 })
                 break
 
-        # ── 2. WALK FORWARD TO FIND EVERY SUBSEQUENT EXTERNAL BEARISH BOS ───
         if choch_break_idx is not None:
             leg_start = choch_break_idx
 
@@ -385,7 +373,7 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         if lows[m] <= run_low_val:
                             run_low_val = float(lows[m])
                             run_low_idx = m
-                        elif (highs[m] - run_low_val) >= (0.60 * atr) and run_low_val < choch_lvl - (0.12 * atr):
+                        elif (highs[m] - run_low_val) >= (0.60 * atr) and run_low_val < last_broken_low if 'last_broken_low' in locals() else choch_lvl - (0.12 * atr):
                             pullback_ready = True
 
                     if pullback_ready:
@@ -412,12 +400,107 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     return events
 
 
+def build_single_origin_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
+                            anchor_price: float, struct_events: List[Dict],
+                            atr: float, decimals: int) -> Dict:
+    """
+    STEP 2: SINGLE CLEAN ORIGIN POI (Order Block Validated by FVG)
+    1. Locates the origin of the latest structure break (latest BOS or CHoCH).
+    2. Refines to the last opposite reaction candle right before the impulse.
+    3. Checks for 3-candle FVG attachment for validation.
+    4. Returns ONE clean POI zone box with [FVG ✅] status.
+    """
+    opens  = df['Open'].values
+    closes = df['Close'].values
+    highs  = df['High'].values
+    lows   = df['Low'].values
+    dates  = df['Date'].values if 'Date' in df.columns else df.index.values
+    total  = len(closes)
+
+    # Determine origin start index from the latest structure break
+    origin_start_idx = anchor_idx
+    if struct_events:
+        latest_ev = struct_events[-1]
+        origin_start_idx = latest_ev.get("swing_idx", anchor_idx)
+
+    origin_start_idx = int(np.clip(origin_start_idx, 0, max(0, total - 4)))
+    zone_thickness   = 0.38 * atr
+
+    if is_bullish:
+        chosen_idx = origin_start_idx
+        bot_val    = float(lows[chosen_idx])
+
+        # Walk forward to find reaction candle with FVG
+        ob_idx  = chosen_idx
+        has_fvg = False
+        for k in range(chosen_idx, min(total - 2, chosen_idx + 4)):
+            if lows[k + 2] - highs[k] >= (MIN_FVG_SIZE_ATR * atr) and closes[k + 1] > opens[k + 1]:
+                has_fvg = True
+                if float(lows[k]) <= bot_val + (0.60 * atr):
+                    ob_idx = k
+                break
+
+        candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
+        top_val    = min(max(bot_val + 0.22 * atr, candle_top), bot_val + zone_thickness)
+
+        bot_r = round(bot_val, decimals)
+        top_r = round(top_val, decimals)
+        label = f"BUY ZONE / POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})" + (" [FVG ✅]" if has_fvg else "")
+
+        return {
+            "poi_idx":    int(ob_idx),
+            "has_fvg":    has_fvg,
+            "box": {
+                "type":      "BULL_OB",
+                "top":       top_r,
+                "bottom":    bot_r,
+                "time":      int(dates[ob_idx]),
+                "end_time":  int(dates[-1]),
+                "label":     label,
+                "mitigated": False,
+            }
+        }
+
+    else:
+        chosen_idx = origin_start_idx
+        top_val    = float(highs[chosen_idx])
+
+        ob_idx  = chosen_idx
+        has_fvg = False
+        for k in range(chosen_idx, min(total - 2, chosen_idx + 4)):
+            if lows[k] - highs[k + 2] >= (MIN_FVG_SIZE_ATR * atr) and closes[k + 1] < opens[k + 1]:
+                has_fvg = True
+                if float(highs[k]) >= top_val - (0.60 * atr):
+                    ob_idx = k
+                break
+
+        candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
+        bot_val    = max(min(top_val - 0.22 * atr, candle_bot), top_val - zone_thickness)
+
+        bot_r = round(bot_val, decimals)
+        top_r = round(top_val, decimals)
+        label = f"SELL ZONE / POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})" + (" [FVG ✅]" if has_fvg else "")
+
+        return {
+            "poi_idx":    int(ob_idx),
+            "has_fvg":    has_fvg,
+            "box": {
+                "type":      "BEAR_OB",
+                "top":       top_r,
+                "bottom":    bot_r,
+                "time":      int(dates[ob_idx]),
+                "end_time":  int(dates[-1]),
+                "label":     label,
+                "mitigated": False,
+            }
+        }
+
+
 def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                              current_price: float = 0.0,
                              swing_order_override: Optional[int] = None,
                              state_key: Optional[str] = None,
                              drop_forming: bool = False) -> Dict:
-    # Do NOT overwrite closes[-1] with live ticks so structure breaks never flicker on tab switches!
     highs  = df['High'].values.copy()
     lows   = df['Low'].values.copy()
     closes = df['Close'].values.copy()
@@ -447,7 +530,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     ema_50_array  = df['Close'].ewm(span=50, adjust=False).mean().values
     ema_200_array = df['Close'].ewm(span=200, adjust=False).mean().values
 
-    # ── 1. Protected Swing Cycle Engine (Locks True Peak Formation High/Low) ──
     def compute_structural_cycles(seed_bullish: bool):
         highs_set = set(raw_highs.tolist())
         lows_set  = set(raw_lows.tolist())
@@ -556,36 +638,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_time  = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
-    current_idx = total - 1
-    if (current_idx - fresh_anchor_idx) > 120:
-        dist_atr = abs(closes[-1] - fresh_anchor_price) / atr if atr > 0 else 0
-        if dist_atr > 5.5:
-            recent_start = max(0, current_idx - 110)
-            if is_bullish:
-                cand_lows = [
-                    idx for idx in raw_lows
-                    if recent_start <= idx <= current_idx - swing_order
-                    and (highs[idx:].max() - lows[idx]) >= (ANCHOR_MIN_MOVE_ATR * atr)
-                    and closes[-1] > lows[idx] + (1.0 * atr)
-                ]
-                if cand_lows:
-                    new_idx = min(cand_lows, key=lambda idx: lows[idx])
-                    fresh_anchor_idx   = int(new_idx)
-                    fresh_anchor_time  = int(dates[fresh_anchor_idx])
-                    fresh_anchor_price = float(lows[fresh_anchor_idx])
-            else:
-                cand_highs = [
-                    idx for idx in raw_highs
-                    if recent_start <= idx <= current_idx - swing_order
-                    and (highs[idx] - lows[idx:].min()) >= (ANCHOR_MIN_MOVE_ATR * atr)
-                    and closes[-1] < highs[idx] - (1.0 * atr)
-                ]
-                if cand_highs:
-                    new_idx = max(cand_highs, key=lambda idx: highs[idx])
-                    fresh_anchor_idx   = int(new_idx)
-                    fresh_anchor_time  = int(dates[fresh_anchor_idx])
-                    fresh_anchor_price = float(highs[fresh_anchor_idx])
-
     anchor_idx   = fresh_anchor_idx
     anchor_time  = fresh_anchor_time
     anchor_price = fresh_anchor_price
@@ -609,7 +661,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
 
     peak_confirmed = bool(extreme_held and move >= ANCHOR_MIN_MOVE_ATR * atr)
 
-    # ── 2. Find Exact CHoCH and Subsequent External BOS Breaks From the Peak ──
+    # ── 2. Find Exact CHoCH and BOS Breaks ──────────────────────────────────
     struct_events = find_choch_and_bos_from_peak(
         df, is_bullish, anchor_idx, raw_highs, raw_lows, atr, decimals
     )
@@ -621,7 +673,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         pattern_name = f"Peak Formation Low ({anchor_price:.{decimals}f})"
         anchor_color = "rgba(59, 255, 130, 0.95)"
 
-    # ── 3. Build Step 1 Lines ONLY (Peak Line + True CHoCH + External BOS) ──
     all_lines = [{
         "level":      round(anchor_price, decimals),
         "start_time": anchor_time,
@@ -652,6 +703,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "is_choch":   is_c,
         })
 
+    # ── 3. Build Single Origin POI Box (Step 2) ─────────────────────────────
+    poi_info   = build_single_origin_poi(df, is_bullish, int(anchor_idx), anchor_price, struct_events, atr, decimals)
+    active_ob  = poi_info["box"]
+    zone_boxes = [active_ob]
+    poi_level  = active_ob["top"] if is_bullish else active_ob["bottom"]
+
     if struct_events:
         latest_ev   = struct_events[-1]
         break_kind  = latest_ev["kind"]
@@ -681,8 +738,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         "raw_highs":       raw_highs.tolist(),
         "raw_lows":        raw_lows.tolist(),
         "trendline":       None,
-        "zone_boxes":      [],
-        "poi_level":       round(anchor_price, decimals),
+        "zone_boxes":      zone_boxes,
+        "poi_level":       round(poi_level, decimals),
         "targets":         [],
         "projection_path": [],
     }
@@ -698,6 +755,11 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     break_kind     = ms["break_kind"]
     break_level    = ms["break_level"]
     struct_events  = ms["struct_events"]
+    zone_boxes     = ms["zone_boxes"]
+    poi_level      = ms["poi_level"]
+
+    active_ob = zone_boxes[0] if zone_boxes else {"label": "POI ZONE"}
+    has_fvg   = bool(active_ob.get("label", "").includes("FVG")) if hasattr(active_ob.get("label", ""), "includes") else ("FVG" in active_ob.get("label", ""))
 
     choch_ev  = next((e for e in struct_events if e["kind"] == "CHoCH"), None)
     bos_evs   = [e for e in struct_events if e["kind"] == "BOS"]
@@ -707,41 +769,41 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
     checklist = [
         {
-            "step":   f"1. {peak_word}",
+            "step":   f"1. {peak_word} & {break_kind} {arrow}",
             "done":   bool(peak_confirmed),
-            "detail": f"{anchor_price:.{decimals}f} ✅" if peak_confirmed else f"{anchor_price:.{decimals}f}",
+            "detail": f"Cleared {break_level:.{decimals}f} ✅",
         },
         {
-            "step":   f"2. Change of Character (CHoCH {arrow})",
-            "done":   bool(choch_ev is not None),
-            "detail": f"Cleared {choch_ev['level']:.{decimals}f} ✅" if choch_ev else "Waiting",
+            "step":   "2. Single Origin POI + FVG",
+            "done":   True,
+            "detail": f"{poi_level:.{decimals}f}" + (" (FVG ✅)" if has_fvg else " (OB Valid)"),
         },
         {
-            "step":   f"3. Break of Structure (BOS {arrow})",
-            "done":   bool(len(bos_evs) > 0),
-            "detail": f"Cleared {bos_evs[-1]['level']:.{decimals}f} ({len(bos_evs)}x) ✅" if bos_evs else "Awaiting Next BOS",
+            "step":   "3. Liquidity / Inducement (IDM)",
+            "done":   False,
+            "detail": "Awaiting Step 3",
         },
         {
-            "step":   "4. Trend Direction Confirmed",
-            "done":   bool(peak_confirmed),
-            "detail": dir_word,
+            "step":   "4. 1H Rejection Close in POI",
+            "done":   False,
+            "detail": "Awaiting Step 4",
         },
     ]
 
     note = (
-        f"📊 STEP 1 STRUCTURE: {peak_word} locked @ {anchor_price:.{decimals}f}. "
-        f"Latest structure break: {break_kind} {arrow} @ {break_level:.{decimals}f} -> Market Direction is {dir_word}."
+        f"📊 STEP 2 READY: Origin POI mapped @ {poi_level:.{decimals}f}. "
+        f"Waiting for liquidity sweep and 1H rejection close."
     )
 
     return {
         "signal":     "WAIT",
-        "confidence": 60 if len(bos_evs) > 0 else 50,
-        "setup_name": f"Step 1: {dir_word}",
+        "confidence": 65,
+        "setup_name": f"Step 2: Origin POI Mapped",
         "checklist":  checklist,
         "execution_plan": {
             "stage":             "AWAITING_PULLBACK",
             "trigger_condition": note,
-            "planned_entry":     round(anchor_price, decimals),
+            "planned_entry":     round(poi_level, decimals),
             "planned_sl":        None,
             "planned_tp1":       None,
             "planned_tp2":       None,
@@ -790,6 +852,7 @@ async def analyze(req: AnalysisRequest):
         cycle          = ms['cycle']
         lines          = ms['lines']
         peak_confirmed = ms.get('peak_confirmed', False)
+        zone_boxes     = ms.get('zone_boxes', [])
 
         bias_str = 'BULLISH' if ms['is_bullish'] else 'BEARISH'
 
@@ -840,7 +903,7 @@ async def analyze(req: AnalysisRequest):
                 "bos_lines":       lines,
                 "sweeps":          [],
                 "trendline":       None,
-                "order_blocks":    [],
+                "order_blocks":    zone_boxes,
                 "targets":         [],
                 "projection_path": [],
             },
@@ -872,11 +935,11 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v8.3 — Step 1 (Zero-Shift CHoCH & BOS)",
+            "✅ ENGINE VERSION": "AuraBrain v9.0 — Step 2 (Single Origin POI + FVG)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
-            "📏 LINES":          ms['lines'],
+            "📦 POI BOX":        ms['zone_boxes'],
         }
     except Exception as e:
         import traceback
