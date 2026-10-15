@@ -24,7 +24,7 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 & STEP 2: PEAK + CHoCH/BOS + STRICT UNTOUCHED/UNMITIGATED POI
+# STEP 1 & STEP 2: PEAK + CHoCH/BOS + TRUE BREAKOUT ORIGIN POI (NO PEAK HUGGING)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.20
@@ -140,7 +140,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE — Step 1 (Peak + CHoCH/BOS) & Step 2 (Untouched Unmitigated POI)
+# CORE ENGINE — Step 1 (Peak + CHoCH/BOS) & Step 2 (True Breakout Origin POI)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -291,12 +291,11 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         if highs[m] >= run_high_val:
                             run_high_val = float(highs[m])
                             run_high_idx = m
-                        elif (run_high_val - lows[m]) >= (0.60 * atr) and run_high_val > choch_lvl + (0.12 * atr):
+                        elif (run_high_val - lows[m]) >= (0.55 * atr) and run_high_val > choch_lvl + (0.10 * atr):
                             pullback_ready = True
 
                     if pullback_ready:
                         if closes[m] > run_high_val + buf:
-                            # The origin of this BOS leg is the lowest pullback point between run_high_idx and break bar m!
                             pb_origin_idx = run_high_idx + int(np.argmin(lows[run_high_idx : m + 1]))
                             events.append({
                                 "kind":       "BOS",
@@ -376,12 +375,11 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         if lows[m] <= run_low_val:
                             run_low_val = float(lows[m])
                             run_low_idx = m
-                        elif (highs[m] - run_low_val) >= (0.60 * atr) and run_low_val < choch_lvl - (0.12 * atr):
+                        elif (highs[m] - run_low_val) >= (0.55 * atr) and run_low_val < choch_lvl - (0.10 * atr):
                             pullback_ready = True
 
                     if pullback_ready:
                         if closes[m] < run_low_val - buf:
-                            # The origin of this Bearish BOS leg is the highest pullback point between run_low_idx and break bar m!
                             pb_origin_idx = run_low_idx + int(np.argmax(highs[run_low_idx : m + 1]))
                             events.append({
                                 "kind":       "BOS",
@@ -406,21 +404,21 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     return events
 
 
-def find_strict_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
-                                struct_events: List[Dict], current_price: float,
-                                atr: float, decimals: int) -> Optional[Dict]:
+def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
+                           struct_events: List[Dict], current_price: float,
+                           atr: float, decimals: int) -> Optional[Dict]:
     """
-    VIDEO STRATEGY STEP 2 & 3 (Strict Untouched / Unmitigated Origin POI + FVG):
-    1. NEVER looks to the left of `anchor_idx` (Peak Formation Low/High).
-       In the earlier buggy code, `swing_idx` of a CHoCH was to the left of the Peak,
-       which caused the box to be drawn on the left side before the Peak even formed!
-       Now we strictly use `leg_origin` (which is ALWAYS >= anchor_idx, on the right side!).
-    2. For a candidate Origin (starting from the latest BOS origin, or the recent pullback leg):
-       - Finds the Order Block candle that created a 3-candle Fair Value Gap (FVG) before the impulse.
-       - Checks EVERY candle after the impulse left the zone (`depart_idx + 1` to `total - 1`):
-         If ANY candle's wick or body has already touched or passed through the POI,
-         that POI is MITIGATED / INVALID and skipped!
-    3. If no untouched, unmitigated POI with FVG exists yet, returns `None` (NEVER forces a POI!).
+    DEEP SMC POI ENGINE (Video 23:50 - 32:40):
+    1. ONLY evaluates the MOST RECENT structure break (`latest_ev = struct_events[-1]`).
+       Never falls back to an older CHoCH or Peak Formation if the latest BOS leg has no unmitigated POI!
+    2. NEVER places the POI on the Peak Formation candle (`ob_idx > anchor_idx + 1`).
+    3. Walks through the Origin range right before `break_idx` (the candle that broke the structure line)
+       to find the LAST opposite/reaction candle (`ob_idx`) immediately before the displacement candle (`k + 1`)
+       that created a 3-candle Fair Value Gap (`FVG`).
+    4. STRICT ZERO-MITIGATION RULE:
+       Checks every candle after the 3-candle FVG (`k + 3` to `total - 1`, plus `current_price`).
+       If ANY subsequent candle has touched or passed through the POI box, that POI is mitigated
+       and returns `None` (waits for the market to form a new BOS + POI).
     """
     if not struct_events:
         return None
@@ -432,113 +430,114 @@ def find_strict_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: 
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     total  = len(closes)
 
-    max_thickness = 0.35 * atr
+    # STRICT RULE 1: Only look at the MOST RECENT structure break (`struct_events[-1]`)!
+    latest_ev  = struct_events[-1]
+    orig_start = int(max(anchor_idx + 2, latest_ev.get("leg_origin", anchor_idx + 2)))
+    break_idx  = int(latest_ev.get("break_idx", total - 1))
 
-    # Collect candidate leg origins on the right side (most recent BOS origin first, then CHoCH origin at Peak)
-    candidate_windows = []
-    for ev in reversed(struct_events):
-        orig_i  = int(max(anchor_idx, ev.get("leg_origin", anchor_idx)))
-        break_i = int(ev.get("break_idx", min(total - 1, orig_i + 6)))
-        candidate_windows.append((orig_i, break_i))
+    # Search window is strictly the range leading into `break_idx` (up to 12 bars before `break_idx`, never at/before Peak!)
+    search_lo = max(anchor_idx + 2, orig_start, break_idx - 12)
+    search_hi = min(total - 3, break_idx)
+
+    if search_lo > search_hi:
+        return None
+
+    max_thickness = 0.38 * atr
 
     if is_bullish:
-        for orig_i, break_i in candidate_windows:
-            search_end = min(total - 3, break_i)
-            if orig_i > search_end:
+        # Walk backwards from `search_hi` (right at the breakout) to find the LAST reaction candle before the break with an FVG
+        for k in range(search_hi, search_lo - 1, -1):
+            # Candle `k + 1` must be a strong bullish impulse candle
+            disp_body = float(closes[k + 1] - opens[k + 1])
+            if disp_body < (0.25 * atr):
                 continue
 
-            # Walk from the impulse break back to the leg origin to find the reaction candle with a 3-bar FVG
-            for k in range(search_end, orig_i - 1, -1):
-                fvg_size = float(lows[k + 2] - highs[k])
-                is_disp  = (closes[k + 1] > opens[k + 1]) and ((closes[k + 1] - opens[k + 1]) >= 0.25 * atr)
-                if fvg_size < (MIN_FVG_SIZE_ATR * atr) or not is_disp:
+            # Candle `k` is the candidate Order Block; check if `k` and `k + 2` form a 3-candle Bullish FVG
+            fvg_size = float(lows[k + 2] - highs[k])
+            if fvg_size < (MIN_FVG_SIZE_ATR * atr):
+                continue
+
+            # Walk back 1 candle if `k` was already a large green impulse candle and `k - 1` was the actual pause/red reaction candle
+            ob_idx = k
+            if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.35 * atr):
+                ob_idx = k - 1
+
+            # Never allow the POI to sit on the Peak Formation candle
+            if ob_idx <= anchor_idx + 1:
+                continue
+
+            bot_val    = float(lows[ob_idx])
+            candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
+            top_val    = min(max(bot_val + 0.16 * atr, candle_top), bot_val + max_thickness)
+
+            # Departure bar is `k + 2` (the 3rd candle of the FVG)
+            depart_idx = k + 2
+
+            # STRICT ZERO-TOUCH / ZERO-MITIGATION RULE:
+            # If ANY candle after `depart_idx` has touched or dipped into `top_val`, this POI is already used/mitigated!
+            if depart_idx + 1 < total:
+                post_lowest = float(np.min(lows[depart_idx + 1:]))
+                if post_lowest <= top_val:
                     continue
+            if current_price <= top_val:
+                continue
 
-                # Refine to the lowest candle of the origin base (k or k-1)
-                ob_idx = k
-                if k > orig_i and lows[k - 1] < lows[k]:
-                    ob_idx = k - 1
-
-                bot_val = float(lows[ob_idx])
-                # The OB must be near the bottom of that origin base (not halfway up the impulse!)
-                base_min = float(np.min(lows[orig_i : k + 1]))
-                if (bot_val - base_min) > (0.50 * atr):
-                    continue
-
-                candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
-                top_val    = min(max(bot_val + 0.18 * atr, candle_top), bot_val + max_thickness)
-
-                # Departure bar is `k + 2` (the 3rd candle of the FVG where price has left the POI)
-                depart_idx = k + 2
-
-                # STRICT ZERO-TOUCH / ZERO-MITIGATION RULE:
-                # Check EVERY candle after departure (`depart_idx + 1` to the end, plus `current_price`).
-                # If ANY candle after departure already touched or passed below `top_val`, this POI is USED/INVALID!
-                if depart_idx + 1 < total:
-                    post_lowest = float(np.min(lows[depart_idx + 1:]))
-                    if post_lowest <= top_val:
-                        continue
-                if current_price <= top_val:
-                    continue
-
-                bot_r = round(bot_val, decimals)
-                top_r = round(top_val, decimals)
-                return {
-                    "type":      "BULL_OB",
-                    "top":       top_r,
-                    "bottom":    bot_r,
-                    "time":      int(dates[ob_idx]),
-                    "end_time":  int(dates[-1]),
-                    "label":     f"BUY POI / OB ({bot_r:.{decimals}f}–{top_r:.{decimals}f}) [FVG ✅]",
-                    "mitigated": False,
-                }
+            bot_r = round(bot_val, decimals)
+            top_r = round(top_val, decimals)
+            return {
+                "type":      "BULL_OB",
+                "top":       top_r,
+                "bottom":    bot_r,
+                "time":      int(dates[ob_idx]),
+                "end_time":  int(dates[-1]),
+                "label":     f"BUY POI / OB ({bot_r:.{decimals}f}–{top_r:.{decimals}f}) [FVG ✅]",
+                "mitigated": False,
+            }
 
     else:
-        for orig_i, break_i in candidate_windows:
-            search_end = min(total - 3, break_i)
-            if orig_i > search_end:
+        # Walk backwards from `search_hi` (right at the bearish breakout) to find the LAST reaction candle before the drop with an FVG
+        for k in range(search_hi, search_lo - 1, -1):
+            disp_body = float(opens[k + 1] - closes[k + 1])
+            if disp_body < (0.25 * atr):
                 continue
 
-            for k in range(search_end, orig_i - 1, -1):
-                fvg_size = float(lows[k] - highs[k + 2])
-                is_disp  = (closes[k + 1] < opens[k + 1]) and ((opens[k + 1] - closes[k + 1]) >= 0.25 * atr)
-                if fvg_size < (MIN_FVG_SIZE_ATR * atr) or not is_disp:
+            fvg_size = float(lows[k] - highs[k + 2])
+            if fvg_size < (MIN_FVG_SIZE_ATR * atr):
+                continue
+
+            ob_idx = k
+            if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.35 * atr):
+                ob_idx = k - 1
+
+            if ob_idx <= anchor_idx + 1:
+                continue
+
+            top_val    = float(highs[ob_idx])
+            candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
+            bot_val    = max(min(top_val - 0.16 * atr, candle_bot), top_val - max_thickness)
+
+            depart_idx = k + 2
+
+            # STRICT ZERO-TOUCH / ZERO-MITIGATION RULE:
+            # If ANY candle after `depart_idx` has touched or rallied into `bot_val`, this POI is already used/mitigated!
+            if depart_idx + 1 < total:
+                post_highest = float(np.max(highs[depart_idx + 1:]))
+                if post_highest >= bot_val:
                     continue
+            if current_price >= bot_val:
+                continue
 
-                ob_idx = k
-                if k > orig_i and highs[k - 1] > highs[k]:
-                    ob_idx = k - 1
-
-                top_val  = float(highs[ob_idx])
-                base_max = float(np.max(highs[orig_i : k + 1]))
-                if (base_max - top_val) > (0.50 * atr):
-                    continue
-
-                candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
-                bot_val    = max(min(top_val - 0.18 * atr, candle_bot), top_val - max_thickness)
-
-                depart_idx = k + 2
-
-                # STRICT ZERO-TOUCH / ZERO-MITIGATION RULE:
-                # If ANY candle after departure already touched or passed above `bot_val`, this POI is USED/INVALID!
-                if depart_idx + 1 < total:
-                    post_highest = float(np.max(highs[depart_idx + 1:]))
-                    if post_highest >= bot_val:
-                        continue
-                if current_price >= bot_val:
-                    continue
-
-                bot_r = round(bot_val, decimals)
-                top_r = round(top_val, decimals)
-                return {
-                    "type":      "BEAR_OB",
-                    "top":       top_r,
-                    "bottom":    bot_r,
-                    "time":      int(dates[ob_idx]),
-                    "end_time":  int(dates[-1]),
-                    "label":     f"SELL POI / OB ({bot_r:.{decimals}f}–{top_r:.{decimals}f}) [FVG ✅]",
-                    "mitigated": False,
-                }
+            bot_r = round(bot_val, decimals)
+            top_r = round(top_val, decimals)
+            return {
+                "type":      "BEAR_OB",
+                "top":       top_r,
+                "bottom":    bot_r,
+                "time":      int(dates[ob_idx]),
+                "end_time":  int(dates[-1]),
+                "label":     f"SELL POI / OB ({bot_r:.{decimals}f}–{top_r:.{decimals}f}) [FVG ✅]",
+                "mitigated": False,
+            }
 
     return None
 
@@ -780,9 +779,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "is_choch":   is_c,
         })
 
-    # ── 3. Build Strict Untouched/Unmitigated POI Box (Or None if Not Ready!) ──
+    # ── 3. Build True Breakout Origin POI (Only on Latest Break, Never on Peak!) ──
     live_ref   = current_price if current_price > 0 else float(closes[-1])
-    poi_box    = find_strict_unmitigated_poi(df, is_bullish, int(anchor_idx), struct_events, live_ref, atr, decimals)
+    poi_box    = find_true_breakout_poi(df, is_bullish, int(anchor_idx), struct_events, live_ref, atr, decimals)
     zone_boxes = [poi_box] if poi_box else []
     poi_level  = poi_box["top"] if (poi_box and is_bullish) else (poi_box["bottom"] if poi_box else anchor_price)
 
@@ -847,9 +846,9 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             "detail": f"Cleared {break_level:.{decimals}f} ✅",
         },
         {
-            "step":   "2. Untouched Origin POI + FVG",
+            "step":   "2. Last Candle Before Break (POI + FVG)",
             "done":   bool(has_poi),
-            "detail": f"{poi_level:.{decimals}f} [FVG ✅]" if has_poi else "Waiting for Market to Create POI",
+            "detail": f"{poi_level:.{decimals}f} [FVG ✅]" if has_poi else "Waiting for Unmitigated POI",
         },
         {
             "step":   "3. Liquidity / Inducement (IDM)",
@@ -866,16 +865,16 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     if has_poi:
         pips_away = round(abs(current_price - poi_level) / max(pip_size, 1e-6), 1)
         note = (
-            f"📊 STEP 2 READY: Fresh untouched Origin POI + FVG mapped @ {poi_level:.{decimals}f} "
+            f"📊 STEP 2 READY: True Breakout Origin POI + FVG mapped @ {poi_level:.{decimals}f} "
             f"({pips_away} pips away). Waiting for pullback."
         )
     else:
         note = (
             f"⏳ NO UNMITIGATED POI YET: {dir_word} confirmed via {break_kind} {arrow} ({break_level:.{decimals}f}), "
-            f"but prior zones are mitigated or a new BOS + FVG impulse hasn't formed yet. Do not force a trade."
+            f"but the breakout origin is either already mitigated or the next BOS + FVG hasn't formed yet. Waiting patiently."
         )
 
-    setup_title = "Step 2: Untouched POI Mapped" if has_poi else "Step 2: Waiting for POI Creation"
+    setup_title = "Step 2: Breakout POI Mapped" if has_poi else "Step 2: Waiting for Next POI"
 
     return {
         "signal":     "WAIT",
@@ -1017,7 +1016,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v9.3 — Strict Zero-Touch Unmitigated Origin POI",
+            "✅ ENGINE VERSION": "AuraBrain v9.4 — True Breakout Origin POI (Zero Peak-Hugging)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
