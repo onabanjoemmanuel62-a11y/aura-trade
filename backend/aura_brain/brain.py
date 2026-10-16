@@ -24,7 +24,7 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FULL 4-CONFLUENCE SMC A+ ENGINE TUNING (v10.1)
+# FULL 4-CONFLUENCE SMC A+ ENGINE TUNING (v10.2)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.30
@@ -441,18 +441,21 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                                  current_price: float, atr: float, decimals: int,
                                  state_key: Optional[str] = None) -> Optional[Dict]:
     """
-    NON-SHIFTING LOCKED POI ENGINE (Keeps GBP/USD & EUR/USD POIs Intact + Blocks Stale Gold Boxes):
+    FULL 4-CONFLUENCE POI & FVG ENGINE (v10.2):
     1. Checks `POI_STATE[state_key]` first:
        If a valid untouched POI is already locked for this cycle and has NOT been touched
        by any candle since `depart_time` (nor by `current_price`), it stays 100% locked!
-    2. Scans `struct_events` from newest to oldest, finding the most recent unmitigated
-       Origin Order Block that created a 3-candle FVG.
-    3. Why Gold's old 4227.53 box is blocked without hurting GBP/USD:
-       A candidate POI is only valid if subsequent structure breaks did NOT form a new
-       protected Lower High (for Sell) or Higher Low (for Buy) that was itself later re-tested
-       and broken. Even simpler: any POI whose `ob_idx` is more than 1 structure leg behind a
-       mitigated BOS is skipped, whereas un-pulled-back continuation legs (like GBP/USD)
-       preserve their unmitigated parent POI!
+    2. Scans `struct_events` from newest to oldest:
+       - Confluence #3 (FVG): Finds a valid 3-candle Fair Value Gap inside the impulse leg
+         (`orig_start` to `break_idx + 1`).
+       - Confluence #2 (Origin OB): Traces from the FVG impulse down to the base of that
+         impulse leg (`ob_search_lo` to `k`) to find the unmitigated Origin Order Block
+         (whether it is right at `k`, `k-1`, or at the Origin base `1–4` candles below the FVG).
+       - Strict Zero-Touch Rule: Any candidate OB touched after its departure (`depart_idx`)
+         is rejected.
+       - Stale Parent Leg Guard: If a parent leg is behind a subsequent BOS whose entire
+         pullback origin swing was later violated against the trend (like Gold rallying from
+         4095 to 4220 above the 4195 BOS origin), that stale parent leg is skipped.
     """
     opens  = df['Open'].values
     closes = df['Close'].values
@@ -491,62 +494,108 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     if not struct_events:
         return None
 
-    max_thickness = 0.38 * atr
+    max_thickness = 0.42 * atr
 
     # ── 2. SCAN STRUCTURE LEGS (NEWEST TO OLDEST) ───────────────────────────
     for ev_idx in range(len(struct_events) - 1, -1, -1):
         ev         = struct_events[ev_idx]
         raw_orig   = int(ev.get("leg_origin", anchor_idx))
-        orig_start = int(max(anchor_idx + 2, raw_orig))
+        orig_start = int(max(anchor_idx + 1, raw_orig))
         break_idx  = int(ev.get("break_idx", total - 1))
 
-        search_lo = max(anchor_idx + 2, orig_start, break_idx - 14)
-        search_hi = min(total - 3, break_idx)
+        # Stale Parent Leg Guard:
+        # If there are newer BOS events after `ev_idx`, check if price later reversed
+        # past the origin swing of a subsequent BOS (e.g. Gold rallying from 4095 to 4220
+        # through both 4169.70 and its 4195 origin). Normal pullbacks (like GBP/USD) stay valid!
+        if ev_idx < len(struct_events) - 1:
+            subsequent_broken = False
+            for next_ev in struct_events[ev_idx + 1:]:
+                n_brk  = int(next_ev.get("break_idx", total - 1))
+                n_orig = int(next_ev.get("leg_origin", anchor_idx))
+                if n_brk + 2 < total:
+                    if is_bullish:
+                        orig_floor = float(lows[n_orig]) if 0 <= n_orig < total else float(next_ev["level"])
+                        if float(np.min(lows[n_brk + 1:])) < orig_floor - (0.25 * atr):
+                            subsequent_broken = True
+                            break
+                    else:
+                        orig_ceil = float(highs[n_orig]) if 0 <= n_orig < total else float(next_ev["level"])
+                        if float(np.max(highs[n_brk + 1:])) > orig_ceil + (0.25 * atr):
+                            subsequent_broken = True
+                            break
+            if subsequent_broken:
+                continue
 
-        if search_lo <= search_hi:
-            if is_bullish:
-                for k in range(search_hi, search_lo - 1, -1):
-                    disp_body = float(closes[k + 1] - opens[k + 1])
-                    if disp_body < (0.20 * atr):
-                        continue
+        search_lo = max(anchor_idx + 1, orig_start - 1, break_idx - 16)
+        search_hi = min(total - 3, break_idx + 1)
 
-                    fvg_bot  = float(highs[k])
-                    fvg_top  = float(lows[k + 2])
-                    fvg_size = fvg_top - fvg_bot
-                    if fvg_size < (MIN_FVG_SIZE_ATR * atr):
-                        continue
+        if search_lo > search_hi:
+            continue
 
-                    ob_idx = k
-                    if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.35 * atr):
-                        ob_idx = k - 1
+        if is_bullish:
+            # Find valid 3-candle Bullish FVGs inside this impulse leg
+            leg_fvgs = []
+            for k in range(search_hi, search_lo - 1, -1):
+                disp_body = float(closes[k + 1] - opens[k + 1])
+                if disp_body < (0.16 * atr):
+                    continue
+                fvg_bot  = float(highs[k])
+                fvg_top  = float(lows[k + 2])
+                fvg_size = fvg_top - fvg_bot
+                if fvg_size >= (MIN_FVG_SIZE_ATR * atr):
+                    leg_fvgs.append((k, round(fvg_bot, decimals), round(fvg_top, decimals)))
 
+            if not leg_fvgs:
+                continue
+
+            # For each FVG in the leg, trace down to find the unmitigated Origin OB
+            for k, fvg_bot_r, fvg_top_r in leg_fvgs:
+                base_lo = max(anchor_idx + 2, orig_start, k - 5)
+                candidate_obs = []
+
+                # Priority 1: Direct FVG base candle (k or k-1)
+                for c_idx in (k, k - 1):
+                    if c_idx >= anchor_idx + 2 and c_idx not in candidate_obs:
+                        candidate_obs.append(c_idx)
+
+                # Priority 2: Last Bearish (opposite) candle at the Origin base before k
+                for c_idx in range(k - 1, base_lo - 1, -1):
+                    if closes[c_idx] <= opens[c_idx] and c_idx not in candidate_obs:
+                        candidate_obs.append(c_idx)
+
+                # Priority 3: Lowest swing candle at the Origin base of the impulse
+                if base_lo <= k:
+                    min_base_idx = base_lo + int(np.argmin(lows[base_lo : k + 1]))
+                    if min_base_idx >= anchor_idx + 2 and min_base_idx not in candidate_obs:
+                        candidate_obs.append(min_base_idx)
+
+                for ob_idx in candidate_obs:
                     if ob_idx <= anchor_idx + 1:
                         continue
 
                     bot_val    = float(lows[ob_idx])
-                    candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
-                    top_val    = min(max(bot_val + 0.16 * atr, candle_top), bot_val + max_thickness)
+                    candle_top = float(max(opens[ob_idx], closes[ob_idx])) if (highs[ob_idx] - lows[ob_idx]) > max_thickness else float(highs[ob_idx])
+                    top_val    = min(max(bot_val + 0.15 * atr, candle_top), bot_val + max_thickness)
 
-                    depart_idx = k + 2
+                    # Determine when price departed above `top_val`
+                    depart_idx = max(k + 2, ob_idx + 1)
+                    while depart_idx < total - 1 and lows[depart_idx] <= top_val:
+                        if depart_idx > k + 4:
+                            break
+                        depart_idx += 1
 
-                    if depart_idx + 1 < total:
-                        post_lowest = float(np.min(lows[depart_idx + 1:]))
-                        if post_lowest <= top_val:
-                            continue
+                    if depart_idx >= total - 1:
+                        continue
+
+                    # Strict Zero-Touch / Unmitigated check after departure
+                    post_lowest = float(np.min(lows[depart_idx + 1:]))
+                    if post_lowest <= top_val:
+                        continue
                     if current_price <= top_val:
                         continue
 
-                    # Ensure price hasn't already dropped below a subsequent BOS break level after forming 2+ BOS breaks
-                    if ev_idx < len(struct_events) - 1:
-                        latest_bos_lvl = float(struct_events[-1]["level"])
-                        latest_bos_brk = int(struct_events[-1]["break_idx"])
-                        if latest_bos_brk + 2 < total and float(np.min(lows[latest_bos_brk + 1:])) < latest_bos_lvl - (1.5 * atr):
-                            continue
-
-                    bot_r     = round(bot_val, decimals)
-                    top_r     = round(top_val, decimals)
-                    fvg_bot_r = round(fvg_bot, decimals)
-                    fvg_top_r = round(fvg_top, decimals)
+                    bot_r = round(bot_val, decimals)
+                    top_r = round(top_val, decimals)
 
                     poi_result = {
                         "is_bullish":  True,
@@ -573,48 +622,64 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         POI_STATE[state_key] = poi_result
                     return poi_result
 
-            else:
-                for k in range(search_hi, search_lo - 1, -1):
-                    disp_body = float(opens[k + 1] - closes[k + 1])
-                    if disp_body < (0.20 * atr):
-                        continue
+        else:
+            # Find valid 3-candle Bearish FVGs inside this impulse leg
+            leg_fvgs = []
+            for k in range(search_hi, search_lo - 1, -1):
+                disp_body = float(opens[k + 1] - closes[k + 1])
+                if disp_body < (0.16 * atr):
+                    continue
+                fvg_top  = float(lows[k])
+                fvg_bot  = float(highs[k + 2])
+                fvg_size = fvg_top - fvg_bot
+                if fvg_size >= (MIN_FVG_SIZE_ATR * atr):
+                    leg_fvgs.append((k, round(fvg_bot, decimals), round(fvg_top, decimals)))
 
-                    fvg_top  = float(lows[k])
-                    fvg_bot  = float(highs[k + 2])
-                    fvg_size = fvg_top - fvg_bot
-                    if fvg_size < (MIN_FVG_SIZE_ATR * atr):
-                        continue
+            if not leg_fvgs:
+                continue
 
-                    ob_idx = k
-                    if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.35 * atr):
-                        ob_idx = k - 1
+            for k, fvg_bot_r, fvg_top_r in leg_fvgs:
+                base_lo = max(anchor_idx + 2, orig_start, k - 5)
+                candidate_obs = []
 
+                for c_idx in (k, k - 1):
+                    if c_idx >= anchor_idx + 2 and c_idx not in candidate_obs:
+                        candidate_obs.append(c_idx)
+
+                for c_idx in range(k - 1, base_lo - 1, -1):
+                    if closes[c_idx] >= opens[c_idx] and c_idx not in candidate_obs:
+                        candidate_obs.append(c_idx)
+
+                if base_lo <= k:
+                    max_base_idx = base_lo + int(np.argmax(highs[base_lo : k + 1]))
+                    if max_base_idx >= anchor_idx + 2 and max_base_idx not in candidate_obs:
+                        candidate_obs.append(max_base_idx)
+
+                for ob_idx in candidate_obs:
                     if ob_idx <= anchor_idx + 1:
                         continue
 
                     top_val    = float(highs[ob_idx])
-                    candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
-                    bot_val    = max(min(top_val - 0.16 * atr, candle_bot), top_val - max_thickness)
+                    candle_bot = float(min(opens[ob_idx], closes[ob_idx])) if (highs[ob_idx] - lows[ob_idx]) > max_thickness else float(lows[ob_idx])
+                    bot_val    = max(min(top_val - 0.15 * atr, candle_bot), top_val - max_thickness)
 
-                    depart_idx = k + 2
+                    depart_idx = max(k + 2, ob_idx + 1)
+                    while depart_idx < total - 1 and highs[depart_idx] >= bot_val:
+                        if depart_idx > k + 4:
+                            break
+                        depart_idx += 1
 
-                    if depart_idx + 1 < total:
-                        post_highest = float(np.max(highs[depart_idx + 1:]))
-                        if post_highest >= bot_val:
-                            continue
+                    if depart_idx >= total - 1:
+                        continue
+
+                    post_highest = float(np.max(highs[depart_idx + 1:]))
+                    if post_highest >= bot_val:
+                        continue
                     if current_price >= bot_val:
                         continue
 
-                    if ev_idx < len(struct_events) - 1:
-                        latest_bos_lvl = float(struct_events[-1]["level"])
-                        latest_bos_brk = int(struct_events[-1]["break_idx"])
-                        if latest_bos_brk + 2 < total and float(np.max(highs[latest_bos_brk + 1:])) > latest_bos_lvl + (1.5 * atr):
-                            continue
-
-                    bot_r     = round(bot_val, decimals)
-                    top_r     = round(top_val, decimals)
-                    fvg_bot_r = round(fvg_bot, decimals)
-                    fvg_top_r = round(fvg_top, decimals)
+                    bot_r = round(bot_val, decimals)
+                    top_r = round(top_val, decimals)
 
                     poi_result = {
                         "is_bullish":  False,
@@ -653,7 +718,7 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
     """
     Finds the closest internal pullback swing low (for a Buy POI) or swing high (for a Sell POI)
     formed AFTER `depart_time` sitting between the POI and current price, and returns a
-    clean `liq_line` so `$$$ IDM` or `$$$ EQH/EQL` is drawn on the chart!
+    clean `liq_line` so `$$$ Inducement (IDM)` or `$$$ Range Liquidity` is drawn on the chart!
     """
     if not poi_info:
         return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
@@ -677,10 +742,9 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
         cand_lows = []
         for j in range(depart_idx + 1, total - 1):
             if lows[j] <= lows[j - 1] and lows[j] <= lows[j + 1]:
-                if poi_top + (0.12 * atr) <= lows[j] <= poi_top + (6.0 * atr):
+                if poi_top + (0.08 * atr) <= lows[j] <= poi_top + (6.5 * atr):
                     cand_lows.append(j)
         if cand_lows:
-            # Pick the pullback low closest to the BUY POI (the final inducement before the POI!)
             idm_idx   = min(cand_lows, key=lambda idx: lows[idx])
             idm_price = float(lows[idm_idx])
             eq_lows   = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.22 * atr]
@@ -708,10 +772,9 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
         cand_highs = []
         for j in range(depart_idx + 1, total - 1):
             if highs[j] >= highs[j - 1] and highs[j] >= highs[j + 1]:
-                if poi_bot - (6.0 * atr) <= highs[j] <= poi_bot - (0.12 * atr):
+                if poi_bot - (6.5 * atr) <= highs[j] <= poi_bot - (0.08 * atr):
                     cand_highs.append(j)
         if cand_highs:
-            # Pick the pullback high closest to the SELL POI (the final inducement before the POI!)
             idm_idx   = max(cand_highs, key=lambda idx: highs[idx])
             idm_price = float(highs[idm_idx])
             eq_highs  = [idx for idx in cand_highs if abs(highs[idx] - idm_price) <= 0.22 * atr]
@@ -1689,7 +1752,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v10.1 — Full 4-Confluence SMC A+ Engine (With IDM Line)",
+            "✅ ENGINE VERSION": "AuraBrain v10.2 — Full 4-Confluence SMC A+ Engine (Origin OB + FVG + IDM)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
