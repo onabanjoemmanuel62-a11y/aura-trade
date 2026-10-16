@@ -24,13 +24,13 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 1, 2 & 3: PEAK + COMPLETE CHoCH/BOS CHAIN + SEPARATED POI (OB) & FVG
+# STABLE RELIABLE STRUCTURE TUNING (Zero Flickering / Clean Flips)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
-FLIP_BUFFER_ATR              = 0.20
+FLIP_BUFFER_ATR              = 0.30
 FLIP_CONFIRM_BARS            = 2
-ANCHOR_MIN_MOVE_ATR          = 1.4
-SWING_PROMINENCE_ATR         = 0.70
+ANCHOR_MIN_MOVE_ATR          = 1.5
+SWING_PROMINENCE_ATR         = 0.80
 MIN_FVG_SIZE_ATR             = 0.08
 
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +39,7 @@ logger = logging.getLogger("AuraBrain")
 MARKET_MEMORY = {"df": None}
 
 CYCLE_STATE: Dict[str, Dict]   = {}
+POI_STATE: Dict[str, Dict]     = {}
 ORDER_CACHE: Dict[str, int]    = {}
 ACTIVE_TRADES: Dict[str, Dict] = {}
 
@@ -140,7 +141,7 @@ class AnalysisRequest(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CORE ENGINE — Step 1 (Peak + CHoCH + Full BOS Chain) & Step 2/3 (POI & FVG)
+# CORE ENGINE — Stable Reliable Peak, CHoCH, BOS & Locked POI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_instrument_profile(currency: str, current_price: float) -> Dict:
@@ -200,7 +201,7 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
         if highs[idx] >= np.max(l_highs) and highs[idx] > np.max(r_highs):
             left_prom  = highs[idx] - np.min(lows[idx - left_w : idx])
             right_prom = highs[idx] - np.min(lows[idx + 1 : idx + right_w + 1])
-            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.40:
+            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.45:
                 if not filtered_highs or (idx - filtered_highs[-1]) >= right_w:
                     filtered_highs.append(idx)
                 elif highs[idx] > highs[filtered_highs[-1]]:
@@ -211,7 +212,7 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
         if lows[idx] <= np.min(l_lows) and lows[idx] < np.min(r_lows):
             left_prom  = np.max(highs[idx - left_w : idx]) - lows[idx]
             right_prom = np.max(highs[idx + 1 : idx + right_w + 1]) - lows[idx]
-            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.40:
+            if max(left_prom, right_prom) >= min_prominence and min(left_prom, right_prom) >= min_prominence * 0.45:
                 if not filtered_lows or (idx - filtered_lows[-1]) >= right_w:
                     filtered_lows.append(idx)
                 elif lows[idx] < lows[filtered_lows[-1]]:
@@ -223,16 +224,6 @@ def detect_swings_causal(highs: np.ndarray, lows: np.ndarray, swing_order: int, 
 def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                                  raw_highs: np.ndarray, raw_lows: np.ndarray,
                                  atr: float, decimals: int) -> List[Dict]:
-    """
-    STEP 1 (Market Structure — True CHoCH + Complete External BOS Chain):
-    1. Finds the LAST Lower High (before a Peak Low) or LAST Higher Low (before a Peak High)
-       immediately preceding `anchor_idx`. When price breaks it after the Peak, that is `CHoCH`.
-    2. After `CHoCH` breaks at `choch_break_idx`, we track every swing high (in Bullish)
-       or swing low (in Bearish) that is followed by a real pullback (`>= 0.35 * ATR`).
-       Critically: Once a pullback occurs (`pullback_ready = True`), a wick poking past the
-       swing level NEVER resets `pullback_ready = False`! As soon as a candle closes beyond
-       that swing level, `BOS` is recorded and the next leg begins!
-    """
     highs  = df['High'].values
     lows   = df['Low'].values
     closes = df['Close'].values
@@ -240,31 +231,33 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     total  = len(closes)
 
     anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
-    buf        = 0.03 * atr
+    buf        = 0.05 * atr
     events     = []
 
     if is_bullish:
         peak_low_val = float(lows[anchor_idx])
-        tight_left   = max(0, anchor_idx - 22)
+        tight_left   = max(0, anchor_idx - 25)
         choch_swing_idx = None
 
-        for j in range(anchor_idx - 1, tight_left - 1, -1):
-            l_w = max(0, j - 3)
-            r_w = min(anchor_idx + 1, j + 4)
-            if highs[j] >= np.max(highs[l_w:r_w]) and (highs[j] - peak_low_val) >= (1.05 * atr):
-                choch_swing_idx = j
-                break
+        pre_raw_highs = [
+            int(i) for i in raw_highs
+            if tight_left <= int(i) < anchor_idx - 1
+            and (highs[int(i)] - peak_low_val) >= (1.10 * atr)
+        ]
+        if pre_raw_highs:
+            choch_swing_idx = max(pre_raw_highs)
+        else:
+            for j in range(anchor_idx - 2, tight_left - 1, -1):
+                l_w = max(0, j - 3)
+                r_w = min(anchor_idx, j + 3)
+                if highs[j] >= np.max(highs[l_w:r_w]) and (highs[j] - peak_low_val) >= (1.10 * atr):
+                    choch_swing_idx = j
+                    break
 
         if choch_swing_idx is None:
-            wider_left = max(0, anchor_idx - 35)
-            pre_highs  = [int(i) for i in raw_highs if wider_left <= int(i) < anchor_idx and (highs[int(i)] - peak_low_val) >= (1.05 * atr)]
-            if pre_highs:
-                choch_swing_idx = max(pre_highs)
-            elif anchor_idx > 0:
-                win_start = max(0, anchor_idx - 18)
-                choch_swing_idx = win_start + int(np.argmax(highs[win_start:anchor_idx]))
-            else:
-                choch_swing_idx = anchor_idx
+            wider_left = max(0, anchor_idx - 38)
+            win_end    = max(wider_left + 1, anchor_idx - 1)
+            choch_swing_idx = wider_left + int(np.argmax(highs[wider_left:win_end]))
 
         nb_lo = max(0, choch_swing_idx - 2)
         nb_hi = min(anchor_idx, choch_swing_idx + 3)
@@ -275,7 +268,7 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 
         choch_break_idx = None
         for m in range(anchor_idx + 1, total):
-            if closes[m] > choch_lvl + buf or (m >= total - 2 and highs[m] > choch_lvl + (0.08 * atr)):
+            if closes[m] > choch_lvl + buf:
                 choch_break_idx = m
                 events.append({
                     "kind":       "CHoCH",
@@ -288,31 +281,35 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 })
                 break
 
-        # ── CHAIN ALL SUBSEQUENT EXTERNAL BULLISH BOS BREAKS ────────────────
         if choch_break_idx is not None:
             leg_start        = choch_break_idx
             last_broken_high = choch_lvl
 
-            while leg_start < total - 2:
+            while leg_start < total - 3:
                 run_high_idx   = leg_start
                 run_high_val   = float(highs[leg_start])
                 pullback_low   = float(lows[leg_start])
+                pullback_bars  = 0
                 pullback_ready = False
                 found_bos      = False
 
                 for m in range(leg_start + 1, total):
                     if not pullback_ready:
                         if highs[m] >= run_high_val:
-                            run_high_val = float(highs[m])
-                            run_high_idx = m
-                            pullback_low = float(lows[m])
+                            run_high_val  = float(highs[m])
+                            run_high_idx  = m
+                            pullback_low  = float(lows[m])
+                            pullback_bars = 0
                         else:
-                            pullback_low = min(pullback_low, float(lows[m]))
-                            if (run_high_val - pullback_low) >= (0.35 * atr) and run_high_val > last_broken_high + (0.05 * atr):
+                            pullback_low   = min(pullback_low, float(lows[m]))
+                            pullback_bars += 1
+                            if (
+                                (run_high_val - pullback_low) >= (0.40 * atr)
+                                and pullback_bars >= 2
+                                and run_high_val > last_broken_high + (0.15 * atr)
+                            ):
                                 pullback_ready = True
                     else:
-                        # Once pullback_ready is True, NEVER reset it to False on a wick!
-                        # Trigger BOS as soon as a candle closes above run_high_val!
                         if closes[m] > run_high_val + buf and (m - run_high_idx) >= 2:
                             pb_origin_idx = run_high_idx + int(np.argmin(lows[run_high_idx : m + 1]))
                             events.append({
@@ -334,26 +331,28 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 
     else:
         peak_high_val = float(highs[anchor_idx])
-        tight_left    = max(0, anchor_idx - 22)
+        tight_left    = max(0, anchor_idx - 25)
         choch_swing_idx = None
 
-        for j in range(anchor_idx - 1, tight_left - 1, -1):
-            l_w = max(0, j - 3)
-            r_w = min(anchor_idx + 1, j + 4)
-            if lows[j] <= np.min(lows[l_w:r_w]) and (peak_high_val - lows[j]) >= (1.05 * atr):
-                choch_swing_idx = j
-                break
+        pre_raw_lows = [
+            int(i) for i in raw_lows
+            if tight_left <= int(i) < anchor_idx - 1
+            and (peak_high_val - lows[int(i)]) >= (1.10 * atr)
+        ]
+        if pre_raw_lows:
+            choch_swing_idx = max(pre_raw_lows)
+        else:
+            for j in range(anchor_idx - 2, tight_left - 1, -1):
+                l_w = max(0, j - 3)
+                r_w = min(anchor_idx, j + 3)
+                if lows[j] <= np.min(lows[l_w:r_w]) and (peak_high_val - lows[j]) >= (1.10 * atr):
+                    choch_swing_idx = j
+                    break
 
         if choch_swing_idx is None:
-            wider_left = max(0, anchor_idx - 35)
-            pre_lows   = [int(i) for i in raw_lows if wider_left <= int(i) < anchor_idx and (peak_high_val - lows[int(i)]) >= (1.05 * atr)]
-            if pre_lows:
-                choch_swing_idx = max(pre_lows)
-            elif anchor_idx > 0:
-                win_start = max(0, anchor_idx - 18)
-                choch_swing_idx = win_start + int(np.argmin(lows[win_start:anchor_idx]))
-            else:
-                choch_swing_idx = anchor_idx
+            wider_left = max(0, anchor_idx - 38)
+            win_end    = max(wider_left + 1, anchor_idx - 1)
+            choch_swing_idx = wider_left + int(np.argmin(lows[wider_left:win_end]))
 
         nb_lo = max(0, choch_swing_idx - 2)
         nb_hi = min(anchor_idx, choch_swing_idx + 3)
@@ -364,7 +363,7 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 
         choch_break_idx = None
         for m in range(anchor_idx + 1, total):
-            if closes[m] < choch_lvl - buf or (m >= total - 2 and lows[m] < choch_lvl - (0.08 * atr)):
+            if closes[m] < choch_lvl - buf:
                 choch_break_idx = m
                 events.append({
                     "kind":       "CHoCH",
@@ -377,15 +376,15 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 })
                 break
 
-        # ── CHAIN ALL SUBSEQUENT EXTERNAL BEARISH BOS BREAKS ────────────────
         if choch_break_idx is not None:
             leg_start       = choch_break_idx
             last_broken_low = choch_lvl
 
-            while leg_start < total - 2:
+            while leg_start < total - 3:
                 run_low_idx    = leg_start
                 run_low_val    = float(lows[leg_start])
                 pullback_high  = float(highs[leg_start])
+                pullback_bars  = 0
                 pullback_ready = False
                 found_bos      = False
 
@@ -395,13 +394,17 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                             run_low_val   = float(lows[m])
                             run_low_idx   = m
                             pullback_high = float(highs[m])
+                            pullback_bars = 0
                         else:
-                            pullback_high = max(pullback_high, float(highs[m]))
-                            if (pullback_high - run_low_val) >= (0.35 * atr) and run_low_val < last_broken_low - (0.05 * atr):
+                            pullback_high  = max(pullback_high, float(highs[m]))
+                            pullback_bars += 1
+                            if (
+                                (pullback_high - run_low_val) >= (0.40 * atr)
+                                and pullback_bars >= 2
+                                and run_low_val < last_broken_low - (0.15 * atr)
+                            ):
                                 pullback_ready = True
                     else:
-                        # Once pullback_ready is True, NEVER reset it to False on a wick!
-                        # Trigger BOS as soon as a candle closes below run_low_val!
                         if closes[m] < run_low_val - buf and (m - run_low_idx) >= 2:
                             pb_origin_idx = run_low_idx + int(np.argmax(highs[run_low_idx : m + 1]))
                             events.append({
@@ -427,16 +430,6 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                            struct_events: List[Dict], current_price: float,
                            atr: float, decimals: int) -> Optional[Dict]:
-    """
-    SEPARATED POI, ORDER BLOCK (OB), & FAIR VALUE GAP (FVG) ENGINE:
-    1. Evaluates ONLY the most recent structure break (`struct_events[-1]`).
-    2. Never anchors on the Peak Formation candle (`ob_idx > anchor_idx + 1`).
-    3. Finds the exact Order Block candle (`ob_idx`) right before the breakout impulse
-       that created a 3-candle Fair Value Gap (`FVG`).
-    4. STRICT ZERO-TOUCH / ZERO-MITIGATION RULE:
-       If ANY subsequent candle after the 3-bar FVG (`k + 3` to `total - 1`, or `current_price`)
-       has touched or passed through the POI box, it is mitigated and returns `None`.
-    """
     if not struct_events:
         return None
 
@@ -462,7 +455,7 @@ def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
     if is_bullish:
         for k in range(search_hi, search_lo - 1, -1):
             disp_body = float(closes[k + 1] - opens[k + 1])
-            if disp_body < (0.25 * atr):
+            if disp_body < (0.22 * atr):
                 continue
 
             fvg_bot  = float(highs[k])
@@ -472,7 +465,7 @@ def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                 continue
 
             ob_idx = k
-            if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.35 * atr):
+            if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.30 * atr):
                 ob_idx = k - 1
 
             if ob_idx <= anchor_idx + 1:
@@ -514,7 +507,7 @@ def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
     else:
         for k in range(search_hi, search_lo - 1, -1):
             disp_body = float(opens[k + 1] - closes[k + 1])
-            if disp_body < (0.25 * atr):
+            if disp_body < (0.22 * atr):
                 continue
 
             fvg_top  = float(lows[k])
@@ -524,7 +517,7 @@ def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                 continue
 
             ob_idx = k
-            if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.35 * atr):
+            if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.30 * atr):
                 ob_idx = k - 1
 
             if ob_idx <= anchor_idx + 1:
@@ -635,14 +628,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                         protected_low_idx = last_confirmed_low
 
                 struct_broke = closes[i] < (lows[protected_low_idx] - buf)
-                ema_crash = (
-                    closes[i] < min(ema_50_array[i], ema_200_array[i]) - (1.2 * atr)
-                    and (extreme_price - closes[i]) >= (2.8 * atr)
-                )
-                broke = struct_broke or ema_crash
-                pending = pending + 1 if broke else 0
+                pending = pending + 1 if struct_broke else 0
 
-                if pending >= FLIP_CONFIRM_BARS or (i == total - 1 and broke and (extreme_price - closes[i]) >= 2.2 * atr):
+                if pending >= FLIP_CONFIRM_BARS:
                     true_peak_high_idx = cycle_start_idx + int(np.argmax(highs[cycle_start_idx : i + 1]))
                     is_bull            = False
                     cycle_start_idx    = true_peak_high_idx
@@ -668,14 +656,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                         protected_high_idx = last_confirmed_high
 
                 struct_broke = closes[i] > (highs[protected_high_idx] + buf)
-                ema_surge = (
-                    closes[i] > max(ema_50_array[i], ema_200_array[i]) + (1.2 * atr)
-                    and (closes[i] - extreme_price) >= (2.8 * atr)
-                )
-                broke = struct_broke or ema_surge
-                pending = pending + 1 if broke else 0
+                pending = pending + 1 if struct_broke else 0
 
-                if pending >= FLIP_CONFIRM_BARS or (i == total - 1 and broke and (closes[i] - extreme_price) >= 2.2 * atr):
+                if pending >= FLIP_CONFIRM_BARS:
                     true_peak_low_idx = cycle_start_idx + int(np.argmin(lows[cycle_start_idx : i + 1]))
                     is_bull           = True
                     cycle_start_idx   = true_peak_low_idx
@@ -708,26 +691,56 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_time  = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
-    # ── MACRO PEAK INTEGRITY CHECK (Fixes GC=F 4242.30 vs 4224.80!) ─────────
-    # If an internal pullback briefly flipped the cycle counter, check if there is a true
-    # unviolated macro Peak High/Low within the last 160 bars of the same trend!
+    # ── RELIABLE PEAK STABILITY GUARD (Prevents False Mid-Range Flips) ──────
+    # A Bearish Peak High (e.g. 4242.30 on Gold) only flips if price breaks and closes
+    # above the highest major intermediate Lower High of the drop (>= 2.5 * ATR prominence).
     macro_lookback = max(0, total - 160)
+    macro_max_idx  = macro_lookback + int(np.argmax(highs[macro_lookback:]))
+    macro_min_idx  = macro_lookback + int(np.argmin(lows[macro_lookback:]))
+    macro_high_val = float(highs[macro_max_idx])
+    macro_low_val  = float(lows[macro_min_idx])
+    macro_span     = macro_high_val - macro_low_val
+
+    if macro_span > (3.5 * atr):
+        if macro_max_idx < macro_min_idx:
+            inter_highs = [
+                int(i) for i in raw_highs
+                if macro_max_idx + 3 <= int(i) <= macro_min_idx - 3
+                and (highs[int(i)] - macro_low_val) >= (2.0 * atr)
+            ]
+            major_ceiling = max([float(highs[i]) for i in inter_highs]) if inter_highs else (macro_low_val + 0.80 * macro_span)
+            post_low_max_close = float(np.max(closes[macro_min_idx:]))
+            if post_low_max_close <= major_ceiling + (0.10 * atr):
+                is_bullish         = False
+                fresh_anchor_idx   = int(macro_max_idx)
+                fresh_anchor_time  = int(dates[macro_max_idx])
+                fresh_anchor_price = macro_high_val
+        else:
+            inter_lows = [
+                int(i) for i in raw_lows
+                if macro_min_idx + 3 <= int(i) <= macro_max_idx - 3
+                and (macro_high_val - lows[int(i)]) >= (2.0 * atr)
+            ]
+            major_floor = min([float(lows[i]) for i in inter_lows]) if inter_lows else (macro_high_val - 0.80 * macro_span)
+            post_high_min_close = float(np.min(closes[macro_max_idx:]))
+            if post_high_min_close >= major_floor - (0.10 * atr):
+                is_bullish         = True
+                fresh_anchor_idx   = int(macro_min_idx)
+                fresh_anchor_time  = int(dates[macro_min_idx])
+                fresh_anchor_price = macro_low_val
+
     if not is_bullish:
-        win_max_idx = macro_lookback + int(np.argmax(highs[macro_lookback:]))
-        if highs[win_max_idx] > fresh_anchor_price and win_max_idx < fresh_anchor_idx:
-            # If price after win_max_idx has made lower lows and never broke above win_max_idx,
-            # then win_max_idx (e.g. 4242.30 on Gold) is the TRUE Peak Formation High!
-            if np.min(lows[fresh_anchor_idx:]) < np.min(lows[win_max_idx:fresh_anchor_idx]):
-                fresh_anchor_idx   = int(win_max_idx)
-                fresh_anchor_time  = int(dates[win_max_idx])
-                fresh_anchor_price = float(highs[win_max_idx])
+        if highs[macro_max_idx] > fresh_anchor_price and macro_max_idx < fresh_anchor_idx:
+            if np.min(lows[fresh_anchor_idx:]) < np.min(lows[macro_max_idx:fresh_anchor_idx]):
+                fresh_anchor_idx   = int(macro_max_idx)
+                fresh_anchor_time  = int(dates[macro_max_idx])
+                fresh_anchor_price = float(highs[macro_max_idx])
     else:
-        win_min_idx = macro_lookback + int(np.argmin(lows[macro_lookback:]))
-        if lows[win_min_idx] < fresh_anchor_price and win_min_idx < fresh_anchor_idx:
-            if np.max(highs[fresh_anchor_idx:]) > np.max(highs[win_min_idx:fresh_anchor_idx]):
-                fresh_anchor_idx   = int(win_min_idx)
-                fresh_anchor_time  = int(dates[win_min_idx])
-                fresh_anchor_price = float(lows[win_min_idx])
+        if lows[macro_min_idx] < fresh_anchor_price and macro_min_idx < fresh_anchor_idx:
+            if np.max(highs[fresh_anchor_idx:]) > np.max(highs[macro_min_idx:fresh_anchor_idx]):
+                fresh_anchor_idx   = int(macro_min_idx)
+                fresh_anchor_time  = int(dates[macro_min_idx])
+                fresh_anchor_price = float(lows[macro_min_idx])
 
     anchor_idx   = fresh_anchor_idx
     anchor_time  = fresh_anchor_time
@@ -745,7 +758,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         post_max_idx = anchor_idx + int(np.argmax(highs[anchor_idx:]))
         if highs[post_max_idx] > anchor_price:
             anchor_idx   = post_max_idx
-            anchor_time  = int(dates[anchor_idx])
+            anchor_time  = int(dates[post_max_idx])
             anchor_price = float(highs[post_max_idx])
         move = float(anchor_price - lows[anchor_idx:].min())
         extreme_held = bool(highs[anchor_idx:].max() <= anchor_price + 1e-9)
@@ -794,9 +807,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "is_choch":   is_c,
         })
 
-    # ── 3. Build Separated POI, OB, and FVG Data ────────────────────────────
-    live_ref   = current_price if current_price > 0 else float(closes[-1])
-    poi_info   = find_true_breakout_poi(df, is_bullish, int(anchor_idx), struct_events, live_ref, atr, decimals)
+    # ── 3. Build or Keep Locked Unmitigated POI ──────────────────────────────
+    live_ref = current_price if current_price > 0 else float(closes[-1])
+    poi_info = find_or_lock_unmitigated_poi(
+        df, is_bullish, int(anchor_idx), anchor_time, struct_events, live_ref, atr, decimals, state_key=state_key
+    )
     zone_boxes = [poi_info["box"]] if poi_info else []
     poi_level  = poi_info["poi_level"] if poi_info else anchor_price
 
@@ -867,7 +882,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         {
             "step":   "2. Point of Interest (Origin OB)",
             "done":   bool(has_poi),
-            "detail": f"{ob_range} ✅" if has_poi else "Waiting for Unmitigated OB",
+            "detail": f"{ob_range} 🔒" if has_poi else "Waiting for Unmitigated OB",
         },
         {
             "step":   "3. Fair Value Gap (FVG)",
@@ -884,16 +899,16 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     if has_poi:
         pips_away = round(abs(current_price - poi_level) / max(pip_size, 1e-6), 1)
         note = (
-            f"📊 STEP 2 & 3 READY: Unmitigated {'BUY' if is_bullish else 'SELL'} POI (OB: {ob_range}) "
-            f"validated by adjacent FVG ({fvg_range}). Price is {pips_away} pips away."
+            f"🔒 LOCKED {'BUY' if is_bullish else 'SELL'} POI (OB: {ob_range}) "
+            f"validated by FVG ({fvg_range}). Price is {pips_away} pips away. This POI is locked until mitigated."
         )
     else:
         note = (
             f"⏳ NO UNMITIGATED POI YET: {dir_word} confirmed via {break_kind} {arrow} ({break_level:.{decimals}f}), "
-            f"but the breakout Origin OB is already mitigated or hasn't formed a valid FVG yet. Waiting patiently."
+            f"but prior Origin OBs have been mitigated. Waiting for market to form a new BOS + FVG setup."
         )
 
-    setup_title = "Step 2 & 3: POI & FVG Confirmed" if has_poi else "Waiting for Unmitigated POI"
+    setup_title = "Step 2 & 3: Locked POI & FVG" if has_poi else "Waiting for Unmitigated POI"
 
     return {
         "signal":     "WAIT",
@@ -1035,12 +1050,12 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v9.7 — Fixed BOS Wick-Reset Bug + Macro Peak Integrity",
+            "✅ ENGINE VERSION": "AuraBrain v9.9 — Macro Peak Guard + Locked Non-Shifting POI",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
             "📏 LINES":          ms['lines'],
-            "📦 POI INFO":       ms.get('poi_info'),
+            "🔒 LOCKED POI":     ms.get('poi_info'),
         }
     except Exception as e:
         import traceback
