@@ -24,7 +24,7 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STABLE RELIABLE STRUCTURE TUNING (Zero Flickering / Clean Flips)
+# STEP 1, 2 & 3: STABLE MACRO PEAK + MULTI-BAR BOS + LOCKED UNMITIGATED POI
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.30
@@ -427,12 +427,18 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     return events
 
 
-def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
-                           struct_events: List[Dict], current_price: float,
-                           atr: float, decimals: int) -> Optional[Dict]:
-    if not struct_events:
-        return None
-
+def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
+                                 anchor_time: int, struct_events: List[Dict],
+                                 current_price: float, atr: float, decimals: int,
+                                 state_key: Optional[str] = None) -> Optional[Dict]:
+    """
+    NON-SHIFTING LOCKED POI ENGINE:
+    1. If a valid, untouched `BUY POI` or `SELL POI` is already locked in `POI_STATE[state_key]`
+       for the current cycle (`anchor_time` & `is_bullish`), it stays 100% frozen in place
+       until price touches/mitigates it—even if new BOS breaks happen further along the leg!
+    2. Scans structure breaks chronologically (from primary unmitigated break to newest)
+       so an unmitigated primary POI is never abandoned prematurely.
+    """
     opens  = df['Open'].values
     closes = df['Close'].values
     highs  = df['High'].values
@@ -440,121 +446,165 @@ def find_true_breakout_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
     dates  = df['Date'].values if 'Date' in df.columns else df.index.values
     total  = len(closes)
 
-    latest_ev  = struct_events[-1]
-    orig_start = int(max(anchor_idx + 2, latest_ev.get("leg_origin", anchor_idx + 2)))
-    break_idx  = int(latest_ev.get("break_idx", total - 1))
+    if state_key and state_key in POI_STATE:
+        locked = POI_STATE[state_key]
+        if locked.get("is_bullish") == is_bullish and locked.get("anchor_time") == anchor_time:
+            dep_time        = locked.get("depart_time", 0)
+            dep_matches     = np.where(dates >= dep_time)[0]
+            still_untouched = True
 
-    search_lo = max(anchor_idx + 2, orig_start, break_idx - 12)
-    search_hi = min(total - 3, break_idx)
+            if len(dep_matches) > 0:
+                dep_idx = int(dep_matches[0])
+                if dep_idx + 1 < total:
+                    if is_bullish and float(np.min(lows[dep_idx + 1:])) <= locked["top"]:
+                        still_untouched = False
+                    elif (not is_bullish) and float(np.max(highs[dep_idx + 1:])) >= locked["bottom"]:
+                        still_untouched = False
 
-    if search_lo > search_hi:
+            if is_bullish and current_price <= locked["top"]:
+                still_untouched = False
+            elif (not is_bullish) and current_price >= locked["bottom"]:
+                still_untouched = False
+
+            if still_untouched:
+                locked["box"]["end_time"] = int(dates[-1])
+                return locked
+            else:
+                del POI_STATE[state_key]
+
+    if not struct_events:
         return None
 
     max_thickness = 0.38 * atr
 
-    if is_bullish:
-        for k in range(search_hi, search_lo - 1, -1):
-            disp_body = float(closes[k + 1] - opens[k + 1])
-            if disp_body < (0.22 * atr):
-                continue
+    for ev in struct_events:
+        orig_start = int(max(anchor_idx + 2, ev.get("leg_origin", anchor_idx + 2)))
+        break_idx  = int(ev.get("break_idx", total - 1))
 
-            fvg_bot  = float(highs[k])
-            fvg_top  = float(lows[k + 2])
-            fvg_size = fvg_top - fvg_bot
-            if fvg_size < (MIN_FVG_SIZE_ATR * atr):
-                continue
+        search_lo = max(anchor_idx + 2, orig_start, break_idx - 12)
+        search_hi = min(total - 3, break_idx)
+        if search_lo > search_hi:
+            continue
 
-            ob_idx = k
-            if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.30 * atr):
-                ob_idx = k - 1
-
-            if ob_idx <= anchor_idx + 1:
-                continue
-
-            bot_val    = float(lows[ob_idx])
-            candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
-            top_val    = min(max(bot_val + 0.16 * atr, candle_top), bot_val + max_thickness)
-
-            depart_idx = k + 2
-
-            if depart_idx + 1 < total:
-                post_lowest = float(np.min(lows[depart_idx + 1:]))
-                if post_lowest <= top_val:
+        if is_bullish:
+            for k in range(search_hi, search_lo - 1, -1):
+                disp_body = float(closes[k + 1] - opens[k + 1])
+                if disp_body < (0.25 * atr):
                     continue
-            if current_price <= top_val:
-                continue
 
-            bot_r     = round(bot_val, decimals)
-            top_r     = round(top_val, decimals)
-            fvg_bot_r = round(fvg_bot, decimals)
-            fvg_top_r = round(fvg_top, decimals)
-
-            return {
-                "poi_level": top_r,
-                "ob_range":  f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
-                "fvg_range": f"{fvg_bot_r:.{decimals}f}–{fvg_top_r:.{decimals}f}",
-                "box": {
-                    "type":      "BULL_OB",
-                    "top":       top_r,
-                    "bottom":    bot_r,
-                    "time":      int(dates[ob_idx]),
-                    "end_time":  int(dates[-1]),
-                    "label":     f"BUY POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
-                    "mitigated": False,
-                }
-            }
-
-    else:
-        for k in range(search_hi, search_lo - 1, -1):
-            disp_body = float(opens[k + 1] - closes[k + 1])
-            if disp_body < (0.22 * atr):
-                continue
-
-            fvg_top  = float(lows[k])
-            fvg_bot  = float(highs[k + 2])
-            fvg_size = fvg_top - fvg_bot
-            if fvg_size < (MIN_FVG_SIZE_ATR * atr):
-                continue
-
-            ob_idx = k
-            if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.30 * atr):
-                ob_idx = k - 1
-
-            if ob_idx <= anchor_idx + 1:
-                continue
-
-            top_val    = float(highs[ob_idx])
-            candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
-            bot_val    = max(min(top_val - 0.16 * atr, candle_bot), top_val - max_thickness)
-
-            depart_idx = k + 2
-
-            if depart_idx + 1 < total:
-                post_highest = float(np.max(highs[depart_idx + 1:]))
-                if post_highest >= bot_val:
+                fvg_bot  = float(highs[k])
+                fvg_top  = float(lows[k + 2])
+                fvg_size = fvg_top - fvg_bot
+                if fvg_size < (MIN_FVG_SIZE_ATR * atr):
                     continue
-            if current_price >= bot_val:
-                continue
 
-            bot_r     = round(bot_val, decimals)
-            top_r     = round(top_val, decimals)
-            fvg_bot_r = round(fvg_bot, decimals)
-            fvg_top_r = round(fvg_top, decimals)
+                ob_idx = k
+                if k > search_lo and (closes[k] > opens[k]) and ((closes[k] - opens[k]) > 0.35 * atr):
+                    ob_idx = k - 1
 
-            return {
-                "poi_level": bot_r,
-                "ob_range":  f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
-                "fvg_range": f"{fvg_bot_r:.{decimals}f}–{fvg_top_r:.{decimals}f}",
-                "box": {
-                    "type":      "BEAR_OB",
-                    "top":       top_r,
-                    "bottom":    bot_r,
-                    "time":      int(dates[ob_idx]),
-                    "end_time":  int(dates[-1]),
-                    "label":     f"SELL POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
-                    "mitigated": False,
+                if ob_idx <= anchor_idx + 1:
+                    continue
+
+                bot_val    = float(lows[ob_idx])
+                candle_top = float(max(opens[ob_idx], closes[ob_idx], highs[ob_idx]))
+                top_val    = min(max(bot_val + 0.16 * atr, candle_top), bot_val + max_thickness)
+
+                depart_idx = k + 2
+
+                if depart_idx + 1 < total:
+                    post_lowest = float(np.min(lows[depart_idx + 1:]))
+                    if post_lowest <= top_val:
+                        continue
+                if current_price <= top_val:
+                    continue
+
+                bot_r     = round(bot_val, decimals)
+                top_r     = round(top_val, decimals)
+                fvg_bot_r = round(fvg_bot, decimals)
+                fvg_top_r = round(fvg_top, decimals)
+
+                poi_result = {
+                    "is_bullish":  True,
+                    "anchor_time": anchor_time,
+                    "depart_time": int(dates[depart_idx]),
+                    "top":         top_r,
+                    "bottom":      bot_r,
+                    "poi_level":   top_r,
+                    "ob_range":    f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
+                    "fvg_range":   f"{fvg_bot_r:.{decimals}f}–{fvg_top_r:.{decimals}f}",
+                    "box": {
+                        "type":      "BULL_OB",
+                        "top":       top_r,
+                        "bottom":    bot_r,
+                        "time":      int(dates[ob_idx]),
+                        "end_time":  int(dates[-1]),
+                        "label":     f"BUY POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
+                        "mitigated": False,
+                    }
                 }
-            }
+                if state_key:
+                    POI_STATE[state_key] = poi_result
+                return poi_result
+
+        else:
+            for k in range(search_hi, search_lo - 1, -1):
+                disp_body = float(opens[k + 1] - closes[k + 1])
+                if disp_body < (0.25 * atr):
+                    continue
+
+                fvg_top  = float(lows[k])
+                fvg_bot  = float(highs[k + 2])
+                fvg_size = fvg_top - fvg_bot
+                if fvg_size < (MIN_FVG_SIZE_ATR * atr):
+                    continue
+
+                ob_idx = k
+                if k > search_lo and (closes[k] < opens[k]) and ((opens[k] - closes[k]) > 0.35 * atr):
+                    ob_idx = k - 1
+
+                if ob_idx <= anchor_idx + 1:
+                    continue
+
+                top_val    = float(highs[ob_idx])
+                candle_bot = float(min(opens[ob_idx], closes[ob_idx], lows[ob_idx]))
+                bot_val    = max(min(top_val - 0.16 * atr, candle_bot), top_val - max_thickness)
+
+                depart_idx = k + 2
+
+                if depart_idx + 1 < total:
+                    post_highest = float(np.max(highs[depart_idx + 1:]))
+                    if post_highest >= bot_val:
+                        continue
+                if current_price >= bot_val:
+                    continue
+
+                bot_r     = round(bot_val, decimals)
+                top_r     = round(top_val, decimals)
+                fvg_bot_r = round(fvg_bot, decimals)
+                fvg_top_r = round(fvg_top, decimals)
+
+                poi_result = {
+                    "is_bullish":  False,
+                    "anchor_time": anchor_time,
+                    "depart_time": int(dates[depart_idx]),
+                    "top":         top_r,
+                    "bottom":      bot_r,
+                    "poi_level":   bot_r,
+                    "ob_range":    f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
+                    "fvg_range":   f"{fvg_bot_r:.{decimals}f}–{fvg_top_r:.{decimals}f}",
+                    "box": {
+                        "type":      "BEAR_OB",
+                        "top":       top_r,
+                        "bottom":    bot_r,
+                        "time":      int(dates[ob_idx]),
+                        "end_time":  int(dates[-1]),
+                        "label":     f"SELL POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
+                        "mitigated": False,
+                    }
+                }
+                if state_key:
+                    POI_STATE[state_key] = poi_result
+                return poi_result
 
     return None
 
@@ -692,8 +742,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
     # ── RELIABLE PEAK STABILITY GUARD (Prevents False Mid-Range Flips) ──────
-    # A Bearish Peak High (e.g. 4242.30 on Gold) only flips if price breaks and closes
-    # above the highest major intermediate Lower High of the drop (>= 2.5 * ATR prominence).
     macro_lookback = max(0, total - 160)
     macro_max_idx  = macro_lookback + int(np.argmax(highs[macro_lookback:]))
     macro_min_idx  = macro_lookback + int(np.argmin(lows[macro_lookback:]))
