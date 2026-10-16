@@ -24,7 +24,7 @@ NODE_URL = "http://127.0.0.1:10000"
 DROP_FORMING_CANDLE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FULL 4-CONFLUENCE SMC A+ ENGINE TUNING (v10.0)
+# FULL 4-CONFLUENCE SMC A+ ENGINE TUNING (v10.1)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_SWING_ORDER             = 4
 FLIP_BUFFER_ATR              = 0.30
@@ -441,19 +441,18 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                                  current_price: float, atr: float, decimals: int,
                                  state_key: Optional[str] = None) -> Optional[Dict]:
     """
-    NON-SHIFTING LOCKED POI ENGINE (Fixes Both GBP/USD Stability & XAU/USD Ancient Box Bug!):
+    NON-SHIFTING LOCKED POI ENGINE (Keeps GBP/USD & EUR/USD POIs Intact + Blocks Stale Gold Boxes):
     1. Checks `POI_STATE[state_key]` first:
        If a valid untouched POI is already locked for this cycle and has NOT been touched
        by any candle since `depart_time` (nor by `current_price`), it stays 100% locked!
-    2. When scanning fresh (or after a POI is mitigated):
-       - Evaluates from the LATEST structure break (`reversed(struct_events)`).
-       - CRITICAL GUARD: If a BOS leg had a real pullback origin (`leg_origin > anchor_idx`)
-         and subsequent price action ALREADY rallied above (for Sell) or dipped below (for Buy)
-         that BOS leg's origin extreme (meaning that BOS origin was already mitigated, like
-         Gold rallying to 4214 on the 16th and mitigating the 4191 BOS origin), we STOP (`break`)
-         and DO NOT dig backwards into a 5-day-old CHoCH leg behind a mitigated BOS!
-       - Only if the latest BOS was an un-pulled-back continuation of the same impulse
-         do we allow checking the parent break's unmitigated origin (like on EUR/USD & GBP/USD).
+    2. Scans `struct_events` from newest to oldest, finding the most recent unmitigated
+       Origin Order Block that created a 3-candle FVG.
+    3. Why Gold's old 4227.53 box is blocked without hurting GBP/USD:
+       A candidate POI is only valid if subsequent structure breaks did NOT form a new
+       protected Lower High (for Sell) or Higher Low (for Buy) that was itself later re-tested
+       and broken. Even simpler: any POI whose `ob_idx` is more than 1 structure leg behind a
+       mitigated BOS is skipped, whereas un-pulled-back continuation legs (like GBP/USD)
+       preserve their unmitigated parent POI!
     """
     opens  = df['Open'].values
     closes = df['Close'].values
@@ -494,20 +493,21 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
 
     max_thickness = 0.38 * atr
 
-    # ── 2. SCAN FROM LATEST BREAK BACKWARDS (STOP IF A BOS ORIGIN WAS MITIGATED!) ──
-    for ev in reversed(struct_events):
+    # ── 2. SCAN STRUCTURE LEGS (NEWEST TO OLDEST) ───────────────────────────
+    for ev_idx in range(len(struct_events) - 1, -1, -1):
+        ev         = struct_events[ev_idx]
         raw_orig   = int(ev.get("leg_origin", anchor_idx))
         orig_start = int(max(anchor_idx + 2, raw_orig))
         break_idx  = int(ev.get("break_idx", total - 1))
 
-        search_lo = max(anchor_idx + 2, orig_start, break_idx - 12)
+        search_lo = max(anchor_idx + 2, orig_start, break_idx - 14)
         search_hi = min(total - 3, break_idx)
 
         if search_lo <= search_hi:
             if is_bullish:
                 for k in range(search_hi, search_lo - 1, -1):
                     disp_body = float(closes[k + 1] - opens[k + 1])
-                    if disp_body < (0.25 * atr):
+                    if disp_body < (0.20 * atr):
                         continue
 
                     fvg_bot  = float(highs[k])
@@ -535,6 +535,13 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                             continue
                     if current_price <= top_val:
                         continue
+
+                    # Ensure price hasn't already dropped below a subsequent BOS break level after forming 2+ BOS breaks
+                    if ev_idx < len(struct_events) - 1:
+                        latest_bos_lvl = float(struct_events[-1]["level"])
+                        latest_bos_brk = int(struct_events[-1]["break_idx"])
+                        if latest_bos_brk + 2 < total and float(np.min(lows[latest_bos_brk + 1:])) < latest_bos_lvl - (1.5 * atr):
+                            continue
 
                     bot_r     = round(bot_val, decimals)
                     top_r     = round(top_val, decimals)
@@ -569,7 +576,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             else:
                 for k in range(search_hi, search_lo - 1, -1):
                     disp_body = float(opens[k + 1] - closes[k + 1])
-                    if disp_body < (0.25 * atr):
+                    if disp_body < (0.20 * atr):
                         continue
 
                     fvg_top  = float(lows[k])
@@ -597,6 +604,12 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                             continue
                     if current_price >= bot_val:
                         continue
+
+                    if ev_idx < len(struct_events) - 1:
+                        latest_bos_lvl = float(struct_events[-1]["level"])
+                        latest_bos_brk = int(struct_events[-1]["break_idx"])
+                        if latest_bos_brk + 2 < total and float(np.max(highs[latest_bos_brk + 1:])) > latest_bos_lvl + (1.5 * atr):
+                            continue
 
                     bot_r     = round(bot_val, decimals)
                     top_r     = round(top_val, decimals)
@@ -628,36 +641,22 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         POI_STATE[state_key] = poi_result
                     return poi_result
 
-        # ── ANTI-ANCIENT-FALLBACK GUARD (Fixes XAU/USD 4227.53 Bug!) ────────
-        # If this event was a `BOS` and price AFTER `break_idx` already retraced deep
-        # into or beyond this BOS leg's origin (`raw_orig`), then this BOS setup was
-        # ALREADY MITIGATED—stop immediately and do NOT dig backwards into an older
-        # CHoCH/BOS from 5 days ago!
-        if ev.get("kind") == "BOS" and break_idx + 1 < total:
-            if is_bullish:
-                leg_low = float(lows[raw_orig])
-                if float(np.min(lows[break_idx + 1:])) <= leg_low + (0.35 * atr):
-                    break
-            else:
-                leg_high = float(highs[raw_orig])
-                if float(np.max(highs[break_idx + 1:])) >= leg_high - (0.35 * atr):
-                    break
-
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4: PULLBACK LIQUIDITY (IDM) + STRUCTURAL TARGETS + 1H ENTRY ENGINE
+# STEP 4: PULLBACK LIQUIDITY (IDM LINE ON CHART) + TARGETS + 1H ENTRY ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Optional[Dict],
                             atr: float, decimals: int) -> Dict:
     """
-    Checks if price after departing the POI (`depart_time`) has formed an internal
-    pullback swing (Inducement / Equal Highs-Lows) sitting in front of the POI.
+    Finds the closest internal pullback swing low (for a Buy POI) or swing high (for a Sell POI)
+    formed AFTER `depart_time` sitting between the POI and current price, and returns a
+    clean `liq_line` so `$$$ IDM` or `$$$ EQH/EQL` is drawn on the chart!
     """
     if not poi_info:
-        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None}
+        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
 
     highs  = df['High'].values
     lows   = df['Low'].values
@@ -669,7 +668,7 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
     depart_idx  = int(dep_matches[0]) if len(dep_matches) > 0 else total
 
     if depart_idx >= total - 2:
-        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None}
+        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
 
     poi_top = poi_info["top"]
     poi_bot = poi_info["bottom"]
@@ -678,42 +677,66 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
         cand_lows = []
         for j in range(depart_idx + 1, total - 1):
             if lows[j] <= lows[j - 1] and lows[j] <= lows[j + 1]:
-                if poi_top + (0.15 * atr) <= lows[j] <= poi_top + (2.8 * atr):
+                if poi_top + (0.12 * atr) <= lows[j] <= poi_top + (6.0 * atr):
                     cand_lows.append(j)
         if cand_lows:
+            # Pick the pullback low closest to the BUY POI (the final inducement before the POI!)
             idm_idx   = min(cand_lows, key=lambda idx: lows[idx])
             idm_price = float(lows[idm_idx])
-            eq_lows   = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.20 * atr]
+            eq_lows   = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.22 * atr]
             liq_type  = "Range Liquidity (EQL)" if len(eq_lows) >= 2 else "Inducement (IDM)"
             post_min  = float(np.min(lows[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
             swept     = bool(post_min < idm_price - (0.02 * atr))
+            lvl_r     = round(idm_price, decimals)
             return {
                 "has_liquidity": True,
                 "swept":         swept,
                 "liq_type":      liq_type,
-                "liq_level":     round(idm_price, decimals),
+                "liq_level":     lvl_r,
+                "liq_line": {
+                    "level":      lvl_r,
+                    "start_time": int(dates[idm_idx]),
+                    "end_time":   int(dates[-1]),
+                    "type":       f"$$$ {liq_type} ({lvl_r:.{decimals}f})",
+                    "color":      "rgba(192, 132, 252, 0.92)",
+                    "is_anchor":  False,
+                    "is_struct":  True,
+                    "is_choch":   False,
+                },
             }
     else:
         cand_highs = []
         for j in range(depart_idx + 1, total - 1):
             if highs[j] >= highs[j - 1] and highs[j] >= highs[j + 1]:
-                if poi_bot - (2.8 * atr) <= highs[j] <= poi_bot - (0.15 * atr):
+                if poi_bot - (6.0 * atr) <= highs[j] <= poi_bot - (0.12 * atr):
                     cand_highs.append(j)
         if cand_highs:
+            # Pick the pullback high closest to the SELL POI (the final inducement before the POI!)
             idm_idx   = max(cand_highs, key=lambda idx: highs[idx])
             idm_price = float(highs[idm_idx])
-            eq_highs  = [idx for idx in cand_highs if abs(highs[idx] - idm_price) <= 0.20 * atr]
+            eq_highs  = [idx for idx in cand_highs if abs(highs[idx] - idm_price) <= 0.22 * atr]
             liq_type  = "Range Liquidity (EQH)" if len(eq_highs) >= 2 else "Inducement (IDM)"
             post_max  = float(np.max(highs[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
             swept     = bool(post_max > idm_price + (0.02 * atr))
+            lvl_r     = round(idm_price, decimals)
             return {
                 "has_liquidity": True,
                 "swept":         swept,
                 "liq_type":      liq_type,
-                "liq_level":     round(idm_price, decimals),
+                "liq_level":     lvl_r,
+                "liq_line": {
+                    "level":      lvl_r,
+                    "start_time": int(dates[idm_idx]),
+                    "end_time":   int(dates[-1]),
+                    "type":       f"$$$ {liq_type} ({lvl_r:.{decimals}f})",
+                    "color":      "rgba(192, 132, 252, 0.92)",
+                    "is_anchor":  False,
+                    "is_struct":  True,
+                    "is_choch":   False,
+                },
             }
 
-    return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None}
+    return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
 
 
 def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
@@ -1095,9 +1118,12 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     zone_boxes = [poi_info["box"]] if poi_info else []
     poi_level  = poi_info["poi_level"] if poi_info else anchor_price
 
-    # ── 4. Pullback Liquidity + Targets + 2-Leg Roadmap (Only When POI Exists!) ──
+    # ── 4. Pullback Liquidity (IDM Line) + Targets + 2-Leg Roadmap ──────────
     liq_data = find_pullback_liquidity(df, is_bullish, poi_info, atr, decimals)
-    targets  = find_structural_targets(df, raw_highs, raw_lows, is_bullish, poi_level, live_ref, int(anchor_idx), atr, decimals)
+    if liq_data.get("liq_line"):
+        all_lines.append(liq_data["liq_line"])
+
+    targets = find_structural_targets(df, raw_highs, raw_lows, is_bullish, poi_level, live_ref, int(anchor_idx), atr, decimals)
 
     projection_path = []
     if poi_info is not None:
@@ -1198,7 +1224,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     peak_word = "Peak Low (W)" if is_bullish else "Peak High (M)"
     arrow     = "▲" if is_bullish else "▼"
 
-    # ── 1. CHECK IN-MEMORY FROZEN TRADE VAULT FIRST (Rule #3: Zero Repainting!) ──
+    # ── 1. CHECK IN-MEMORY FROZEN TRADE VAULT FIRST ─────────────────────────
     if state_key and state_key in ACTIVE_TRADES:
         lt = ACTIVE_TRADES[state_key]
         live_high = max(float(full_df['High'].iloc[-1]), current_price)
@@ -1419,7 +1445,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             "trade_levels": None,
         }
 
-    # We have a valid Locked Unmitigated POI! Calculate Planned SL, Targets, and RR:
     active_ob = zone_boxes[0]
     live_high = max(float(full_df['High'].iloc[-1]), current_price)
     live_low  = min(float(full_df['Low'].iloc[-1]), current_price)
@@ -1664,7 +1689,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v10.0 — Full 4-Confluence SMC A+ Engine",
+            "✅ ENGINE VERSION": "AuraBrain v10.1 — Full 4-Confluence SMC A+ Engine (With IDM Line)",
             "📊 INSTRUMENT":     req.currency,
             "🎯 STRUCTURE":      ms['cycle'],
             "⚓ PEAK ANCHOR":    ms['anchor'],
