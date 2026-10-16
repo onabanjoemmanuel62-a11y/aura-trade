@@ -347,7 +347,7 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 choch_swing_idx = max(pre_lows)
             elif anchor_idx > 0:
                 win_start = max(0, anchor_idx - 18)
-                choch_swing_idx = win_start + int(np.argmin(lows[win_start:anchor_idx])))
+                choch_swing_idx = win_start + int(np.argmin(lows[win_start:anchor_idx]))
             else:
                 choch_swing_idx = anchor_idx
 
@@ -702,7 +702,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_time  = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
-    # Keep the true Peak Formation locked for up to 240 bars (10 trading days) unless structure flips!
     current_idx = total - 1
     if (current_idx - fresh_anchor_idx) > 240:
         dist_atr = abs(closes[-1] - fresh_anchor_price) / atr if atr > 0 else 0
