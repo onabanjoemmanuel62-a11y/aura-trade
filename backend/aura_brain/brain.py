@@ -408,83 +408,73 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     return events
 
 
-def check_poi_status_after_departure(df: pd.DataFrame, is_bullish: bool, depart_idx: int,
-                                     top_val: float, bot_val: float,
-                                     leg_target_ref: float, current_price: float,
-                                     atr: float) -> str:
+def check_poi_status_strict(df: pd.DataFrame, is_bullish: bool, depart_idx: int,
+                            top_val: float, bot_val: float, current_price: float) -> str:
+    """
+    STRICT ZERO-WICK MITIGATION RULE (v10.6):
+    - Checks every candle strictly after departure (`depart_idx + 1` to `total - 1`):
+    - If ANY closed historical candle (`depart_idx + 1` to `total - 2`) has already touched
+      the POI EVEN BY A WICK (`low <= top_val` for Buy, `high >= bot_val` for Sell),
+      then that POI was ALREADY MITIGATED in the past! Do NOT draw it again!
+    - For the current live candle (`total - 1`):
+      * If zero candles have touched it yet -> "UNTOUCHED" (draw clean POI + projection arrow).
+      * If the current candle is the VERY FIRST candle tapping inside the box AND has not
+        wicked through the back of the box (`low >= bot_val` for Buy, `high <= top_val` for Sell)
+        -> "TAPPING_NOW" (confirming right now on this candle!).
+      * Otherwise -> "MITIGATED" (do not draw box or projection line!).
+    """
     highs = df['High'].values
     lows = df['Low'].values
-    closes = df['Close'].values
-    total = len(closes)
+    total = len(highs)
 
     if depart_idx >= total - 1:
-        return "INVALIDATED"
-
-    sl_buffer = 0.25 * atr
+        return "MITIGATED"
 
     if is_bullish:
-        first_tap_idx = None
-        for idx in range(depart_idx + 1, total):
-            if lows[idx] <= top_val + (0.04 * atr):
-                first_tap_idx = idx
-                break
+        # 1. Did any completed candle after departure already touch `top_val` (even by a wick)?
+        if depart_idx + 1 <= total - 2:
+            prior_min_low = float(np.min(lows[depart_idx + 1 : total - 1]))
+            if prior_min_low <= top_val:
+                return "MITIGATED"
 
-        if first_tap_idx is None:
-            if current_price <= top_val + (0.04 * atr):
-                if current_price < bot_val - sl_buffer:
-                    return "INVALIDATED"
-                return "IN_PLAY"
-            return "UNTOUCHED"
-
-        min_low_since_tap = min(float(np.min(lows[first_tap_idx:])), current_price)
-        min_close_since_tap = float(np.min(closes[first_tap_idx:]))
-        if min_low_since_tap < bot_val - sl_buffer or min_close_since_tap < bot_val - (0.08 * atr):
-            return "INVALIDATED"
-
-        if first_tap_idx + 1 < total:
-            max_high_after_tap = max(float(np.max(highs[first_tap_idx + 1:])), current_price)
-            if max_high_after_tap >= leg_target_ref - (0.05 * atr):
-                return "INVALIDATED"
-
-        if (total - 1 - first_tap_idx) > 30:
-            return "INVALIDATED"
-
-        return "IN_PLAY"
+        # 2. Check the current candle (`total - 1`) and `current_price`
+        live_low = min(float(lows[-1]), current_price)
+        if live_low < bot_val:
+            # Wicked below the bottom of the BUY POI -> Invalidated!
+            return "MITIGATED"
+        if live_low <= top_val:
+            return "TAPPING_NOW"
+        return "UNTOUCHED"
 
     else:
-        first_tap_idx = None
-        for idx in range(depart_idx + 1, total):
-            if highs[idx] >= bot_val - (0.04 * atr):
-                first_tap_idx = idx
-                break
+        # 1. Did any completed candle after departure already touch `bot_val` (even by a wick)?
+        if depart_idx + 1 <= total - 2:
+            prior_max_high = float(np.max(highs[depart_idx + 1 : total - 1]))
+            if prior_max_high >= bot_val:
+                return "MITIGATED"
 
-        if first_tap_idx is None:
-            if current_price >= bot_val - (0.04 * atr):
-                if current_price > top_val + sl_buffer:
-                    return "INVALIDATED"
-                return "IN_PLAY"
-            return "UNTOUCHED"
-
-        max_high_since_tap = max(float(np.max(highs[first_tap_idx:])), current_price)
-        max_close_since_tap = float(np.max(closes[first_tap_idx:]))
-        if max_high_since_tap > top_val + sl_buffer or max_close_since_tap > top_val + (0.08 * atr):
-            return "INVALIDATED"
-
-        if first_tap_idx + 1 < total:
-            min_low_after_tap = min(float(np.min(lows[first_tap_idx + 1:])), current_price)
-            if min_low_after_tap <= leg_target_ref + (0.05 * atr):
-                return "INVALIDATED"
-
-        if (total - 1 - first_tap_idx) > 30:
-            return "INVALIDATED"
-
-        return "IN_PLAY"
+        # 2. Check the current candle (`total - 1`) and `current_price`
+        live_high = max(float(highs[-1]), current_price)
+        if live_high > top_val:
+            # Wicked above the top of the SELL POI -> Invalidated!
+            return "MITIGATED"
+        if live_high >= bot_val:
+            return "TAPPING_NOW"
+        return "UNTOUCHED"
 
 
 def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
                                  anchor_time: int, struct_events: List[Dict],
                                  current_price: float, atr: float, decimals: int,
                                  state_key: Optional[str] = None) -> Optional[Dict]:
+    """
+    STRICT ZERO-WICK MITIGATION ORDER BLOCK ENGINE (v10.6):
+    1. If an active trade (`ACTIVE_TRADES[state_key]`) is currently open, keep its POI box visible
+       until that trade hits `TP1` or `SL`.
+    2. Otherwise, any POI that has ALREADY been touched by a past candle (even by a single wick!)
+       is 100% MITIGATED and is immediately removed (`return None`) so we NEVER draw boxes or
+       projection arrows on mitigated zones (like the 1.40790–1.40963 box in your screenshot)!
+    """
     opens = df['Open'].values
     closes = df['Close'].values
     highs = df['High'].values
@@ -492,6 +482,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
     total = len(closes)
 
+    # ── 0. IF AN ACTIVE TRADE IS RUNNING, KEEP ITS POI BOX ON CHART UNTIL TP/SL ──
     if state_key and state_key in ACTIVE_TRADES:
         lt = ACTIVE_TRADES[state_key]
         if lt.get("is_bullish") == is_bullish and lt.get("poi_snapshot"):
@@ -513,32 +504,25 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                 )
                 return snap
 
+    # ── 1. CHECK IF AN EXISTING LOCKED POI IS STILL 100% UNMITIGATED ────────
     if state_key and state_key in POI_STATE:
         locked = POI_STATE[state_key]
         if (
             locked.get("is_bullish") == is_bullish
             and locked.get("anchor_time") == anchor_time
-            and locked.get("engine_ver") == "10.5"
+            and locked.get("engine_ver") == "10.6"
         ):
             dep_time = locked.get("depart_time", 0)
             dep_matches = np.where(dates >= dep_time)[0]
             if len(dep_matches) > 0:
                 dep_idx = int(dep_matches[0])
-                leg_target_ref = (
-                    max(float(np.max(highs[dep_idx:])), locked["top"] + 1.2 * atr)
-                    if is_bullish else
-                    min(float(np.min(lows[dep_idx:])), locked["bottom"] - 1.2 * atr)
+                status = check_poi_status_strict(
+                    df, is_bullish, dep_idx, locked["top"], locked["bottom"], current_price
                 )
-                status = check_poi_status_after_departure(
-                    df, is_bullish, dep_idx, locked["top"], locked["bottom"],
-                    leg_target_ref, current_price, atr
-                )
-                if status in ("UNTOUCHED", "IN_PLAY"):
+                if status in ("UNTOUCHED", "TAPPING_NOW"):
                     locked["status"] = status
                     locked["box"]["end_time"] = int(dates[-1])
                     prefix = "BUY POI" if is_bullish else "SELL POI"
-                    if status == "IN_PLAY":
-                        prefix = "ACTIVE " + prefix
                     locked["box"]["label"] = f"{prefix} ({locked['bottom']:.{decimals}f}–{locked['top']:.{decimals}f})"
                     return locked
             del POI_STATE[state_key]
@@ -549,6 +533,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     max_candle_span = 1.10 * atr
     min_candle_span = 0.16 * atr
 
+    # ── 2. SCAN STRUCTURE LEGS (NEWEST TO OLDEST) ───────────────────────────
     for ev_idx in range(len(struct_events) - 1, -1, -1):
         ev = struct_events[ev_idx]
         orig_idx = int(np.clip(ev.get("leg_origin", anchor_idx), anchor_idx, total - 3))
@@ -617,28 +602,28 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                     bot_val = raw_bot
                     top_val = max(raw_top, raw_bot + min_candle_span)
 
+                # Departure is strictly the breakout candle (`break_idx`)!
+                # Do NOT advance `depart_idx` over subsequent candles that wicked back into the OB!
                 depart_idx = max(ob_idx + 1, break_idx)
-                while depart_idx < total - 1 and lows[depart_idx] <= top_val:
-                    if depart_idx > break_idx + 2:
-                        break
-                    depart_idx += 1
-
                 if depart_idx >= total - 1:
                     continue
 
-                leg_target_ref = max(float(np.max(highs[depart_idx:])), top_val + 1.2 * atr)
-                status = check_poi_status_after_departure(
-                    df, True, depart_idx, top_val, bot_val, leg_target_ref, current_price, atr
-                )
-                if status == "INVALIDATED":
+                # Must actually depart above `top_val` on the breakout candle
+                if float(closes[depart_idx]) <= top_val:
+                    if depart_idx + 1 < total - 1 and float(closes[depart_idx + 1]) > top_val and float(lows[depart_idx + 1]) > bot_val:
+                        depart_idx = depart_idx + 1
+                    else:
+                        continue
+
+                status = check_poi_status_strict(df, True, depart_idx, top_val, bot_val, current_price)
+                if status == "MITIGATED":
                     continue
 
                 bot_r = round(bot_val, decimals)
                 top_r = round(top_val, decimals)
-                prefix = "ACTIVE BUY POI" if status == "IN_PLAY" else "BUY POI"
 
                 poi_result = {
-                    "engine_ver": "10.5",
+                    "engine_ver": "10.6",
                     "is_bullish": True,
                     "status": status,
                     "anchor_time": anchor_time,
@@ -658,7 +643,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         "bottom": bot_r,
                         "time": int(dates[ob_idx]),
                         "end_time": int(dates[-1]),
-                        "label": f"{prefix} ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
+                        "label": f"BUY POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
                         "mitigated": False,
                     }
                 }
@@ -713,28 +698,27 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                     top_val = raw_top
                     bot_val = min(raw_bot, raw_top - min_candle_span)
 
+                # Departure is strictly the breakout candle (`break_idx`)!
+                # Do NOT advance `depart_idx` over subsequent candles that wicked back into the OB!
                 depart_idx = max(ob_idx + 1, break_idx)
-                while depart_idx < total - 1 and highs[depart_idx] >= bot_val:
-                    if depart_idx > break_idx + 2:
-                        break
-                    depart_idx += 1
-
                 if depart_idx >= total - 1:
                     continue
 
-                leg_target_ref = min(float(np.min(lows[depart_idx:])), bot_val - 1.2 * atr)
-                status = check_poi_status_after_departure(
-                    df, False, depart_idx, top_val, bot_val, leg_target_ref, current_price, atr
-                )
-                if status == "INVALIDATED":
+                if float(closes[depart_idx]) >= bot_val:
+                    if depart_idx + 1 < total - 1 and float(closes[depart_idx + 1]) < bot_val and float(highs[depart_idx + 1]) < top_val:
+                        depart_idx = depart_idx + 1
+                    else:
+                        continue
+
+                status = check_poi_status_strict(df, False, depart_idx, top_val, bot_val, current_price)
+                if status == "MITIGATED":
                     continue
 
                 bot_r = round(bot_val, decimals)
                 top_r = round(top_val, decimals)
-                prefix = "ACTIVE SELL POI" if status == "IN_PLAY" else "SELL POI"
 
                 poi_result = {
-                    "engine_ver": "10.5",
+                    "engine_ver": "10.6",
                     "is_bullish": False,
                     "status": status,
                     "anchor_time": anchor_time,
@@ -754,7 +738,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                         "bottom": bot_r,
                         "time": int(dates[ob_idx]),
                         "end_time": int(dates[-1]),
-                        "label": f"{prefix} ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
+                        "label": f"SELL POI ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
                         "mitigated": False,
                     }
                 }
@@ -1295,7 +1279,8 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     targets = find_structural_targets(df, raw_highs, raw_lows, is_bullish, poi_level, live_ref, int(anchor_idx), atr, decimals)
 
     projection_path = []
-    if poi_info is not None:
+    # Only draw the dashed 2-leg projection roadmap when an UNTOUCHED POI is waiting for pullback!
+    if poi_info is not None and poi_info.get("status") == "UNTOUCHED":
         target_line_color = "rgba(255, 193, 7, 0.95)"
         for t in targets:
             all_lines.append({
@@ -1412,130 +1397,112 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
     locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
 
+    # Only scan the most recent closed 1H candle (`k = total - 1`) for a fresh first-tap rejection!
     if locked_trade is None and has_poi and peak_confirmed:
         active_ob = zone_boxes[0]
         depart_idx = int(poi_info.get("depart_idx", anchor_idx + 2))
         if total > depart_idx + 1:
-            search_start = max(depart_idx + 1, total - 35)
-            for k in range(search_start, total):
+            k = total - 1
+            # Ensure no candle prior to `k` already mitigated this OB
+            prior_mitigated = False
+            if k > depart_idx + 1:
+                if is_bullish and float(np.min(lows[depart_idx + 1 : k])) <= active_ob["top"]:
+                    prior_mitigated = True
+                elif (not is_bullish) and float(np.max(highs[depart_idx + 1 : k])) >= active_ob["bottom"]:
+                    prior_mitigated = True
+
+            if not prior_mitigated:
                 c_open = float(opens[k])
                 c_close = float(closes[k])
                 c_high = float(highs[k])
                 c_low = float(lows[k])
-                p_high = float(highs[k - 1])
-                p_low = float(lows[k - 1])
-
                 body_sz = abs(c_close - c_open)
                 u_wick = c_high - max(c_open, c_close)
                 l_wick = min(c_open, c_close) - c_low
 
                 if is_bullish:
-                    touched_ob = (min(c_low, p_low) <= active_ob["top"] + 0.06 * atr) and (c_close >= active_ob["bottom"])
-                    if not touched_ob:
-                        continue
-
+                    touched_ob = (c_low <= active_ob["top"]) and (c_low >= active_ob["bottom"]) and (c_close >= active_ob["bottom"])
                     is_bull_rej = (
                         ((c_close > c_open) and (body_sz >= 0.10 * atr))
-                        or (l_wick >= 0.16 * atr and c_close >= c_low + 0.52 * max(c_high - c_low, 1e-9))
+                        or (l_wick >= 0.16 * atr and c_close >= c_low + 0.55 * max(c_high - c_low, 1e-9))
                     )
-                    not_chasing = (c_close - active_ob["top"]) <= (0.55 * atr)
-                    if not (is_bull_rej and not_chasing):
-                        continue
+                    not_chasing = (c_close - active_ob["top"]) <= (0.50 * atr)
 
-                    entry_k = round(c_close, decimals)
-                    floor_k = min(active_ob["bottom"], c_low, p_low)
-                    sl_k = round(min(floor_k - 0.25 * atr, entry_k - 0.40 * atr), decimals)
-                    risk_k = max(abs(entry_k - sl_k), 1e-6)
+                    if touched_ob and is_bull_rej and not_chasing:
+                        entry_k = round(c_close, decimals)
+                        floor_k = min(active_ob["bottom"], c_low)
+                        sl_k = round(min(floor_k - 0.25 * atr, entry_k - 0.40 * atr), decimals)
+                        risk_k = max(abs(entry_k - sl_k), 1e-6)
 
-                    t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, entry_k, anchor_idx, atr, decimals)
-                    if len(t_list) < 2:
-                        continue
-                    tp1_k = t_list[0]["level"]
-                    tp2_k = t_list[1]["level"]
-                    rr_k = round(max(abs(tp1_k - entry_k), abs(tp2_k - entry_k)) / risk_k, 2)
-                    if rr_k < MIN_ALLOWED_RR:
-                        continue
-
-                    post_lows = list(lows[k + 1:]) + [float(full_df['Low'].iloc[-1]), current_price]
-                    post_highs = list(highs[k + 1:]) + [float(full_df['High'].iloc[-1]), current_price]
-                    if min(post_lows) <= sl_k or max(post_highs) >= tp1_k:
-                        continue
-
-                    poi_snap = dict(poi_info)
-                    poi_snap["box"] = dict(active_ob)
-                    poi_snap["box"]["label"] = f"ACTIVE BUY POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
-
-                    locked_trade = {
-                        "is_bullish": True,
-                        "signal": "BUY",
-                        "signal_idx": k,
-                        "signal_time": int(dates[k]),
-                        "entry": entry_k,
-                        "stop_loss": sl_k,
-                        "target_1": tp1_k,
-                        "target_2": tp2_k,
-                        "risk_reward": rr_k,
-                        "ob_range": ob_range,
-                        "fvg_range": fvg_range,
-                        "poi_snapshot": poi_snap,
-                    }
-                    if state_key:
-                        ACTIVE_TRADES[state_key] = locked_trade
-                    break
+                        t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, entry_k, anchor_idx, atr, decimals)
+                        if len(t_list) >= 2:
+                            tp1_k = t_list[0]["level"]
+                            tp2_k = t_list[1]["level"]
+                            rr_k = round(max(abs(tp1_k - entry_k), abs(tp2_k - entry_k)) / risk_k, 2)
+                            live_l = min(float(full_df['Low'].iloc[-1]), current_price)
+                            live_h = max(float(full_df['High'].iloc[-1]), current_price)
+                            if rr_k >= MIN_ALLOWED_RR and live_l > sl_k and live_h < tp1_k:
+                                poi_snap = dict(poi_info)
+                                poi_snap["box"] = dict(active_ob)
+                                poi_snap["box"]["label"] = f"ACTIVE BUY POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
+                                locked_trade = {
+                                    "is_bullish": True,
+                                    "signal": "BUY",
+                                    "signal_idx": k,
+                                    "signal_time": int(dates[k]),
+                                    "entry": entry_k,
+                                    "stop_loss": sl_k,
+                                    "target_1": tp1_k,
+                                    "target_2": tp2_k,
+                                    "risk_reward": rr_k,
+                                    "ob_range": ob_range,
+                                    "fvg_range": fvg_range,
+                                    "poi_snapshot": poi_snap,
+                                }
+                                if state_key:
+                                    ACTIVE_TRADES[state_key] = locked_trade
 
                 else:
-                    touched_ob = (max(c_high, p_high) >= active_ob["bottom"] - 0.06 * atr) and (c_close <= active_ob["top"])
-                    if not touched_ob:
-                        continue
-
+                    touched_ob = (c_high >= active_ob["bottom"]) and (c_high <= active_ob["top"]) and (c_close <= active_ob["top"])
                     is_bear_rej = (
                         ((c_close < c_open) and (body_sz >= 0.10 * atr))
-                        or (u_wick >= 0.16 * atr and c_close <= c_high - 0.52 * max(c_high - c_low, 1e-9))
+                        or (u_wick >= 0.16 * atr and c_close <= c_high - 0.55 * max(c_high - c_low, 1e-9))
                     )
-                    not_chasing = (active_ob["bottom"] - c_close) <= (0.55 * atr)
-                    if not (is_bear_rej and not_chasing):
-                        continue
+                    not_chasing = (active_ob["bottom"] - c_close) <= (0.50 * atr)
 
-                    entry_k = round(c_close, decimals)
-                    ceil_k = max(active_ob["top"], c_high, p_high)
-                    sl_k = round(max(ceil_k + 0.25 * atr, entry_k + 0.40 * atr), decimals)
-                    risk_k = max(abs(sl_k - entry_k), 1e-6)
+                    if touched_ob and is_bear_rej and not_chasing:
+                        entry_k = round(c_close, decimals)
+                        ceil_k = max(active_ob["top"], c_high)
+                        sl_k = round(max(ceil_k + 0.25 * atr, entry_k + 0.40 * atr), decimals)
+                        risk_k = max(abs(sl_k - entry_k), 1e-6)
 
-                    t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, entry_k, anchor_idx, atr, decimals)
-                    if len(t_list) < 2:
-                        continue
-                    tp1_k = t_list[0]["level"]
-                    tp2_k = t_list[1]["level"]
-                    rr_k = round(max(abs(entry_k - tp1_k), abs(entry_k - tp2_k)) / risk_k, 2)
-                    if rr_k < MIN_ALLOWED_RR:
-                        continue
-
-                    post_lows = list(lows[k + 1:]) + [float(full_df['Low'].iloc[-1]), current_price]
-                    post_highs = list(highs[k + 1:]) + [float(full_df['High'].iloc[-1]), current_price]
-                    if max(post_highs) >= sl_k or min(post_lows) <= tp1_k:
-                        continue
-
-                    poi_snap = dict(poi_info)
-                    poi_snap["box"] = dict(active_ob)
-                    poi_snap["box"]["label"] = f"ACTIVE SELL POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
-
-                    locked_trade = {
-                        "is_bullish": False,
-                        "signal": "SELL",
-                        "signal_idx": k,
-                        "signal_time": int(dates[k]),
-                        "entry": entry_k,
-                        "stop_loss": sl_k,
-                        "target_1": tp1_k,
-                        "target_2": tp2_k,
-                        "risk_reward": rr_k,
-                        "ob_range": ob_range,
-                        "fvg_range": fvg_range,
-                        "poi_snapshot": poi_snap,
-                    }
-                    if state_key:
-                        ACTIVE_TRADES[state_key] = locked_trade
-                    break
+                        t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, entry_k, anchor_idx, atr, decimals)
+                        if len(t_list) >= 2:
+                            tp1_k = t_list[0]["level"]
+                            tp2_k = t_list[1]["level"]
+                            rr_k = round(max(abs(entry_k - tp1_k), abs(entry_k - tp2_k)) / risk_k, 2)
+                            live_l = min(float(full_df['Low'].iloc[-1]), current_price)
+                            live_h = max(float(full_df['High'].iloc[-1]), current_price)
+                            if rr_k >= MIN_ALLOWED_RR and live_h < sl_k and live_l > tp1_k:
+                                poi_snap = dict(poi_info)
+                                poi_snap["box"] = dict(active_ob)
+                                poi_snap["box"]["label"] = f"ACTIVE SELL POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
+                                locked_trade = {
+                                    "is_bullish": False,
+                                    "signal": "SELL",
+                                    "signal_idx": k,
+                                    "signal_time": int(dates[k]),
+                                    "entry": entry_k,
+                                    "stop_loss": sl_k,
+                                    "target_1": tp1_k,
+                                    "target_2": tp2_k,
+                                    "risk_reward": rr_k,
+                                    "ob_range": ob_range,
+                                    "fvg_range": fvg_range,
+                                    "poi_snapshot": poi_snap,
+                                }
+                                if state_key:
+                                    ACTIVE_TRADES[state_key] = locked_trade
 
     if locked_trade:
         f_entry = locked_trade["entry"]
@@ -1607,7 +1574,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         ]
         note = (
             f"⏳ NO UNMITIGATED POI YET: {dir_word} confirmed via {break_kind} {arrow} ({break_level:.{decimals}f}), "
-            f"but prior Order Blocks have completed their moves or been invalidated. Waiting for a new BOS."
+            f"but prior Order Blocks have already been mitigated by price wicks/bodies. Waiting for a new BOS."
         )
         return {
             "signal": "WAIT",
@@ -1630,24 +1597,10 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     active_ob = zone_boxes[0]
     poi_status = poi_info.get("status", "UNTOUCHED")
     has_fvg_flag = bool(poi_info.get("has_fvg", False))
-    live_high = max(float(full_df['High'].iloc[-1]), current_price)
-    live_low = min(float(full_df['Low'].iloc[-1]), current_price)
     live_open = float(full_df['Open'].iloc[-1])
-    full_len = len(full_df)
-    has_departed = (full_len - 1) > int(poi_info.get("depart_idx", anchor_idx + 2))
 
     if is_bullish:
-        in_zone_now = (
-            has_departed
-            and (
-                poi_status == "IN_PLAY"
-                or (
-                    (live_low <= poi_level + 0.08 * atr)
-                    and (current_price >= active_ob["bottom"] - 0.08 * atr)
-                    and ((current_price - poi_level) <= 0.50 * atr)
-                )
-            )
-        )
+        in_zone_now = (poi_status == "TAPPING_NOW")
         planned_sl = round(min(active_ob["bottom"], poi_level) - (0.25 * atr), decimals)
         risk = max(abs(poi_level - planned_sl), 1e-6)
         best_rr = round(max(abs(t1_level - poi_level), abs(t2_level - poi_level)) / risk, 2) if (t1_level and t2_level) else 2.5
@@ -1668,7 +1621,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         if in_zone_now:
             stage = "IN_ZONE_CONFIRMING"
             trig_lvl = round(max(live_open, active_ob["bottom"]), decimals)
-            note = f"🎯 PRICE TAPPED BUY POI ({ob_range})! Wait for 1H candle to close GREEN with rejection above {trig_lvl:.{decimals}f} to lock BUY."
+            note = f"🎯 FIRST TAP IN BUY POI ({ob_range})! Wait for current 1H candle to close GREEN above {trig_lvl:.{decimals}f} to lock BUY."
         else:
             stage = "AWAITING_PULLBACK"
             pips_away = round(abs(current_price - poi_level) / max(pip_size, 1e-6), 1)
@@ -1678,7 +1631,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 else f" {liq_type} sitting @ {liq_level:.{decimals}f} above POI."
                 if has_liquidity else ""
             )
-            note = f"🔒 LOCKED BUY POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips above Buy POI.{liq_hint}"
+            note = f"🔒 UNMITIGATED BUY POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips above Buy POI.{liq_hint}"
 
         return {
             "signal": "WAIT",
@@ -1699,17 +1652,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         }
 
     else:
-        in_zone_now = (
-            has_departed
-            and (
-                poi_status == "IN_PLAY"
-                or (
-                    (live_high >= poi_level - 0.08 * atr)
-                    and (current_price <= active_ob["top"] + 0.08 * atr)
-                    and ((poi_level - current_price) <= 0.50 * atr)
-                )
-            )
-        )
+        in_zone_now = (poi_status == "TAPPING_NOW")
         planned_sl = round(max(active_ob["top"], poi_level) + (0.25 * atr), decimals)
         risk = max(abs(planned_sl - poi_level), 1e-6)
         best_rr = round(max(abs(poi_level - t1_level), abs(poi_level - t2_level)) / risk, 2) if (t1_level and t2_level) else 2.5
@@ -1730,7 +1673,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         if in_zone_now:
             stage = "IN_ZONE_CONFIRMING"
             trig_lvl = round(min(live_open, active_ob["top"]), decimals)
-            note = f"🎯 PRICE TAPPED SELL POI ({ob_range})! Wait for 1H candle to close RED with rejection below {trig_lvl:.{decimals}f} to lock SELL."
+            note = f"🎯 FIRST TAP IN SELL POI ({ob_range})! Wait for current 1H candle to close RED below {trig_lvl:.{decimals}f} to lock SELL."
         else:
             stage = "AWAITING_PULLBACK"
             pips_away = round(abs(poi_level - current_price) / max(pip_size, 1e-6), 1)
@@ -1740,7 +1683,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                 else f" {liq_type} sitting @ {liq_level:.{decimals}f} below POI."
                 if has_liquidity else ""
             )
-            note = f"🔒 LOCKED SELL POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips below Sell POI.{liq_hint}"
+            note = f"🔒 UNMITIGATED SELL POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips below Sell POI.{liq_hint}"
 
         return {
             "signal": "WAIT",
@@ -1890,7 +1833,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v10.5 — Pure Pre-Breakout OB Candle Geometry",
+            "✅ ENGINE VERSION": "AuraBrain v10.6 — Strict Zero-Wick Mitigation Engine",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],
