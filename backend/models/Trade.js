@@ -23,10 +23,18 @@ const tradeSchema = new mongoose.Schema({
     required: true
   },
   // Stop-loss / take-profit levels the AI set when the trade was opened.
-  // Required so an OPEN trade can actually be monitored and closed later.
   sl: {
     type: Number,
     required: true
+  },
+  // Original stop-loss at entry so RR calculation never breaks after SL moves to Break-Even
+  initialSl: {
+    type: Number
+  },
+  // Flag indicating whether Stop Loss has been moved to Break-Even (+1 pip buffer)
+  beTriggered: {
+    type: Boolean,
+    default: false
   },
   tp: {
     type: Number,
@@ -43,8 +51,6 @@ const tradeSchema = new mongoose.Schema({
     default: 'OPEN',
     required: true
   },
-  // The following three are only set once the trade closes — no longer required
-  // up front, since a freshly-opened paper trade doesn't have an exit yet.
   exit: {
     type: Number
   },
@@ -53,7 +59,7 @@ const tradeSchema = new mongoose.Schema({
     enum: ['WON', 'LOST']
   },
   profit: {
-    type: Number // price-unit move (entry vs exit), negative for losses. Matches the dashboard's "pips" stat.
+    type: Number
   },
   timestamp: {
     type: Date,
@@ -64,9 +70,6 @@ const tradeSchema = new mongoose.Schema({
   }
 });
 
-// Fast lookup for "is there already an open trade on this symbol?" (used to avoid
-// opening duplicate paper trades while one is still active) and for the monitoring
-// loop's per-tick query of open trades by symbol.
 tradeSchema.index({ symbol: 1, status: 1 });
 
 module.exports = mongoose.model('Trade', tradeSchema);

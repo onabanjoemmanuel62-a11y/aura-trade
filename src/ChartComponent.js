@@ -34,8 +34,12 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
     if (candles[mid].time < targetTime) lo = mid + 1;
     else hi = mid - 1;
   }
-  const nearestIdx = Math.min(candles.length - 1, Math.max(0, lo));
-  return timeScale.timeToCoordinate(candles[nearestIdx].time);
+  const idxLo = Math.min(candles.length - 1, Math.max(0, lo));
+  const idxHi = Math.min(candles.length - 1, Math.max(0, hi));
+  const bestIdx = Math.abs(candles[idxHi].time - targetTime) <= Math.abs(candles[idxLo].time - targetTime)
+    ? idxHi
+    : idxLo;
+  return timeScale.timeToCoordinate(candles[bestIdx].time);
 };
 
 class LineRenderer {
@@ -51,11 +55,11 @@ class LineRenderer {
 
       this._data.forEach((line) => {
         if (line.x1 === null || line.x2 === null || line.y === null) return;
-        const x1 = Math.max(0, line.x1 * hPR);
+        const x1 = Math.max(0, Math.round(line.x1 * hPR));
         const x2 = line.isStruct
-          ? Math.min(Math.max(x1 + 26 * hPR, line.x2 * hPR), rightEdge)
-          : Math.min(line.x2 * hPR, rightEdge);
-        const y  = line.y * vPR;
+          ? Math.min(Math.max(x1 + 26 * hPR, Math.round(line.x2 * hPR)), rightEdge)
+          : Math.min(Math.round(line.x2 * hPR), rightEdge);
+        const y  = Math.round(line.y * vPR);
         if (x1 >= rightEdge) return;
 
         ctx.save();
@@ -134,8 +138,8 @@ class TrendlineRenderer {
       const { x1, y1, x2, y2, color, label } = this._data;
       if (x1 === null || y1 === null || x2 === null || y2 === null) return;
 
-      const px1 = Math.max(0, x1 * hPR), py1 = y1 * vPR;
-      const px2 = Math.min(x2, rightEdge / hPR) * hPR, py2 = y2 * vPR;
+      const px1 = Math.max(0, Math.round(x1 * hPR)), py1 = Math.round(y1 * vPR);
+      const px2 = Math.min(Math.round(x2 * hPR), rightEdge), py2 = Math.round(y2 * vPR);
       if (px1 >= rightEdge) return;
 
       ctx.beginPath();
@@ -197,10 +201,10 @@ class OBZoneRenderer {
 
       this._data.forEach((zone) => {
         if (zone.x1 === null || zone.yTop === null || zone.yBottom === null) return;
-        const x1      = Math.max(0, zone.x1 * hPR);
-        const x2      = zone.x2 !== null ? Math.min(zone.x2 * hPR, rightEdge) : rightEdge;
-        const yTop    = Math.min(zone.yTop, zone.yBottom) * vPR;
-        const yBottom = Math.max(zone.yTop, zone.yBottom) * vPR;
+        const x1      = Math.max(0, Math.round(zone.x1 * hPR));
+        const x2      = zone.x2 !== null ? Math.min(Math.round(zone.x2 * hPR), rightEdge) : rightEdge;
+        const yTop    = Math.round(Math.min(zone.yTop, zone.yBottom) * vPR);
+        const yBottom = Math.round(Math.max(zone.yTop, zone.yBottom) * vPR);
         const boxH    = Math.max(4 * vPR, yBottom - yTop);
         if (x1 >= rightEdge) return;
 
@@ -274,12 +278,12 @@ class ProjectionRenderer {
       const [p0, p1, p2] = this._data.points;
       if (p0.x == null || p0.y == null || p1.y == null || p2.y == null) return;
 
-      const x0 = p0.x * hPR;
-      const y0 = p0.y * vPR;
+      const x0 = Math.round(p0.x * hPR);
+      const y0 = Math.round(p0.y * vPR);
       const x1 = Math.min(x0 + 28 * hPR, rightEdge - 65 * hPR);
-      const y1 = p1.y * vPR;
+      const y1 = Math.round(p1.y * vPR);
       const x2 = Math.min(x0 + 78 * hPR, rightEdge - 20 * hPR);
-      const y2 = p2.y * vPR;
+      const y2 = Math.round(p2.y * vPR);
 
       if (x0 >= rightEdge - 30 * hPR) return;
 
@@ -423,16 +427,36 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
   const processCandles = useCallback((rawData) => {
     if (!Array.isArray(rawData)) return [];
-    return rawData
+    const sorted = rawData
       .filter(d => d.open != null && d.close != null && d.time != null)
       .map(d => {
         let seconds = Number(d.time);
         if (seconds > 2_000_000_000) seconds = Math.floor(seconds / 1000);
-        return { time: seconds, open: parseFloat(d.open), high: parseFloat(d.high), low: parseFloat(d.low), close: parseFloat(d.close) };
+        return {
+          time:  seconds,
+          open:  parseFloat(d.open),
+          high:  parseFloat(d.high),
+          low:   parseFloat(d.low),
+          close: parseFloat(d.close),
+        };
       })
-      .filter(d => !isNaN(d.open) && d.open > 0)
+      .filter(d => !isNaN(d.open) && d.open > 0 && !isNaN(d.close) && d.close > 0)
       .sort((a, b) => a.time - b.time)
-      .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i);
+      .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time);
+
+    // TradingView Continuous Candle Smoothing:
+    // Stitches intra-session candle opens to the prior candle's close (when time gap <= 6 hours)
+    // so Yahoo Finance micro-gaps never make candles look like they are "jumping"!
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const curr = sorted[i];
+      if ((curr.time - prev.time) <= 21600) {
+        curr.open = prev.close;
+        if (curr.high < Math.max(curr.open, curr.close)) curr.high = Math.max(curr.open, curr.close);
+        if (curr.low  > Math.min(curr.open, curr.close)) curr.low  = Math.min(curr.open, curr.close);
+      }
+    }
+    return sorted;
   }, []);
 
   useEffect(() => {
@@ -440,6 +464,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     const chart = createChart(chartContainerRef.current, {
       layout:          { background: { type: ColorType.Solid, color: '#161A25' }, textColor: '#D9D9D9' },
       grid:            { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
+      crosshair:       { mode: 0 },
       width:           chartContainerRef.current.clientWidth,
       height:          500,
       timeScale:       { timeVisible: true, secondsVisible: false, rightOffset: 24, barSpacing: 12 },
@@ -510,9 +535,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       });
       const newData = processCandles(res.data);
       if (!newData.length) return;
-      const combined = [...newData, ...allDataRef.current]
-        .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i)
-        .sort((a, b) => a.time - b.time);
+      const combined = processCandles([...newData, ...allDataRef.current]);
       allDataRef.current = combined;
       updateChartData(combined);
     } catch { /* silent */ }
@@ -617,9 +640,16 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       if (tradeSetup.target_2) {
         addLine(tradeSetup.target_2, '#00E676', 'TP2 🚀', 2, 2);
       }
-      addLine(tradeSetup.take_profit, '#00E676', 'TP1 🎯',   0, 2);
-      addLine(tradeSetup.stop_loss,   '#FF1744', 'SL 🛑',    0, 2);
-      addLine(tradeSetup.entry,       '#2962FF', 'ENTRY 🔵', 3, 2);
+      addLine(tradeSetup.take_profit, '#00E676', 'TP1 🎯', 0, 2);
+      const isBE = Boolean(tradeSetup.breakeven_active || tradeSetup.be_triggered);
+      addLine(
+        tradeSetup.stop_loss,
+        isBE ? '#FFD600' : '#FF1744',
+        isBE ? 'SL (BE) 🛡️' : 'SL 🛑',
+        0,
+        2
+      );
+      addLine(tradeSetup.entry, '#2962FF', 'ENTRY 🔵', 3, 2);
     }
   }, [levels, tradeSetup]);
 

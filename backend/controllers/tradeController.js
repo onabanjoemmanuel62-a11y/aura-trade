@@ -17,6 +17,20 @@ const symbolToPairLabel = (symbol) => SYMBOL_LABELS[symbol] || symbol;
 // In-memory backup vault so an active trade's Entry/SL/TP NEVER shifts even if MongoDB hiccups
 const MEMORY_OPEN_TRADES = {};
 
+const getPipBuffer = (symbol = '') => {
+  const s = symbol.toUpperCase();
+  if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 0.20;
+  if (s.includes('JPY')) return 0.01;
+  return 0.0001;
+};
+
+const getDecimals = (symbol = '') => {
+  const s = symbol.toUpperCase();
+  if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 2;
+  if (s.includes('JPY')) return 3;
+  return 5;
+};
+
 /**
  * Converts a raw price difference into standard Forex / Gold Pips:
  * - Gold (GC=F / XAUUSD): $0.10 move = 1 pip (so $10 move = 100 pips)
@@ -41,7 +55,6 @@ const calculatePips = (symbol = '', rawPriceDiff = 0) => {
 // @access  Public
 const getTrades = async (req, res) => {
   try {
-    // 1. Remove old dummy/seed trades that have no Stop Loss or Take Profit (e.g. XAUUSD @ 2030 with — / —)
     await Trade.deleteMany({
       $or: [
         { sl: { $exists: false } },
@@ -51,7 +64,6 @@ const getTrades = async (req, res) => {
       ]
     });
 
-    // 2. Fix any legacy trade where result is WON/LOST but status was left as OPEN
     await Trade.updateMany(
       { result: { $in: ['WON', 'LOST'] }, status: 'OPEN' },
       { $set: { status: 'CLOSED' } }
@@ -129,7 +141,6 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
       status:     'OPEN',
     };
 
-    // Lock in memory immediately so Entry can never shift even if DB write is slow
     MEMORY_OPEN_TRADES[symbol] = tradePayload;
 
     const trade = await Trade.create(tradePayload);
@@ -144,23 +155,16 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
 };
 
 /**
- * Checks all OPEN paper trades on a given symbol against a fresh price tick,
- * closing any whose stop-loss or take-profit was hit and recording the
- * outcome in real Forex/Gold Pips.
+ * Checks all OPEN paper trades on a given symbol against a fresh price tick:
+ * 1. First checks if price has moved 1R (or 50% to TP1) in profit; if so, locks SL to Break-Even (+1 pip buffer).
+ * 2. Then checks if SL or TP was hit and closes the trade with accurate Forex/Gold Pips.
  */
 const evaluateOpenTrades = async (symbol, candle) => {
   try {
     if (!candle || candle.high == null || candle.low == null) return;
 
-    // Also check in-memory lock in case it wasn't persisted
-    const memTrade = MEMORY_OPEN_TRADES[symbol];
-    if (memTrade && memTrade.status === 'OPEN') {
-      if (memTrade.action === 'Buy' && (candle.low <= memTrade.sl || candle.high >= memTrade.tp)) {
-        delete MEMORY_OPEN_TRADES[symbol];
-      } else if (memTrade.action === 'Sell' && (candle.high >= memTrade.sl || candle.low <= memTrade.tp)) {
-        delete MEMORY_OPEN_TRADES[symbol];
-      }
-    }
+    const pipBuf   = getPipBuffer(symbol);
+    const decimals = getDecimals(symbol);
 
     const openTrades = await Trade.find({
       symbol,
@@ -171,38 +175,72 @@ const evaluateOpenTrades = async (symbol, candle) => {
     if (openTrades.length === 0) return;
 
     for (const trade of openTrades) {
-      let hit = null; // 'TP' | 'SL' | null
+      const isBuy     = (trade.action || '').toUpperCase() === 'BUY';
+      const entry     = Number(trade.entry);
+      let currentSL   = Number(trade.sl);
+      const tp1       = Number(trade.tp);
+
+      // Step 1: Adaptive Break-Even Check (1R or 50% of TP1 distance)
+      const initRisk    = Math.abs(entry - currentSL);
+      const tp1Dist     = Math.abs(tp1 - entry);
+      const isAlreadyBE = initRisk <= (pipBuf * 5);
+
+      if (!isAlreadyBE && tp1Dist > 0) {
+        const beTriggerDist = Math.min(initRisk > 0 ? initRisk : tp1Dist * 0.35, tp1Dist * 0.50);
+        if (isBuy && candle.high >= entry + beTriggerDist) {
+          const beSL = Number((entry + pipBuf).toFixed(decimals));
+          if (currentSL < beSL) {
+            currentSL = beSL;
+            trade.sl  = beSL;
+            await trade.save();
+            MEMORY_OPEN_TRADES[symbol] = trade;
+            console.log(`🛡️ BREAK-EVEN LOCKED: BUY ${trade.pair} SL moved to ${beSL}`);
+          }
+        } else if (!isBuy && candle.low <= entry - beTriggerDist) {
+          const beSL = Number((entry - pipBuf).toFixed(decimals));
+          if (currentSL > beSL) {
+            currentSL = beSL;
+            trade.sl  = beSL;
+            await trade.save();
+            MEMORY_OPEN_TRADES[symbol] = trade;
+            console.log(`🛡️ BREAK-EVEN LOCKED: SELL ${trade.pair} SL moved to ${beSL}`);
+          }
+        }
+      }
+
+      // Step 2: Check SL or TP hit
+      let hit = null;
       let exitPrice = null;
 
-      if (trade.action === 'Buy') {
-        if (candle.low <= trade.sl) {
+      if (isBuy) {
+        if (candle.low <= currentSL) {
           hit = 'SL';
-          exitPrice = trade.sl;
-        } else if (candle.high >= trade.tp) {
+          exitPrice = currentSL;
+        } else if (candle.high >= tp1) {
           hit = 'TP';
-          exitPrice = trade.tp;
+          exitPrice = tp1;
         }
       } else {
-        if (candle.high >= trade.sl) {
+        if (candle.high >= currentSL) {
           hit = 'SL';
-          exitPrice = trade.sl;
-        } else if (candle.low <= trade.tp) {
+          exitPrice = currentSL;
+        } else if (candle.low <= tp1) {
           hit = 'TP';
-          exitPrice = trade.tp;
+          exitPrice = tp1;
         }
       }
 
       if (!hit) continue;
 
-      const rawDiff = trade.action === 'Buy'
-        ? exitPrice - trade.entry
-        : trade.entry - exitPrice;
+      const rawDiff = isBuy
+        ? exitPrice - entry
+        : entry - exitPrice;
 
       const profitPips = calculatePips(symbol, rawDiff);
 
       trade.status   = 'CLOSED';
       trade.exit     = exitPrice;
-      trade.result   = hit === 'TP' ? 'WON' : 'LOST';
+      trade.result   = profitPips >= 0 ? 'WON' : 'LOST';
       trade.profit   = profitPips;
       trade.closedAt = new Date();
       await trade.save();
