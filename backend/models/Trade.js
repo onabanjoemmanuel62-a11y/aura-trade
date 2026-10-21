@@ -22,12 +22,12 @@ const tradeSchema = new mongoose.Schema({
     type: Number,
     required: true
   },
-  // Stop-loss / take-profit levels the AI set when the trade was opened.
+  // Stop-loss level (updates automatically to Break-Even at 1R, and to TP1 when TP1 is hit)
   sl: {
     type: Number,
     required: true
   },
-  // Original stop-loss at entry so RR calculation never breaks after SL moves to Break-Even
+  // Original stop-loss at entry so RR calculation never breaks after SL moves to Break-Even / TP1
   initialSl: {
     type: Number
   },
@@ -36,15 +36,25 @@ const tradeSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Target 1 (TP1) level
   tp: {
     type: Number,
     required: true
+  },
+  // Target 2 (TP2 — Final Runner Target) level
+  tp2: {
+    type: Number
+  },
+  // Flag indicating whether TP1 has been banked and the trade is now running toward TP2
+  tp1Hit: {
+    type: Boolean,
+    default: false
   },
   // Confidence score the AI Brain gave this signal at entry (0-99), for reference/analysis.
   confidence: {
     type: Number
   },
-  // OPEN = still live, being monitored against price. CLOSED = resolved (hit SL or TP).
+  // OPEN = still live, being monitored against price. CLOSED = resolved (hit SL or TP2).
   status: {
     type: String,
     enum: ['OPEN', 'CLOSED'],
