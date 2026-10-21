@@ -412,7 +412,7 @@ def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx:
                                   top_val: float, bot_val: float,
                                   current_price: float, atr: float) -> str:
     """
-    EXACT PRE-BREAKOUT CANDLE (`break_idx - 1`) LIFECYCLE EVALUATOR (v10.8):
+    EXACT PRE-BREAKOUT CANDLE (`break_idx - 1`) LIFECYCLE EVALUATOR (v10.9):
     - Checks what happened AFTER the breakout candle (`break_idx`) departed the POI:
       1. First, price must actually move away from the POI (or close beyond it on `break_idx`).
       2. If ANY candle after `break_idx` wicked past the invalidation side of the POI
@@ -422,7 +422,7 @@ def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx:
       3. If price has NOT touched the POI at all since `depart_idx` -> return "UNTOUCHED".
       4. If price pulled back and TAPPED into the POI (`low <= top_val` for Buy, `high >= bot_val` for Sell),
          held the back of the box without violating it, and has NOT yet completed the move past
-         the impulse extreme (`leg_extreme`), then this POI is "TAPPED_ACTIVE"!
+         the impulse extreme (`pre_tap_high` / `pre_tap_low`), then this POI is "TAPPED_ACTIVE"!
     """
     highs = df['High'].values
     lows = df['Low'].values
@@ -434,11 +434,15 @@ def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx:
 
     depart_idx = break_idx
     if is_bullish:
-        if lows[depart_idx] <= top_val and depart_idx + 1 < total - 1 and closes[depart_idx + 1] > top_val:
-            depart_idx = depart_idx + 1
+        while depart_idx + 1 < total - 1 and lows[depart_idx + 1] <= top_val and closes[depart_idx + 1] > top_val:
+            if (highs[depart_idx] - top_val) >= (0.45 * atr):
+                break
+            depart_idx += 1
     else:
-        if highs[depart_idx] >= bot_val and depart_idx + 1 < total - 1 and closes[depart_idx + 1] < bot_val:
-            depart_idx = depart_idx + 1
+        while depart_idx + 1 < total - 1 and highs[depart_idx + 1] >= bot_val and closes[depart_idx + 1] < bot_val:
+            if (bot_val - lows[depart_idx]) >= (0.45 * atr):
+                break
+            depart_idx += 1
 
     if depart_idx >= total - 1:
         return "INVALIDATED"
@@ -460,7 +464,7 @@ def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx:
             return "UNTOUCHED"
 
         pre_tap_high = float(np.max(highs[break_idx : first_tap + 1]))
-        if (pre_tap_high - top_val) < (0.35 * atr) or first_tap == break_idx + 1:
+        if (pre_tap_high - top_val) < (0.30 * atr):
             return "INVALIDATED"
 
         if first_tap + 1 < total:
@@ -487,7 +491,7 @@ def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx:
             return "UNTOUCHED"
 
         pre_tap_low = float(np.min(lows[break_idx : first_tap + 1]))
-        if (bot_val - pre_tap_low) < (0.35 * atr) or first_tap == break_idx + 1:
+        if (bot_val - pre_tap_low) < (0.30 * atr):
             return "INVALIDATED"
 
         if first_tap + 1 < total:
@@ -503,9 +507,11 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
                                  current_price: float, atr: float, decimals: int,
                                  state_key: Optional[str] = None) -> Optional[Dict]:
     """
-    STRICT `break_idx - 1` CANDLE POI ENGINE (v10.8):
-    - For every structure break (`BOS` or `CHoCH`), the POI is strictly the candle
-      IMMEDIATELY BEFORE the breakout candle (`ob_idx = break_idx - 1`)!
+    STRICT FULL-CANDLE `break_idx - 1` POI ENGINE (v10.9):
+    - NO artificial `1.15 * atr` clamping that slices off the top of a Bullish `break_idx - 1`
+      candle (like on GBP/USD at BOS 1.33710) or the bottom of a Bearish `break_idx - 1` candle!
+    - The POI is strictly the FULL High-to-Low range of the candle immediately before the
+      breakout candle (`ob_idx = break_idx - 1`).
     """
     opens = df['Open'].values
     closes = df['Close'].values
@@ -517,7 +523,6 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     if not struct_events:
         return None
 
-    max_candle_span = 1.15 * atr
     min_candle_span = 0.14 * atr
 
     for ev_idx in range(len(struct_events) - 1, -1, -1):
@@ -547,15 +552,8 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
         ob_idx = max(orig_idx, break_idx - 1)
 
         if is_bullish:
-            raw_bot = float(lows[ob_idx])
-            raw_top = float(highs[ob_idx])
-            if (raw_top - raw_bot) > max_candle_span:
-                body_top = float(max(opens[ob_idx], closes[ob_idx]))
-                top_val = min(max(body_top, raw_bot + min_candle_span), raw_bot + max_candle_span)
-                bot_val = raw_bot
-            else:
-                bot_val = raw_bot
-                top_val = max(raw_top, raw_bot + min_candle_span)
+            bot_val = float(lows[ob_idx])
+            top_val = max(float(highs[ob_idx]), bot_val + min_candle_span)
 
             status = evaluate_pre_break_candle_poi(
                 df, True, break_idx, top_val, bot_val, current_price, atr
@@ -578,7 +576,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE BUY POI" if status == "TAPPED_ACTIVE" else "BUY POI"
 
             poi_result = {
-                "engine_ver": "10.8",
+                "engine_ver": "10.9",
                 "is_bullish": True,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -607,15 +605,8 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             return poi_result
 
         else:
-            raw_top = float(highs[ob_idx])
-            raw_bot = float(lows[ob_idx])
-            if (raw_top - raw_bot) > max_candle_span:
-                body_bot = float(min(opens[ob_idx], closes[ob_idx]))
-                bot_val = max(min(body_bot, raw_top - min_candle_span), raw_top - max_candle_span)
-                top_val = raw_top
-            else:
-                top_val = raw_top
-                bot_val = min(raw_bot, raw_top - min_candle_span)
+            top_val = float(highs[ob_idx])
+            bot_val = min(float(lows[ob_idx]), top_val - min_candle_span)
 
             status = evaluate_pre_break_candle_poi(
                 df, False, break_idx, top_val, bot_val, current_price, atr
@@ -638,7 +629,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE SELL POI" if status == "TAPPED_ACTIVE" else "SELL POI"
 
             poi_result = {
-                "engine_ver": "10.8",
+                "engine_ver": "10.9",
                 "is_bullish": False,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -699,7 +690,7 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
             ):
                 subsequent_bounce = float(np.max(highs[j + 1 : min(total, j + 8)])) - float(lows[j])
                 if subsequent_bounce >= (0.45 * atr):
-                    if poi_top + (0.06 * atr) <= lows[j] <= poi_top + (6.5 * atr):
+                    if poi_bot + (0.05 * atr) <= lows[j] <= poi_top + (6.5 * atr):
                         cand_lows.append(j)
 
         if cand_lows:
@@ -739,7 +730,7 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
             ):
                 subsequent_drop = float(highs[j]) - float(np.min(lows[j + 1 : min(total, j + 8)]))
                 if subsequent_drop >= (0.45 * atr):
-                    if poi_bot - (6.5 * atr) <= highs[j] <= poi_bot - (0.06 * atr):
+                    if poi_bot - (6.5 * atr) <= highs[j] <= poi_top - (0.05 * atr):
                         cand_highs.append(j)
 
         if cand_highs:
@@ -1319,7 +1310,13 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                         continue
 
                     entry_k = round(c_close, decimals)
-                    floor_k = min(active_ob["bottom"], c_low, p_low)
+                    swing_floor = min(c_low, p_low)
+                    ob_span = active_ob["top"] - active_ob["bottom"]
+                    if ob_span > (1.20 * atr):
+                        floor_k = max(active_ob["bottom"], swing_floor - 0.10 * atr)
+                    else:
+                        floor_k = min(active_ob["bottom"], swing_floor)
+
                     init_sl_k = round(min(floor_k - 0.22 * atr, entry_k - 0.35 * atr), decimals)
                     risk_k = max(abs(entry_k - init_sl_k), 1e-6)
 
@@ -1337,7 +1334,6 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     be_active_k = False
                     trade_closed = False
 
-                    # Walk forward bar-by-bar from `k + 1` to live candle to check SL, TP1, and Break-Even progression
                     sim_highs = list(highs[k + 1:]) + [max(float(full_df['High'].iloc[-1]), current_price)]
                     sim_lows = list(lows[k + 1:]) + [min(float(full_df['Low'].iloc[-1]), current_price)]
 
@@ -1390,7 +1386,13 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                         continue
 
                     entry_k = round(c_close, decimals)
-                    ceil_k = max(active_ob["top"], c_high, p_high)
+                    swing_ceil = max(c_high, p_high)
+                    ob_span = active_ob["top"] - active_ob["bottom"]
+                    if ob_span > (1.20 * atr):
+                        ceil_k = min(active_ob["top"], swing_ceil + 0.10 * atr)
+                    else:
+                        ceil_k = max(active_ob["top"], swing_ceil)
+
                     init_sl_k = round(max(ceil_k + 0.22 * atr, entry_k + 0.35 * atr), decimals)
                     risk_k = max(abs(init_sl_k - entry_k), 1e-6)
 
@@ -1552,7 +1554,9 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
     if is_bullish:
         in_zone_now = (poi_status == "TAPPED_ACTIVE")
-        planned_sl = round(min(active_ob["bottom"], poi_level) - (0.22 * atr), decimals)
+        ob_span = active_ob["top"] - active_ob["bottom"]
+        eff_floor = (active_ob["top"] - 0.85 * atr) if ob_span > (1.20 * atr) else active_ob["bottom"]
+        planned_sl = round(min(eff_floor, poi_level) - (0.22 * atr), decimals)
         risk = max(abs(poi_level - planned_sl), 1e-6)
         best_rr = round(max(abs(t1_level - poi_level), abs(t2_level - poi_level)) / risk, 2) if (t1_level and t2_level) else 2.5
 
@@ -1604,7 +1608,9 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
     else:
         in_zone_now = (poi_status == "TAPPED_ACTIVE")
-        planned_sl = round(max(active_ob["top"], poi_level) + (0.22 * atr), decimals)
+        ob_span = active_ob["top"] - active_ob["bottom"]
+        eff_ceil = (active_ob["bottom"] + 0.85 * atr) if ob_span > (1.20 * atr) else active_ob["top"]
+        planned_sl = round(max(eff_ceil, poi_level) + (0.22 * atr), decimals)
         risk = max(abs(planned_sl - poi_level), 1e-6)
         best_rr = round(max(abs(poi_level - t1_level), abs(poi_level - t2_level)) / risk, 2) if (t1_level and t2_level) else 2.5
 
@@ -1784,7 +1790,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v10.8 — Exact Pre-Breakout Candle (break_idx - 1) POI + 1R Break-Even Engine",
+            "✅ ENGINE VERSION": "AuraBrain v10.9 — Full High-to-Low Pre-Breakout Candle (break_idx - 1) POI + 1R Break-Even Engine",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],
