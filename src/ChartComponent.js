@@ -427,36 +427,16 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
 
   const processCandles = useCallback((rawData) => {
     if (!Array.isArray(rawData)) return [];
-    const sorted = rawData
+    return rawData
       .filter(d => d.open != null && d.close != null && d.time != null)
       .map(d => {
         let seconds = Number(d.time);
         if (seconds > 2_000_000_000) seconds = Math.floor(seconds / 1000);
-        return {
-          time:  seconds,
-          open:  parseFloat(d.open),
-          high:  parseFloat(d.high),
-          low:   parseFloat(d.low),
-          close: parseFloat(d.close),
-        };
+        return { time: seconds, open: parseFloat(d.open), high: parseFloat(d.high), low: parseFloat(d.low), close: parseFloat(d.close) };
       })
-      .filter(d => !isNaN(d.open) && d.open > 0 && !isNaN(d.close) && d.close > 0)
+      .filter(d => !isNaN(d.open) && d.open > 0)
       .sort((a, b) => a.time - b.time)
-      .filter((v, i, a) => i === 0 || v.time !== a[i - 1].time);
-
-    // TradingView Continuous Candle Smoothing:
-    // Stitches intra-session candle opens to the prior candle's close (when time gap <= 6 hours)
-    // so Yahoo Finance micro-gaps never make candles look like they are "jumping"!
-    for (let i = 1; i < sorted.length; i++) {
-      const prev = sorted[i - 1];
-      const curr = sorted[i];
-      if ((curr.time - prev.time) <= 21600) {
-        curr.open = prev.close;
-        if (curr.high < Math.max(curr.open, curr.close)) curr.high = Math.max(curr.open, curr.close);
-        if (curr.low  > Math.min(curr.open, curr.close)) curr.low  = Math.min(curr.open, curr.close);
-      }
-    }
-    return sorted;
+      .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i);
   }, []);
 
   useEffect(() => {
@@ -535,7 +515,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       });
       const newData = processCandles(res.data);
       if (!newData.length) return;
-      const combined = processCandles([...newData, ...allDataRef.current]);
+      const combined = [...newData, ...allDataRef.current]
+        .filter((v, i, a) => a.findIndex(t => t.time === v.time) === i)
+        .sort((a, b) => a.time - b.time);
       allDataRef.current = combined;
       updateChartData(combined);
     } catch { /* silent */ }
@@ -637,11 +619,8 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     };
 
     if (tradeSetup) {
-      if (tradeSetup.target_2) {
-        addLine(tradeSetup.target_2, '#00E676', 'TP2 🚀', 2, 2);
-      }
-      addLine(tradeSetup.take_profit, '#00E676', 'TP1 🎯', 0, 2);
-      const isBE = Boolean(tradeSetup.breakeven_active || tradeSetup.be_triggered);
+      addLine(tradeSetup.take_profit, '#00E676', 'TP 🎯', 0, 2);
+      const isBE = Boolean(tradeSetup.breakeven_active);
       addLine(
         tradeSetup.stop_loss,
         isBE ? '#FFD600' : '#FF1744',

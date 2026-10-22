@@ -145,7 +145,7 @@ exports.analyzePattern = async (req, res) => {
             const aiResult = pythonResponse.data;
 
             // Purge any stale legacy OPEN trade with missing SL/TP or opposite cycle direction
-            // (Safe for Break-Even and TP1-trailed trades!)
+            // (Safe for Break-Even trades where sl is near entry!)
             const existingOpen = await Trade.findOne({ symbol: targetSymbol, status: 'OPEN' });
             if (existingOpen) {
                 if (existingOpen.sl == null || existingOpen.tp == null) {
@@ -153,10 +153,9 @@ exports.analyzePattern = async (req, res) => {
                 } else {
                     const pipBuf      = getPipBuffer(targetSymbol);
                     const baseSL      = Number(existingOpen.initialSl || existingOpen.sl);
-                    const isAlreadyBE = Boolean(existingOpen.beTriggered || existingOpen.tp1Hit) || Math.abs(existingOpen.entry - existingOpen.sl) <= (pipBuf * 5);
+                    const isAlreadyBE = Boolean(existingOpen.beTriggered) || Math.abs(existingOpen.entry - existingOpen.sl) <= (pipBuf * 5);
                     const risk        = Math.max(Math.abs(existingOpen.entry - baseSL), 1e-6);
-                    const maxTarget   = Number(existingOpen.tp2 || existingOpen.tp);
-                    const rr          = Math.max(Math.abs(existingOpen.tp - existingOpen.entry), Math.abs(maxTarget - existingOpen.entry)) / risk;
+                    const rr          = Math.abs(existingOpen.tp - existingOpen.entry) / risk;
                     const cycleIsBull = (aiResult.trend || '').toUpperCase().includes('BULLISH');
                     const tradeIsBuy  = (existingOpen.action || '').toUpperCase() === 'BUY';
 
@@ -168,54 +167,32 @@ exports.analyzePattern = async (req, res) => {
 
             const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
 
-            // If an OPEN trade is active on this symbol, lock its exact Entry, SL (or BE/TP1-trailed SL), TP1, and TP2!
+            // If an OPEN trade is active on this symbol, lock its exact Entry, SL (or BE SL), and Single TP!
             if (activeTrade && activeTrade.status === 'OPEN') {
                 const decimals    = getDecimals(targetSymbol);
                 const pipBuf      = getPipBuffer(targetSymbol);
                 const lockedEntry = Number(activeTrade.entry);
                 let lockedSL      = Number(activeTrade.sl);
                 const initSL      = Number(activeTrade.initialSl || aiResult.tradeSetup?.initial_sl || lockedSL);
-                const lockedTP1   = Number(activeTrade.tp);
-                const rawTP2      = Number(activeTrade.tp2 || aiResult.tradeSetup?.target_2 || aiResult.keyLevels?.target2 || lockedTP1);
+                const lockedTP    = Number(activeTrade.tp);
                 const isBuy       = (activeTrade.action || '').toUpperCase() === 'BUY';
-                const lockedTP2   = isBuy ? Math.max(lockedTP1, rawTP2) : Math.min(lockedTP1, rawTP2);
 
                 const pyBE        = Boolean(aiResult.tradeSetup?.breakeven_active);
-                const pyTP1Hit    = Boolean(aiResult.tradeSetup?.tp1_hit);
                 const initRisk    = Math.abs(lockedEntry - initSL);
-                const tp1Dist     = Math.abs(lockedTP1 - lockedEntry);
-                const beThreshold = Math.min(initRisk > pipBuf * 3 ? initRisk : tp1Dist * 0.35, tp1Dist * 0.50);
+                const tpDist      = Math.abs(lockedTP - lockedEntry);
+                const beThreshold = Math.min(initRisk > pipBuf * 3 ? initRisk : tpDist * 0.40, tpDist * 0.50);
 
-                let isTP1Hit   = Boolean(activeTrade.tp1Hit) || pyTP1Hit;
-                let isBEActive = Boolean(activeTrade.beTriggered) || pyBE || isTP1Hit || (Math.abs(lockedEntry - lockedSL) <= pipBuf * 5);
+                let isBEActive = Boolean(activeTrade.beTriggered) || pyBE || (Math.abs(lockedEntry - lockedSL) <= pipBuf * 5);
 
-                if (!isTP1Hit && ((isBuy && currentPrice >= lockedTP1) || (!isBuy && currentPrice <= lockedTP1))) {
-                    isTP1Hit   = true;
-                    isBEActive = true;
-                } else if (!isBEActive && beThreshold > 0) {
+                if (!isBEActive && beThreshold > 0) {
                     if ((isBuy && (currentPrice - lockedEntry) >= beThreshold) || (!isBuy && (lockedEntry - currentPrice) >= beThreshold)) {
                         isBEActive = true;
                     }
                 }
 
-                let dbUpdated = false;
-                if (isTP1Hit) {
-                    const trailSL = Number((isBuy
-                        ? lockedEntry + Math.max(pipBuf * 2, tp1Dist * 0.50)
-                        : lockedEntry - Math.max(pipBuf * 2, tp1Dist * 0.50)
-                    ).toFixed(decimals));
-                    if ((isBuy && lockedSL < trailSL) || (!isBuy && lockedSL > trailSL)) {
-                        lockedSL = trailSL;
-                        activeTrade.sl = trailSL;
-                        dbUpdated = true;
-                    }
-                    if (!activeTrade.tp1Hit) {
-                        activeTrade.tp1Hit      = true;
-                        activeTrade.beTriggered = true;
-                        dbUpdated = true;
-                    }
-                } else if (isBEActive) {
+                if (isBEActive) {
                     const beSL = Number((isBuy ? lockedEntry + pipBuf : lockedEntry - pipBuf).toFixed(decimals));
+                    let dbUpdated = false;
                     if ((isBuy && lockedSL < beSL) || (!isBuy && lockedSL > beSL)) {
                         lockedSL = beSL;
                         activeTrade.sl = beSL;
@@ -225,21 +202,15 @@ exports.analyzePattern = async (req, res) => {
                         activeTrade.beTriggered = true;
                         dbUpdated = true;
                     }
+                    if (dbUpdated && typeof activeTrade.save === 'function') {
+                        await activeTrade.save();
+                    }
                 }
 
-                if (dbUpdated && typeof activeTrade.save === 'function') {
-                    await activeTrade.save();
-                }
-
-                const effRisk = initRisk > pipBuf * 3 ? initRisk : Math.max(tp1Dist / 2.0, 1e-6);
-                const rr      = aiResult.tradeSetup?.risk_reward || parseFloat((Math.max(Math.abs(lockedTP1 - lockedEntry), Math.abs(lockedTP2 - lockedEntry)) / effRisk).toFixed(2));
+                const effRisk = initRisk > pipBuf * 3 ? initRisk : Math.max(tpDist / 2.0, 1e-6);
+                const rr      = aiResult.tradeSetup?.risk_reward || parseFloat((Math.abs(lockedTP - lockedEntry) / effRisk).toFixed(2));
                 const dir     = isBuy ? 'BUY' : 'SELL';
-                const slTag   = isTP1Hit
-                    ? `SL (Trailed 🛡️): ${lockedSL}`
-                    : isBEActive
-                    ? `SL (BE 🛡️): ${lockedSL}`
-                    : `SL: ${lockedSL}`;
-                const tp1Tag  = isTP1Hit ? `TP1: ${lockedTP1} (HIT ✅)` : `Target 1: ${lockedTP1}`;
+                const slTag   = isBEActive ? `SL (BE 🛡️): ${lockedSL}` : `SL: ${lockedSL}`;
 
                 aiResult.signal     = dir;
                 aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 84);
@@ -247,31 +218,29 @@ exports.analyzePattern = async (req, res) => {
                     entry:            lockedEntry,
                     stop_loss:        lockedSL,
                     initial_sl:       initSL,
-                    take_profit:      lockedTP1,
-                    target_1:         lockedTP1,
-                    target_2:         lockedTP2,
+                    take_profit:      lockedTP,
+                    target_1:         lockedTP,
+                    target_2:         null,
                     risk_reward:      rr,
-                    breakeven_active: isBEActive,
-                    tp1_hit:          isTP1Hit
+                    breakeven_active: isBEActive
                 };
 
                 if (aiResult.keyLevels) {
-                    aiResult.keyLevels.target1 = lockedTP1;
-                    aiResult.keyLevels.target2 = lockedTP2;
+                    aiResult.keyLevels.target1 = lockedTP;
+                    aiResult.keyLevels.target2 = null;
                 }
 
                 aiResult.executionPlan = {
                     ...(aiResult.executionPlan || {}),
                     stage:             'TRADE_ACTIVE',
-                    trigger_condition: `${isBuy ? '🟢 BUY' : '🔴 SELL'} EXECUTING: Locked Entry @ ${lockedEntry} | ${tp1Tag} | Target 2: ${lockedTP2} | ${slTag}`,
+                    trigger_condition: `${isBuy ? '🟢 BUY' : '🔴 SELL'} EXECUTING: Locked Entry @ ${lockedEntry} | TP: ${lockedTP} | ${slTag}`,
                     planned_entry:     lockedEntry,
                     planned_sl:        lockedSL,
                     initial_sl:        initSL,
-                    planned_tp1:       lockedTP1,
-                    planned_tp2:       lockedTP2,
+                    planned_tp1:       lockedTP,
+                    planned_tp2:       null,
                     risk_reward:       rr,
-                    breakeven_active:  isBEActive,
-                    tp1_hit:           isTP1Hit
+                    breakeven_active:  isBEActive
                 };
 
                 if (Array.isArray(aiResult.checklist) && aiResult.checklist.length >= 4) {
@@ -280,17 +249,14 @@ exports.analyzePattern = async (req, res) => {
                     aiResult.checklist[2].done   = true;
                     aiResult.checklist[2].detail = 'Confirmed ✅';
                     aiResult.checklist[3].done   = true;
-                    aiResult.checklist[3].detail = isTP1Hit
-                        ? `TP1 Hit ✅ -> Running to TP2`
-                        : isBEActive
-                        ? `1:${rr} (SL @ BE 🛡️)`
-                        : `1:${rr}`;
+                    aiResult.checklist[3].detail = isBEActive ? `1:${rr} (SL @ BE 🛡️)` : `1:${rr}`;
                 }
 
                 if (aiResult.visuals && Array.isArray(aiResult.visuals.projection_path) && aiResult.visuals.projection_path.length >= 3) {
+                    const midPrice = Number(((currentPrice + lockedTP) / 2.0).toFixed(decimals));
                     aiResult.visuals.projection_path[0].price = currentPrice;
-                    aiResult.visuals.projection_path[1].price = isTP1Hit ? currentPrice : lockedTP1;
-                    aiResult.visuals.projection_path[2].price = lockedTP2;
+                    aiResult.visuals.projection_path[1].price = midPrice;
+                    aiResult.visuals.projection_path[2].price = lockedTP;
                 }
             }
 
