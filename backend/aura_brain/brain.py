@@ -1,7 +1,7 @@
 import os
 import math
 import logging
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 from contextlib import asynccontextmanager
 import pandas as pd
 import numpy as np
@@ -33,6 +33,7 @@ CYCLE_STATE: Dict[str, Dict] = {}
 POI_STATE: Dict[str, Dict] = {}
 ORDER_CACHE: Dict[str, int] = {}
 ACTIVE_TRADES: Dict[str, Dict] = {}
+CLOSED_SIGNALS: Dict[str, Set[int]] = {}
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -556,7 +557,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE BUY POI" if status == "TAPPED_ACTIVE" else "BUY POI"
 
             poi_result = {
-                "engine_ver": "11.1",
+                "engine_ver": "11.2",
                 "is_bullish": True,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -609,7 +610,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE SELL POI" if status == "TAPPED_ACTIVE" else "SELL POI"
 
             poi_result = {
-                "engine_ver": "11.1",
+                "engine_ver": "11.2",
                 "is_bullish": False,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -749,8 +750,9 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
                             is_bullish: bool, poi_ref: float, current_price: float,
                             anchor_idx: int, atr: float, decimals: int) -> List[Dict]:
     """
-    SINGLE STRUCTURAL TARGET ENGINE (v11.1):
-    - Returns exactly ONE clean opposing structural liquidity target (`Target (price)`).
+    SINGLE SENSIBLE STRUCTURAL TARGET ENGINE (v11.2):
+    - Targets the actual opposing swing high/low of the impulse leg (with a clean 1.25 * ATR floor
+      and a realistic 4.2 * ATR cap so targets never project wildly into empty space).
     """
     highs = df['High'].values
     lows = df['Low'].values
@@ -764,10 +766,12 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
     anchor_time = int(dates[anchor_idx])
 
     min_dist_from_poi = 1.25 * atr
+    max_sensible_dist = 4.20 * atr
 
     if is_bullish:
         leg_high = float(max(highs[anchor_idx:].max(), current_price))
         min_t1_floor = max(poi_ref + min_dist_from_poi, leg_high)
+        max_t1_cap = max(leg_high + 0.35 * atr, poi_ref + max_sensible_dist)
 
         candidate_indices = set(int(i) for i in raw_highs if 0 <= int(i) < total)
         if anchor_idx < total:
@@ -787,7 +791,8 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
             if idx < total - 1 and np.max(highs[idx + 1:]) > lvl + (0.25 * atr):
                 continue
             t_start = int(dates[idx]) if idx < total - 8 else anchor_time
-            valid_candidates.append((max(lvl, min_t1_floor), t_start))
+            clamped_lvl = min(max(lvl, min_t1_floor), max_t1_cap)
+            valid_candidates.append((clamped_lvl, t_start))
 
         valid_candidates.sort(key=lambda x: x[0])
 
@@ -802,7 +807,7 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
                 "label": f"Target ({lvl_r:.{decimals}f})",
             }]
 
-        proj_lvl = round(min_t1_floor, decimals)
+        proj_lvl = round(min(min_t1_floor, max_t1_cap), decimals)
         return [{
             "target_num": 1,
             "level": proj_lvl,
@@ -814,6 +819,7 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
     else:
         leg_low = float(min(lows[anchor_idx:].min(), current_price))
         max_t1_ceil = min(poi_ref - min_dist_from_poi, leg_low)
+        min_t1_cap = min(leg_low - 0.35 * atr, poi_ref - max_sensible_dist)
 
         candidate_indices = set(int(i) for i in raw_lows if 0 <= int(i) < total)
         if anchor_idx < total:
@@ -833,7 +839,8 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
             if idx < total - 1 and np.min(lows[idx + 1:]) < lvl - (0.25 * atr):
                 continue
             t_start = int(dates[idx]) if idx < total - 8 else anchor_time
-            valid_candidates.append((min(lvl, max_t1_ceil), t_start))
+            clamped_lvl = max(min(lvl, max_t1_ceil), min_t1_cap)
+            valid_candidates.append((clamped_lvl, t_start))
 
         valid_candidates.sort(key=lambda x: x[0], reverse=True)
 
@@ -848,7 +855,7 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
                 "label": f"Target ({lvl_r:.{decimals}f})",
             }]
 
-        proj_lvl = round(max_t1_ceil, decimals)
+        proj_lvl = round(max(max_t1_ceil, min_t1_cap), decimals)
         return [{
             "target_num": 1,
             "level": proj_lvl,
@@ -1213,9 +1220,12 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     dir_word = "BULLISH (BUY BIAS)" if is_bullish else "BEARISH (SELL BIAS)"
     peak_word = "Peak Low (W)" if is_bullish else "Peak High (M)"
     arrow = "▲" if is_bullish else "▼"
-    be_buffer = round(max(pip_size, 0.02 * atr), decimals)
+    min_be_buf = round(max(pip_size * 2.0, 0.04 * atr), decimals)
 
-    # 1. Manage existing locked trade in memory (1R / 50% TP Break-Even + Single TP Close)
+    if state_key and state_key not in CLOSED_SIGNALS:
+        CLOSED_SIGNALS[state_key] = set()
+
+    # 1. Manage existing locked trade in memory (65% TP / 1.25R Break-Even + Single TP Close)
     if state_key and state_key in ACTIVE_TRADES:
         lt = ACTIVE_TRADES[state_key]
         live_high = max(float(full_df['High'].iloc[-1]), current_price)
@@ -1224,14 +1234,15 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         init_sl = lt.get("initial_sl", lt["stop_loss"])
         init_risk = max(abs(lt["entry"] - init_sl), 1e-6)
         tp_dist = abs(lt["target_1"] - lt["entry"])
-        be_trigger_dist = min(init_risk, 0.50 * tp_dist)
+        be_trigger_dist = max(init_risk * 1.25, 0.65 * tp_dist)
+        be_cushion = round(max(min_be_buf, 0.25 * init_risk), decimals)
 
         if not lt.get("breakeven_active", False):
             if lt["is_bullish"] and (live_high - lt["entry"]) >= be_trigger_dist:
-                lt["stop_loss"] = round(lt["entry"] + be_buffer, decimals)
+                lt["stop_loss"] = round(lt["entry"] + be_cushion, decimals)
                 lt["breakeven_active"] = True
             elif (not lt["is_bullish"]) and (lt["entry"] - live_low) >= be_trigger_dist:
-                lt["stop_loss"] = round(lt["entry"] - be_buffer, decimals)
+                lt["stop_loss"] = round(lt["entry"] - be_cushion, decimals)
                 lt["breakeven_active"] = True
 
         closed_out = False
@@ -1243,6 +1254,8 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             closed_out = True
 
         if closed_out:
+            if lt.get("signal_time"):
+                CLOSED_SIGNALS[state_key].add(int(lt["signal_time"]))
             del ACTIVE_TRADES[state_key]
             if state_key in POI_STATE:
                 del POI_STATE[state_key]
@@ -1256,6 +1269,10 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         if total > depart_idx + 2:
             search_start = max(depart_idx + 2, total - 35)
             for k in range(search_start, total):
+                sig_ts = int(dates[k])
+                if state_key and sig_ts in CLOSED_SIGNALS.get(state_key, set()):
+                    continue
+
                 c_open = float(opens[k])
                 c_close = float(closes[k])
                 c_high = float(highs[k])
@@ -1295,11 +1312,13 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     if not t_list:
                         continue
                     tp_k = t_list[0]["level"]
-                    rr_k = round(abs(tp_k - entry_k) / risk_k, 2)
+                    tp_dist_k = abs(tp_k - entry_k)
+                    rr_k = round(tp_dist_k / risk_k, 2)
                     if rr_k < MIN_ALLOWED_RR:
                         continue
 
-                    be_trigger_k = min(risk_k, 0.50 * abs(tp_k - entry_k))
+                    be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
+                    be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
                     curr_sl_k = init_sl_k
                     be_active_k = False
                     trade_closed = False
@@ -1312,10 +1331,12 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                             trade_closed = True
                             break
                         if (not be_active_k) and (float(s_hi) - entry_k) >= be_trigger_k:
-                            curr_sl_k = round(entry_k + be_buffer, decimals)
+                            curr_sl_k = round(entry_k + be_cushion_k, decimals)
                             be_active_k = True
 
                     if trade_closed:
+                        if state_key:
+                            CLOSED_SIGNALS[state_key].add(sig_ts)
                         continue
 
                     poi_snap = dict(poi_info)
@@ -1326,7 +1347,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                         "is_bullish": True,
                         "signal": "BUY",
                         "signal_idx": k,
-                        "signal_time": int(dates[k]),
+                        "signal_time": sig_ts,
                         "entry": entry_k,
                         "initial_sl": init_sl_k,
                         "stop_loss": curr_sl_k,
@@ -1369,11 +1390,13 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                     if not t_list:
                         continue
                     tp_k = t_list[0]["level"]
-                    rr_k = round(abs(entry_k - tp_k) / risk_k, 2)
+                    tp_dist_k = abs(entry_k - tp_k)
+                    rr_k = round(tp_dist_k / risk_k, 2)
                     if rr_k < MIN_ALLOWED_RR:
                         continue
 
-                    be_trigger_k = min(risk_k, 0.50 * abs(entry_k - tp_k))
+                    be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
+                    be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
                     curr_sl_k = init_sl_k
                     be_active_k = False
                     trade_closed = False
@@ -1386,10 +1409,12 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                             trade_closed = True
                             break
                         if (not be_active_k) and (entry_k - float(s_lo)) >= be_trigger_k:
-                            curr_sl_k = round(entry_k - be_buffer, decimals)
+                            curr_sl_k = round(entry_k - be_cushion_k, decimals)
                             be_active_k = True
 
                     if trade_closed:
+                        if state_key:
+                            CLOSED_SIGNALS[state_key].add(sig_ts)
                         continue
 
                     poi_snap = dict(poi_info)
@@ -1400,7 +1425,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
                         "is_bullish": False,
                         "signal": "SELL",
                         "signal_idx": k,
-                        "signal_time": int(dates[k]),
+                        "signal_time": sig_ts,
                         "entry": entry_k,
                         "initial_sl": init_sl_k,
                         "stop_loss": curr_sl_k,
@@ -1753,7 +1778,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v11.1 — Single Target (TP) + Full Pre-Breakout Candle POI + 1R Break-Even Engine",
+            "✅ ENGINE VERSION": "AuraBrain v11.2 — Single Sensible Target (TP) + Anti-Duplicate Closed Signal Guard + 65% TP Break-Even Engine",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],
@@ -1762,6 +1787,7 @@ async def debug_analysis(req: AnalysisRequest):
             "💧 LIQUIDITY": ms.get('liq_data'),
             "🎯 TARGETS": ms.get('targets', []),
             "🔒 ACTIVE TRADES": ACTIVE_TRADES,
+            "🚫 CLOSED SIGNALS": {k: list(v) for k, v in CLOSED_SIGNALS.items()},
         }
     except Exception as e:
         import traceback

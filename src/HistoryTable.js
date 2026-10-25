@@ -77,14 +77,25 @@ const HistoryTable = () => {
     return 0;
   });
 
-  // Accurate Stats Summary
+  // Accurate Stats Summary (with Pips Won, Pips Lost, and Net Pips)
   const openTrades   = trades.filter(t => isTradeOpen(t));
   const closedTrades = trades.filter(t => !isTradeOpen(t));
   const wins         = closedTrades.filter(t => (t.result || '').toUpperCase() === 'WON').length;
   const losses       = closedTrades.filter(t => (t.result || '').toUpperCase() === 'LOST').length;
   const winRate      = closedTrades.length > 0 ? Math.round((wins / closedTrades.length) * 100) : 0;
-  const totalPips    = closedTrades.reduce((sum, t) => sum + normalizePips(t), 0);
-  const bestTrade    = closedTrades.length > 0 ? Math.max(0, ...closedTrades.map(t => normalizePips(t))) : 0;
+
+  const pipsWon = closedTrades.reduce((sum, t) => {
+    const p = normalizePips(t);
+    return p > 0 ? sum + p : sum;
+  }, 0);
+
+  const pipsLost = closedTrades.reduce((sum, t) => {
+    const p = normalizePips(t);
+    return p < 0 ? sum + Math.abs(p) : sum;
+  }, 0);
+
+  const netPips   = pipsWon - pipsLost;
+  const bestTrade = closedTrades.length > 0 ? Math.max(0, ...closedTrades.map(t => normalizePips(t))) : 0;
 
   const SortIcon = ({ col }) => {
     if (sortKey !== col) return <span style={{ color: '#3d4d5e', marginLeft: 4 }}>↕</span>;
@@ -100,22 +111,26 @@ const HistoryTable = () => {
     transition: 'all 0.15s',
   });
 
+  const summaryStats = [
+    { label: 'SIGNALS',     value: trades.length,     color: '#9ca3af' },
+    { label: 'ACTIVE',      value: openTrades.length, color: '#2962FF' },
+    { label: 'WINS / LOSS', value: `${wins}W / ${losses}L`, color: '#00e676' },
+    { label: 'WIN RATE',    value: closedTrades.length > 0 ? `${winRate}%` : '—', color: winRate >= 60 ? '#00e676' : winRate >= 45 ? '#f0b429' : '#9ca3af' },
+    { label: 'PIPS WON',    value: `+${pipsWon.toFixed(1)}p`, color: '#00e676' },
+    { label: 'PIPS LOST',   value: `-${pipsLost.toFixed(1)}p`, color: '#ff4757' },
+    { label: 'NET PIPS',    value: `${netPips >= 0 ? '+' : ''}${netPips.toFixed(1)}p`, color: netPips >= 0 ? '#00e676' : '#ff4757' },
+    { label: 'BEST TRADE',  value: `+${bestTrade.toFixed(1)}p`, color: '#f0b429' },
+  ];
+
   return (
     <div style={{ background: '#0d1117', borderRadius: 10, border: '1px solid rgba(255,255,255,0.07)', overflow: 'hidden', fontFamily: "'Syne', sans-serif" }}>
 
       {/* Stats summary bar */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-        {[
-          { label: 'SIGNALS',     value: trades.length,     color: '#9ca3af' },
-          { label: 'ACTIVE',      value: openTrades.length, color: '#2962FF' },
-          { label: 'WINS / LOSS', value: `${wins}W / ${losses}L`, color: '#00e676' },
-          { label: 'WIN RATE',    value: closedTrades.length > 0 ? `${winRate}%` : '—', color: winRate >= 60 ? '#00e676' : winRate >= 45 ? '#f0b429' : '#9ca3af' },
-          { label: 'TOTAL PIPS',  value: `${totalPips > 0 ? '+' : ''}${totalPips.toFixed(1)}`, color: totalPips >= 0 ? '#00e676' : '#ff4757' },
-          { label: 'BEST TRADE',  value: `+${bestTrade.toFixed(1)}p`, color: '#f0b429' },
-        ].map((stat, i) => (
-          <div key={i} style={{ padding: '10px 14px', borderRight: i < 5 ? '1px solid rgba(255,255,255,0.05)' : 'none', textAlign: 'center' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
+        {summaryStats.map((stat, i) => (
+          <div key={i} style={{ padding: '10px 12px', borderRight: i < summaryStats.length - 1 ? '1px solid rgba(255,255,255,0.05)' : 'none', textAlign: 'center' }}>
             <div style={{ fontSize: 9, color: '#3d4d5e', fontFamily: "'Space Mono', monospace", letterSpacing: 1, marginBottom: 4 }}>{stat.label}</div>
-            <div style={{ fontSize: 15, fontWeight: 700, color: stat.color, fontFamily: "'Space Mono', monospace" }}>{stat.value}</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: stat.color, fontFamily: "'Space Mono', monospace" }}>{stat.value}</div>
           </div>
         ))}
       </div>
@@ -174,11 +189,12 @@ const HistoryTable = () => {
                 const isWin  = !isOpen && (trade.result || '').toUpperCase() === 'WON';
                 const isBuy  = (trade.action || '').toUpperCase() === 'BUY';
                 const pips   = normalizePips(trade);
+                const isBE   = !isOpen && isWin && pips > 0 && pips <= 2.5;
 
-                const badgeBg     = isOpen ? 'rgba(41,98,255,0.15)' : isWin ? 'rgba(0,230,118,0.1)' : 'rgba(255,71,87,0.1)';
-                const badgeColor  = isOpen ? '#82b1ff'              : isWin ? '#00e676'            : '#ff4757';
-                const badgeBorder = isOpen ? 'rgba(41,98,255,0.4)'  : isWin ? 'rgba(0,230,118,0.2)': 'rgba(255,71,87,0.2)';
-                const badgeText   = isOpen ? 'ACTIVE 🟢'            : (trade.result || 'CLOSED');
+                const badgeBg     = isOpen ? 'rgba(41,98,255,0.15)' : isBE ? 'rgba(240,180,41,0.12)' : isWin ? 'rgba(0,230,118,0.1)' : 'rgba(255,71,87,0.1)';
+                const badgeColor  = isOpen ? '#82b1ff'              : isBE ? '#f0b429'               : isWin ? '#00e676'            : '#ff4757';
+                const badgeBorder = isOpen ? 'rgba(41,98,255,0.4)'  : isBE ? 'rgba(240,180,41,0.35)' : isWin ? 'rgba(0,230,118,0.2)': 'rgba(255,71,87,0.2)';
+                const badgeText   = isOpen ? 'ACTIVE 🟢'            : isBE ? 'WON (BE 🛡️)'           : (trade.result || 'CLOSED');
 
                 return (
                   <tr key={i} style={{ borderBottom: '1px solid rgba(255,255,255,0.04)', transition: 'background 0.1s' }}

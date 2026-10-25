@@ -144,16 +144,14 @@ exports.analyzePattern = async (req, res) => {
 
             const aiResult = pythonResponse.data;
 
-            // Purge any stale legacy OPEN trade with missing SL/TP or opposite cycle direction
-            // (Safe for Break-Even trades where sl is near entry!)
+            // 1. Purge any invalid legacy OPEN trade (missing SL/TP or opposite cycle direction)
             const existingOpen = await Trade.findOne({ symbol: targetSymbol, status: 'OPEN' });
             if (existingOpen) {
                 if (existingOpen.sl == null || existingOpen.tp == null) {
                     await Trade.deleteOne({ _id: existingOpen._id });
                 } else {
-                    const pipBuf      = getPipBuffer(targetSymbol);
                     const baseSL      = Number(existingOpen.initialSl || existingOpen.sl);
-                    const isAlreadyBE = Boolean(existingOpen.beTriggered) || Math.abs(existingOpen.entry - existingOpen.sl) <= (pipBuf * 5);
+                    const isAlreadyBE = Boolean(existingOpen.beTriggered);
                     const risk        = Math.max(Math.abs(existingOpen.entry - baseSL), 1e-6);
                     const rr          = Math.abs(existingOpen.tp - existingOpen.entry) / risk;
                     const cycleIsBull = (aiResult.trend || '').toUpperCase().includes('BULLISH');
@@ -165,52 +163,43 @@ exports.analyzePattern = async (req, res) => {
                 }
             }
 
+            // 2. Open paper trade (or retrieve existing OPEN trade; returns null if already taken & closed!)
             const activeTrade = await openPaperTradeIfEligible(targetSymbol, aiResult);
 
-            // If an OPEN trade is active on this symbol, lock its exact Entry, SL (or BE SL), and Single TP!
+            // 3. If Python returned BUY/SELL on an older candle that was ALREADY closed in MongoDB,
+            // downgrade response to WAIT so the chart never shows a ghost/duplicate trade!
+            if (!activeTrade && (aiResult.signal === 'BUY' || aiResult.signal === 'SELL')) {
+                aiResult.signal     = 'WAIT';
+                aiResult.confidence = 58;
+                aiResult.tradeSetup = null;
+                if (aiResult.executionPlan) {
+                    aiResult.executionPlan.stage = 'AWAITING_PULLBACK';
+                    aiResult.executionPlan.trigger_condition = '⏳ Previous setup on this POI already completed. Waiting for next fresh structure break.';
+                }
+                if (aiResult.visuals) {
+                    aiResult.visuals.projection_path = [];
+                }
+                return res.json(aiResult);
+            }
+
+            // 4. If a genuine OPEN trade is active, sync its locked MongoDB values directly into the response
+            // (Break-Even is managed exclusively in tradeController.evaluateOpenTrades at 65% TP / +0.25R!)
             if (activeTrade && activeTrade.status === 'OPEN') {
                 const decimals    = getDecimals(targetSymbol);
                 const pipBuf      = getPipBuffer(targetSymbol);
                 const lockedEntry = Number(activeTrade.entry);
-                let lockedSL      = Number(activeTrade.sl);
-                const initSL      = Number(activeTrade.initialSl || aiResult.tradeSetup?.initial_sl || lockedSL);
+                const lockedSL    = Number(activeTrade.sl);
+                const initSL      = Number(activeTrade.initialSl || lockedSL);
                 const lockedTP    = Number(activeTrade.tp);
                 const isBuy       = (activeTrade.action || '').toUpperCase() === 'BUY';
+                const isBEActive  = Boolean(activeTrade.beTriggered);
 
-                const pyBE        = Boolean(aiResult.tradeSetup?.breakeven_active);
-                const initRisk    = Math.abs(lockedEntry - initSL);
-                const tpDist      = Math.abs(lockedTP - lockedEntry);
-                const beThreshold = Math.min(initRisk > pipBuf * 3 ? initRisk : tpDist * 0.40, tpDist * 0.50);
-
-                let isBEActive = Boolean(activeTrade.beTriggered) || pyBE || (Math.abs(lockedEntry - lockedSL) <= pipBuf * 5);
-
-                if (!isBEActive && beThreshold > 0) {
-                    if ((isBuy && (currentPrice - lockedEntry) >= beThreshold) || (!isBuy && (lockedEntry - currentPrice) >= beThreshold)) {
-                        isBEActive = true;
-                    }
-                }
-
-                if (isBEActive) {
-                    const beSL = Number((isBuy ? lockedEntry + pipBuf : lockedEntry - pipBuf).toFixed(decimals));
-                    let dbUpdated = false;
-                    if ((isBuy && lockedSL < beSL) || (!isBuy && lockedSL > beSL)) {
-                        lockedSL = beSL;
-                        activeTrade.sl = beSL;
-                        dbUpdated = true;
-                    }
-                    if (!activeTrade.beTriggered) {
-                        activeTrade.beTriggered = true;
-                        dbUpdated = true;
-                    }
-                    if (dbUpdated && typeof activeTrade.save === 'function') {
-                        await activeTrade.save();
-                    }
-                }
-
-                const effRisk = initRisk > pipBuf * 3 ? initRisk : Math.max(tpDist / 2.0, 1e-6);
-                const rr      = aiResult.tradeSetup?.risk_reward || parseFloat((Math.abs(lockedTP - lockedEntry) / effRisk).toFixed(2));
-                const dir     = isBuy ? 'BUY' : 'SELL';
-                const slTag   = isBEActive ? `SL (BE 🛡️): ${lockedSL}` : `SL: ${lockedSL}`;
+                const initRisk = Math.abs(lockedEntry - initSL);
+                const tpDist   = Math.abs(lockedTP - lockedEntry);
+                const effRisk  = initRisk > pipBuf * 3 ? initRisk : Math.max(tpDist / 2.0, 1e-6);
+                const rr       = parseFloat((tpDist / effRisk).toFixed(2));
+                const dir      = isBuy ? 'BUY' : 'SELL';
+                const slTag    = isBEActive ? `SL (BE 🛡️): ${lockedSL}` : `SL: ${lockedSL}`;
 
                 aiResult.signal     = dir;
                 aiResult.confidence = Math.max(aiResult.confidence || 0, activeTrade.confidence || 84);
