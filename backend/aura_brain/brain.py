@@ -557,7 +557,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE BUY POI" if status == "TAPPED_ACTIVE" else "BUY POI"
 
             poi_result = {
-                "engine_ver": "11.2",
+                "engine_ver": "11.3",
                 "is_bullish": True,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -610,7 +610,7 @@ def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx:
             prefix = "ACTIVE SELL POI" if status == "TAPPED_ACTIVE" else "SELL POI"
 
             poi_result = {
-                "engine_ver": "11.2",
+                "engine_ver": "11.3",
                 "is_bullish": False,
                 "status": status,
                 "anchor_time": anchor_time,
@@ -749,11 +749,6 @@ def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Option
 def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
                             is_bullish: bool, poi_ref: float, current_price: float,
                             anchor_idx: int, atr: float, decimals: int) -> List[Dict]:
-    """
-    SINGLE SENSIBLE STRUCTURAL TARGET ENGINE (v11.2):
-    - Targets the actual opposing swing high/low of the impulse leg (with a clean 1.25 * ATR floor
-      and a realistic 4.2 * ATR cap so targets never project wildly into empty space).
-    """
     highs = df['High'].values
     lows = df['Low'].values
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
@@ -997,7 +992,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_time = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
-    macro_lookback = max(0, total - 160)
+    # TRUE EXTREME PEAK ANCHOR SNAP (v11.3):
+    # Look back up to 260 bars (~11 trading days on 1H) so Peak Formation High/Low ALWAYS
+    # locks onto the true macro V-spike (e.g. 1.31400 on GBPUSD, 0.83900 on USDCHF,
+    # 1.42950 on USDCAD, 0.55550 on NZDUSD) instead of a secondary right shoulder!
+    macro_lookback = max(0, total - 260)
     macro_max_idx = macro_lookback + int(np.argmax(highs[macro_lookback:]))
     macro_min_idx = macro_lookback + int(np.argmin(lows[macro_lookback:]))
     macro_high_val = float(highs[macro_max_idx])
@@ -1032,18 +1031,34 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 fresh_anchor_time = int(dates[macro_min_idx])
                 fresh_anchor_price = macro_low_val
 
-    if not is_bullish:
-        if highs[macro_max_idx] > fresh_anchor_price and macro_max_idx < fresh_anchor_idx:
-            if np.min(lows[fresh_anchor_idx:]) < np.min(lows[macro_max_idx:fresh_anchor_idx]):
-                fresh_anchor_idx = int(macro_max_idx)
-                fresh_anchor_time = int(dates[macro_max_idx])
-                fresh_anchor_price = float(highs[macro_max_idx])
-    else:
+    # If the cycle anchor landed on a secondary shoulder after a sharp V-spike,
+    # snap back to the true highest/lowest spike of that leg!
+    if is_bullish:
+        shoulder_win = max(0, fresh_anchor_idx - 65)
+        true_leg_min_idx = shoulder_win + int(np.argmin(lows[shoulder_win : fresh_anchor_idx + 1]))
+        if lows[true_leg_min_idx] < fresh_anchor_price:
+            fresh_anchor_idx = int(true_leg_min_idx)
+            fresh_anchor_time = int(dates[fresh_anchor_idx])
+            fresh_anchor_price = float(lows[fresh_anchor_idx])
+
         if lows[macro_min_idx] < fresh_anchor_price and macro_min_idx < fresh_anchor_idx:
-            if np.max(highs[fresh_anchor_idx:]) > np.max(highs[macro_min_idx:fresh_anchor_idx]):
+            if np.max(highs[fresh_anchor_idx:]) >= np.max(highs[macro_min_idx:fresh_anchor_idx]) - (0.50 * atr):
                 fresh_anchor_idx = int(macro_min_idx)
                 fresh_anchor_time = int(dates[macro_min_idx])
                 fresh_anchor_price = float(lows[macro_min_idx])
+    else:
+        shoulder_win = max(0, fresh_anchor_idx - 65)
+        true_leg_max_idx = shoulder_win + int(np.argmax(highs[shoulder_win : fresh_anchor_idx + 1]))
+        if highs[true_leg_max_idx] > fresh_anchor_price:
+            fresh_anchor_idx = int(true_leg_max_idx)
+            fresh_anchor_time = int(dates[fresh_anchor_idx])
+            fresh_anchor_price = float(highs[fresh_anchor_idx])
+
+        if highs[macro_max_idx] > fresh_anchor_price and macro_max_idx < fresh_anchor_idx:
+            if np.min(lows[fresh_anchor_idx:]) <= np.min(lows[macro_max_idx:fresh_anchor_idx]) + (0.50 * atr):
+                fresh_anchor_idx = int(macro_max_idx)
+                fresh_anchor_time = int(dates[macro_max_idx])
+                fresh_anchor_price = float(highs[macro_max_idx])
 
     anchor_idx = fresh_anchor_idx
     anchor_time = fresh_anchor_time
@@ -1778,7 +1793,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v11.2 — Single Sensible Target (TP) + Anti-Duplicate Closed Signal Guard + 65% TP Break-Even Engine",
+            "✅ ENGINE VERSION": "AuraBrain v11.3 — True Extreme Peak Anchor + Single Sensible TP + 65% TP Break-Even Engine",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],

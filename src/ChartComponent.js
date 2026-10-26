@@ -5,6 +5,30 @@ import io from 'socket.io-client';
 
 const API_URL = 'https://aura-trade-v1.onrender.com';
 
+const SYMBOL_DISPLAY_NAMES = {
+  'GC=F':     'XAU/USD',
+  'XAUUSD':   'XAU/USD',
+  'EURUSD=X': 'EUR/USD',
+  'EURUSD':   'EUR/USD',
+  'GBPUSD=X': 'GBP/USD',
+  'GBPUSD':   'GBP/USD',
+  'JPY=X':    'USD/JPY',
+  'USDJPY':   'USD/JPY',
+  'AUDUSD=X': 'AUD/USD',
+  'AUDUSD':   'AUD/USD',
+  'CAD=X':    'USD/CAD',
+  'USDCAD':   'USD/CAD',
+  'CHF=X':    'USD/CHF',
+  'USDCHF':   'USD/CHF',
+  'NZDUSD=X': 'NZD/USD',
+  'NZDUSD':   'NZD/USD',
+};
+
+const formatSymbolDisplay = (sym = '') => {
+  const clean = sym.toUpperCase().trim();
+  return SYMBOL_DISPLAY_NAMES[clean] || clean.replace('=X', '');
+};
+
 const getPriceFormat = (sym = '') => {
   const s = sym.toUpperCase();
   if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) {
@@ -676,11 +700,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       <div style={{ position: 'absolute', top: 15, left: 15, right: 15, zIndex: 20, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(42,46,57,0.85)', padding: '4px 10px', borderRadius: 4, borderLeft: `3px solid ${statusColor}` }}>
           <span style={{ fontSize: 11, fontWeight: 600, color: '#FFF' }}>{connectionStatus}</span>
-          {isExpanded && (
-            <span style={{ fontSize: 11, fontWeight: 700, color: '#f0b429', marginLeft: 6 }}>
-              {symbol} ({timeframe.toUpperCase()})
-            </span>
-          )}
+          <span style={{ fontSize: 11, fontWeight: 700, color: '#f0b429', marginLeft: 6 }}>
+            {formatSymbolDisplay(symbol)} ({timeframe.toUpperCase()})
+          </span>
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
