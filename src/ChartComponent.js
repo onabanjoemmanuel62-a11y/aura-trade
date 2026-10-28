@@ -30,7 +30,7 @@ const formatSymbolDisplay = (sym = '') => {
 };
 
 const getPriceFormat = (sym = '') => {
-  const s = sym.toUpperCase();
+  const s = symbolToUpper(sym);
   if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) {
     return { type: 'price', precision: 2, minMove: 0.01 };
   }
@@ -39,6 +39,8 @@ const getPriceFormat = (sym = '') => {
   }
   return { type: 'price', precision: 5, minMove: 0.00001 };
 };
+
+const symbolToUpper = (sym = '') => String(sym || '').toUpperCase();
 
 const safeTimeToX = (timeScale, candles, targetTime) => {
   if (!timeScale || targetTime == null) return null;
@@ -64,6 +66,80 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
     ? idxHi
     : idxLo;
   return timeScale.timeToCoordinate(candles[bestIdx].time);
+};
+
+// Local fallback TDI calculator so the TDI panel renders immediately even before Python responds
+const computeLocalTDI = (candles) => {
+  if (!candles || candles.length < 20) return [];
+  const closes = candles.map(c => c.close);
+  const n = closes.length;
+  const period = 13;
+
+  const rsi = new Array(n).fill(50);
+  let avgGain = 0;
+  let avgLoss = 0;
+
+  for (let i = 1; i < n; i++) {
+    const chg = closes[i] - closes[i - 1];
+    const gain = chg > 0 ? chg : 0;
+    const loss = chg < 0 ? -chg : 0;
+
+    if (i <= period) {
+      avgGain += gain / period;
+      avgLoss += loss / period;
+      if (i === period) {
+        const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+        rsi[i] = 100 - 100 / (1 + rs);
+      }
+    } else {
+      avgGain = (avgGain * (period - 1) + gain) / period;
+      avgLoss = (avgLoss * (period - 1) + loss) / period;
+      const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
+      rsi[i] = 100 - 100 / (1 + rs);
+    }
+  }
+
+  const out = [];
+  const startIdx = Math.max(0, n - 500);
+  for (let i = startIdx; i < n; i++) {
+    // Green = SMA(2) of RSI
+    const gStart = Math.max(0, i - 1);
+    let gSum = 0;
+    for (let j = gStart; j <= i; j++) gSum += rsi[j];
+    const green = gSum / (i - gStart + 1);
+
+    // Red = SMA(7) of RSI
+    const rStart = Math.max(0, i - 6);
+    let rSum = 0;
+    for (let j = rStart; j <= i; j++) rSum += rsi[j];
+    const red = rSum / (i - rStart + 1);
+
+    // Yellow = SMA(34) of RSI & Blue Bands = 1.6185 * StdDev(34)
+    const bStart = Math.max(0, i - 33);
+    const bLen = i - bStart + 1;
+    let bSum = 0;
+    for (let j = bStart; j <= i; j++) bSum += rsi[j];
+    const yellow = bSum / bLen;
+
+    let varSum = 0;
+    for (let j = bStart; j <= i; j++) {
+      const d = rsi[j] - yellow;
+      varSum += d * d;
+    }
+    const std = Math.sqrt(varSum / Math.max(1, bLen));
+    const upper = Math.min(100, Math.max(0, yellow + 1.6185 * std));
+    const lower = Math.min(100, Math.max(0, yellow - 1.6185 * std));
+
+    out.push({
+      time: candles[i].time,
+      green,
+      red,
+      yellow,
+      upper,
+      lower,
+    });
+  }
+  return out;
 };
 
 class LineRenderer {
@@ -379,6 +455,198 @@ class ProjectionPrimitive {
   paneViews() { return this._paneViews; }
 }
 
+// ============================================================================
+// 🦈 TDI (TRADERS DYNAMIC INDEX) SUB-WINDOW PRIMITIVE (BTMM SHARKFIN VIEW)
+// ============================================================================
+class TDIPaneRenderer {
+  constructor(data) { this._data = data; }
+
+  draw(target) {
+    target.useBitmapCoordinateSpace((scope) => {
+      if (!this._data || !this._data.visible || !this._data.points || this._data.points.length < 2) return;
+
+      const ctx   = scope.context;
+      const hPR   = scope.horizontalPixelRatio;
+      const vPR   = scope.verticalPixelRatio;
+      const fullW = scope.mediaSize.width * hPR;
+      const fullH = scope.mediaSize.height * vPR;
+
+      const paneH   = Math.round(fullH * 0.24);
+      const paneTop = fullH - paneH;
+      const padTop  = 18 * vPR;
+      const padBot  = 8 * vPR;
+      const plotTop = paneTop + padTop;
+      const plotBot = fullH - padBot;
+      const plotH   = Math.max(20 * vPR, plotBot - plotTop);
+
+      // Map RSI 15..85 range into the sub-window height
+      const valToY = (v) => {
+        const clamped = Math.max(12, Math.min(88, v));
+        return plotBot - ((clamped - 12) / (88 - 12)) * plotH;
+      };
+
+      const pts = this._data.points.filter(p => p.x != null && p.x * hPR >= -20 && p.x * hPR <= fullW + 20);
+      if (pts.length < 2) return;
+
+      ctx.save();
+
+      // 1. Sub-panel dark background & top divider border
+      ctx.fillStyle = 'rgba(13, 17, 24, 0.94)';
+      ctx.fillRect(0, paneTop, fullW, paneH);
+
+      ctx.beginPath();
+      ctx.moveTo(0, paneTop);
+      ctx.lineTo(fullW, paneTop);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+      ctx.lineWidth   = 1.2 * vPR;
+      ctx.stroke();
+
+      // 2. Reference levels: 68 (Overbought), 50 (Mid), 32 (Oversold)
+      [
+        { lvl: 68, col: 'rgba(239, 83, 80, 0.30)' },
+        { lvl: 50, col: 'rgba(255, 255, 255, 0.16)' },
+        { lvl: 32, col: 'rgba(38, 166, 154, 0.30)' },
+      ].forEach(({ lvl, col }) => {
+        const y = Math.round(valToY(lvl));
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(fullW, y);
+        ctx.strokeStyle = col;
+        ctx.lineWidth   = 1 * vPR;
+        ctx.setLineDash([4 * hPR, 4 * hPR]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.font      = `${9 * hPR}px monospace`;
+        ctx.fillStyle = 'rgba(156, 163, 175, 0.65)';
+        ctx.fillText(String(lvl), fullW - 22 * hPR, y - 3 * vPR);
+      });
+
+      // 3. Blue Volatility Band Water Fill (between Upper & Lower Blue Bands)
+      ctx.beginPath();
+      pts.forEach((p, idx) => {
+        const x = Math.round(p.x * hPR);
+        const y = Math.round(valToY(p.upper));
+        if (idx === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      for (let idx = pts.length - 1; idx >= 0; idx--) {
+        const p = pts[idx];
+        const x = Math.round(p.x * hPR);
+        const y = Math.round(valToY(p.lower));
+        ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(41, 98, 255, 0.08)';
+      ctx.fill();
+
+      // Helper to stroke a continuous TDI line
+      const strokeTDILine = (key, color, width, dash = []) => {
+        ctx.beginPath();
+        pts.forEach((p, idx) => {
+          const x = Math.round(p.x * hPR);
+          const y = Math.round(valToY(p[key]));
+          if (idx === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.strokeStyle = color;
+        ctx.lineWidth   = width * hPR;
+        ctx.setLineDash(dash);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      };
+
+      // 4. Draw Upper & Lower Blue Volatility Bands
+      strokeTDILine('upper', 'rgba(41, 182, 246, 0.85)', 1.3);
+      strokeTDILine('lower', 'rgba(41, 182, 246, 0.85)', 1.3);
+
+      // 5. Draw Yellow Market Base Line (SMA 34)
+      strokeTDILine('yellow', 'rgba(255, 214, 0, 0.90)', 1.4);
+
+      // 6. Draw Red Trade Signal Line (SMA 7)
+      strokeTDILine('red', 'rgba(255, 82, 82, 0.95)', 1.6);
+
+      // 7. Draw Green RSI Price Line (SMA 2 of RSI 13)
+      strokeTDILine('green', 'rgba(0, 230, 118, 0.98)', 2.0);
+
+      // 8. Highlight Sharkfin spikes where Green pokes outside the Blue Volatility Bands!
+      pts.forEach((p) => {
+        const isBullFin = p.green <= p.lower + 0.5;
+        const isBearFin = p.green >= p.upper - 0.5;
+        if (!isBullFin && !isBearFin) return;
+
+        const x = Math.round(p.x * hPR);
+        const y = Math.round(valToY(p.green));
+        ctx.beginPath();
+        ctx.arc(x, y, 3.2 * hPR, 0, Math.PI * 2);
+        ctx.fillStyle = isBullFin ? '#00E676' : '#FF1744';
+        ctx.fill();
+      });
+
+      // 9. Header Legend inside TDI Sub-Window
+      const last = pts[pts.length - 1];
+      ctx.font      = `bold ${10 * hPR}px monospace`;
+      ctx.fillStyle = '#E8EDF3';
+      ctx.fillText('🦈 TDI (13, 2, 7, 34)', 12 * hPR, paneTop + 13 * vPR);
+
+      ctx.fillStyle = '#00E676';
+      ctx.fillText(`Green: ${last.green.toFixed(1)}`, 165 * hPR, paneTop + 13 * vPR);
+
+      ctx.fillStyle = '#FF5252';
+      ctx.fillText(`Red: ${last.red.toFixed(1)}`, 255 * hPR, paneTop + 13 * vPR);
+
+      ctx.fillStyle = '#FFD600';
+      ctx.fillText(`Base: ${last.yellow.toFixed(1)}`, 335 * hPR, paneTop + 13 * vPR);
+
+      ctx.fillStyle = '#29B6F6';
+      ctx.fillText(`Bands: ${last.lower.toFixed(1)}–${last.upper.toFixed(1)}`, 425 * hPR, paneTop + 13 * vPR);
+
+      ctx.restore();
+    });
+  }
+}
+
+class TDIPaneView {
+  constructor(source) { this._source = source; }
+  renderer() { return new TDIPaneRenderer(this._source._rendererData); }
+}
+
+class TDIPanePrimitive {
+  constructor() {
+    this._rendererData = { visible: true, points: [] };
+    this._paneViews    = [new TDIPaneView(this)];
+  }
+
+  setData(tdiSeries, timeScale, candles, visible = true) {
+    if (!visible || !candles || !candles.length) {
+      this._rendererData = { visible: false, points: [] };
+      return;
+    }
+    const sourceData = (tdiSeries && tdiSeries.length > 10) ? tdiSeries : computeLocalTDI(candles);
+    if (!sourceData || !sourceData.length) {
+      this._rendererData = { visible: false, points: [] };
+      return;
+    }
+
+    const points = sourceData.map((item) => {
+      const x = safeTimeToX(timeScale, candles, item.time);
+      if (x === null) return null;
+      return {
+        x,
+        green:  Number(item.green),
+        red:    Number(item.red),
+        yellow: Number(item.yellow),
+        upper:  Number(item.upper),
+        lower:  Number(item.lower),
+      };
+    }).filter(Boolean);
+
+    this._rendererData = { visible: true, points };
+  }
+
+  paneViews() { return this._paneViews; }
+}
+
 const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const chartContainerRef       = useRef(null);
   const chartRef                = useRef(null);
@@ -388,6 +656,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const trendlinePrimitiveRef   = useRef(null);
   const obZonePrimitiveRef      = useRef(null);
   const projectionPrimitiveRef  = useRef(null);
+  const tdiPrimitiveRef         = useRef(null);
   const activeLinesRef          = useRef([]);
   const isChartReady            = useRef(false);
   const isSymbolLoadedRef       = useRef(false);
@@ -403,12 +672,24 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
   const [newsData,            setNewsData]            = useState([]);
   const [isHoveringControls,  setIsHoveringControls]  = useState(false);
   const [isExpanded,          setIsExpanded]          = useState(false);
+  const [showTDI,             setShowTDI]             = useState(true);
+  const showTDIRef            = useRef(true);
+
+  useEffect(() => {
+    showTDIRef.current = showTDI;
+    if (chartRef.current) {
+      chartRef.current.priceScale('right').applyOptions({
+        scaleMargins: { top: 0.12, bottom: showTDI ? 0.28 : 0.14 },
+      });
+    }
+  }, [showTDI]);
 
   const clearPrimitives = useCallback(() => {
     if (linePrimitiveRef.current)       linePrimitiveRef.current.setData([], null, null, []);
     if (trendlinePrimitiveRef.current)  trendlinePrimitiveRef.current.setData(null, null, null, []);
     if (obZonePrimitiveRef.current)     obZonePrimitiveRef.current.setData([], null, null, []);
     if (projectionPrimitiveRef.current) projectionPrimitiveRef.current.setData(null, null, null, []);
+    if (tdiPrimitiveRef.current)        tdiPrimitiveRef.current.setData([], null, [], false);
   }, []);
 
   const updateChartData = useCallback((data) => {
@@ -422,7 +703,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       if (chartRef.current && chartContainerRef.current) {
         chartRef.current.applyOptions({
           width:  chartContainerRef.current.clientWidth,
-          height: isExpanded ? window.innerHeight : 500,
+          height: isExpanded ? window.innerHeight : 540,
         });
       }
     }, 30);
@@ -470,9 +751,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       grid:            { vertLines: { color: '#2B2B43', style: 1 }, horzLines: { color: '#2B2B43', style: 1 } },
       crosshair:       { mode: 0 },
       width:           chartContainerRef.current.clientWidth,
-      height:          500,
+      height:          540,
       timeScale:       { timeVisible: true, secondsVisible: false, rightOffset: 24, barSpacing: 12 },
-      rightPriceScale: { scaleMargins: { top: 0.18, bottom: 0.18 }, borderVisible: false, autoScale: true },
+      rightPriceScale: { scaleMargins: { top: 0.12, bottom: 0.28 }, borderVisible: false, autoScale: true },
     });
 
     const initialFormat = getPriceFormat(symbolRef.current);
@@ -502,6 +783,10 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
     series.attachPrimitive(projP);
     projectionPrimitiveRef.current = projP;
 
+    const tdiP = new TDIPanePrimitive();
+    series.attachPrimitive(tdiP);
+    tdiPrimitiveRef.current = tdiP;
+
     chartRef.current        = chart;
     candleSeriesRef.current = series;
     isChartReady.current    = true;
@@ -510,7 +795,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
       if (chartContainerRef.current && chartRef.current) {
         chartRef.current.applyOptions({
           width:  chartContainerRef.current.clientWidth,
-          height: chartContainerRef.current.clientHeight || 500,
+          height: chartContainerRef.current.clientHeight || 540,
         });
       }
     };
@@ -600,6 +885,9 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         }
         if (projectionPrimitiveRef.current) {
           projectionPrimitiveRef.current.setData(visuals?.projection_path, candleSeriesRef.current, ts, candles);
+        }
+        if (tdiPrimitiveRef.current) {
+          tdiPrimitiveRef.current.setData(visuals?.tdi_data, ts, candles, showTDIRef.current);
         }
       }
       rafId = requestAnimationFrame(loop);
@@ -706,6 +994,23 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button
+            onClick={() => setShowTDI(prev => !prev)}
+            title="Show / Hide TDI Sharkfin Indicator"
+            style={{
+              padding: '6px 12px',
+              background: showTDI ? 'rgba(0, 230, 118, 0.16)' : '#2A2E39',
+              color: showTDI ? '#00E676' : '#787B86',
+              border: `1px solid ${showTDI ? 'rgba(0, 230, 118, 0.45)' : 'rgba(255,255,255,0.12)'}`,
+              cursor: 'pointer',
+              borderRadius: 4,
+              fontWeight: 700,
+              fontSize: 11,
+              fontFamily: 'monospace',
+            }}>
+            {showTDI ? '🦈 TDI: ON' : '🦈 TDI: OFF'}
+          </button>
+
           <div style={{ display: 'flex', gap: 2, background: '#2A2E39', padding: 2, borderRadius: 4 }}>
             {['15m', '1h', '4h'].map(tf => (
               <button key={tf} onClick={() => handleTimeframeChange(tf)}
@@ -736,7 +1041,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         </div>
       </div>
 
-      <div style={{ position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 30, display: 'flex', gap: 8, opacity: isHoveringControls ? 1 : 0, transition: 'opacity 0.2s', background: 'rgba(42,46,57,0.9)', padding: '8px 12px', borderRadius: 30, border: '1px solid #374357' }}>
+      <div style={{ position: 'absolute', bottom: showTDI ? '26%' : 20, left: '50%', transform: 'translateX(-50%)', zIndex: 30, display: 'flex', gap: 8, opacity: isHoveringControls ? 1 : 0, transition: 'opacity 0.2s', background: 'rgba(42,46,57,0.9)', padding: '8px 12px', borderRadius: 30, border: '1px solid #374357' }}>
         <ControlButton onClick={() => handleScroll('left')}  label="<"     />
         <ControlButton onClick={handleZoomOut}               label="−"     />
         <ControlButton onClick={handleReset}                 label="RESET" wide />
@@ -744,7 +1049,7 @@ const ChartComponent = ({ symbol = 'GC=F', levels, visuals, tradeSetup }) => {
         <ControlButton onClick={() => handleScroll('right')} label=">"     />
       </div>
 
-      <div ref={chartContainerRef} style={{ width: '100%', height: isExpanded ? '100vh' : 500, position: 'relative' }} />
+      <div ref={chartContainerRef} style={{ width: '100%', height: isExpanded ? '100vh' : 540, position: 'relative' }} />
     </div>
   );
 };
