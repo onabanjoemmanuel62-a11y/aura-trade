@@ -22,7 +22,6 @@ FLIP_BUFFER_ATR = 0.30
 FLIP_CONFIRM_BARS = 2
 ANCHOR_MIN_MOVE_ATR = 1.5
 SWING_PROMINENCE_ATR = 0.80
-MIN_FVG_SIZE_ATR = 0.05
 MIN_ALLOWED_RR = 1.4
 
 logging.basicConfig(level=logging.INFO)
@@ -409,354 +408,302 @@ def find_choch_and_bos_from_peak(df: pd.DataFrame, is_bullish: bool, anchor_idx:
     return events
 
 
-def evaluate_pre_break_candle_poi(df: pd.DataFrame, is_bullish: bool, break_idx: int,
-                                  top_val: float, bot_val: float,
-                                  current_price: float, atr: float) -> str:
+def detect_sharkfin_stophunt(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
+                             struct_events: List[Dict], current_price: float,
+                             atr: float, decimals: int, pip_size: float) -> Dict:
     """
-    PRE-BREAKOUT CANDLE LIFECYCLE EVALUATOR (v11.4):
-    - Ensures initial breakout continuation candles right after `break_idx` (`depart_idx`)
-      that overlap the edge of the POI on their way out are treated as part of departure,
-      NEVER as a false pullback tap that kills the zone!
-    """
-    highs = df['High'].values
-    lows = df['Low'].values
-    closes = df['Close'].values
-    total = len(closes)
-
-    if break_idx >= total - 1:
-        return "INVALIDATED"
-
-    depart_idx = break_idx
-    if is_bullish:
-        # Advance `depart_idx` across any immediate post-breakout candles that are still overlapping `top_val`
-        while depart_idx + 1 < total - 1 and (depart_idx - break_idx) < 4:
-            if lows[depart_idx + 1] <= top_val + (0.04 * atr) and closes[depart_idx + 1] > bot_val:
-                if lows[depart_idx + 1] < bot_val - (0.08 * atr):
-                    return "INVALIDATED"
-                depart_idx += 1
-            else:
-                break
-    else:
-        while depart_idx + 1 < total - 1 and (depart_idx - break_idx) < 4:
-            if highs[depart_idx + 1] >= bot_val - (0.04 * atr) and closes[depart_idx + 1] < top_val:
-                if highs[depart_idx + 1] > top_val + (0.08 * atr):
-                    return "INVALIDATED"
-                depart_idx += 1
-            else:
-                break
-
-    if depart_idx >= total - 1:
-        return "INVALIDATED"
-
-    if is_bullish:
-        first_tap = None
-        for idx in range(depart_idx + 1, total):
-            if lows[idx] < bot_val - (0.08 * atr) or closes[idx] < bot_val:
-                return "INVALIDATED"
-            if lows[idx] <= top_val + (0.02 * atr) and first_tap is None:
-                first_tap = idx
-
-        if current_price < bot_val - (0.08 * atr):
-            return "INVALIDATED"
-
-        if first_tap is None:
-            if current_price <= top_val + (0.02 * atr):
-                return "TAPPED_ACTIVE"
-            return "UNTOUCHED"
-
-        pre_tap_high = float(np.max(highs[break_idx : first_tap + 1]))
-        if (pre_tap_high - top_val) < (0.25 * atr):
-            return "INVALIDATED"
-
-        if first_tap + 1 < total:
-            post_tap_high = max(float(np.max(highs[first_tap + 1:])), current_price)
-            if post_tap_high >= pre_tap_high + (0.10 * atr):
-                return "INVALIDATED"
-
-        return "TAPPED_ACTIVE"
-
-    else:
-        first_tap = None
-        for idx in range(depart_idx + 1, total):
-            if highs[idx] > top_val + (0.08 * atr) or closes[idx] > top_val:
-                return "INVALIDATED"
-            if highs[idx] >= bot_val - (0.02 * atr) and first_tap is None:
-                first_tap = idx
-
-        if current_price > top_val + (0.08 * atr):
-            return "INVALIDATED"
-
-        if first_tap is None:
-            if current_price >= bot_val - (0.02 * atr):
-                return "TAPPED_ACTIVE"
-            return "UNTOUCHED"
-
-        pre_tap_low = float(np.min(lows[break_idx : first_tap + 1]))
-        if (bot_val - pre_tap_low) < (0.25 * atr):
-            return "INVALIDATED"
-
-        if first_tap + 1 < total:
-            post_tap_low = min(float(np.min(lows[first_tap + 1:])), current_price)
-            if post_tap_low <= pre_tap_low - (0.10 * atr):
-                return "INVALIDATED"
-
-        return "TAPPED_ACTIVE"
-
-
-def find_or_lock_unmitigated_poi(df: pd.DataFrame, is_bullish: bool, anchor_idx: int,
-                                 anchor_time: int, struct_events: List[Dict],
-                                 current_price: float, atr: float, decimals: int,
-                                 state_key: Optional[str] = None) -> Optional[Dict]:
-    """
-    UNMITIGATED POI ENGINE (v11.4):
-    - Removed the broken `subsequent_broken` blocker that was skipping valid parent POIs
-      (like USD/JPY 157.577 and USD/CHF 0.82595 / 0.83166) whenever price rallied past a lower BOS!
-    - Checks `break_idx - 1` first, and if `break_idx - 1` is invalidated/mitigated, checks
-      `break_idx - 2` and `orig_idx` on that same leg before stepping back to the previous BOS.
+    SHARKFIN / STOP-HUNT DETECTOR SYSTEM (v12.0):
+    1. Identifies internal pullback Swing Lows (in a PFL / Bullish trend) or
+       internal pullback Swing Highs (in a PFH / Bearish trend) after the Peak Anchor.
+    2. Detects when a candle (or 2-candle Sharkfin sequence) sweeps past that liquidity pool
+       to hunt stops and snaps back to close inside the range!
+    3. Also tracks the nearest UNSWEPT liquidity pool ("Bait") so the chart shows
+       where the next Sharkfin Stop Hunt is waiting if no sweep is active right now.
     """
     opens = df['Open'].values
-    closes = df['Close'].values
     highs = df['High'].values
     lows = df['Low'].values
+    closes = df['Close'].values
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
     total = len(closes)
 
-    if not struct_events:
-        return None
+    empty_res = {
+        "has_pool": False,
+        "swept": False,
+        "pool_type": "Stop-Hunt Pool",
+        "pool_level": None,
+        "pool_idx": None,
+        "pool_time": None,
+        "pool_line": None,
+        "recent_sweeps": [],
+    }
+    if total < 20 or anchor_idx >= total - 4:
+        return empty_res
 
-    min_candle_span = 0.14 * atr
+    anchor_price = float(lows[anchor_idx]) if is_bullish else float(highs[anchor_idx])
+    start_scan = max(anchor_idx + 2, total - 180)
+    min_sweep_pen = max(pip_size * 0.8, 0.015 * atr)
+    max_sweep_pen = 1.85 * atr
 
-    for ev_idx in range(len(struct_events) - 1, -1, -1):
-        ev = struct_events[ev_idx]
-        orig_idx = int(np.clip(ev.get("leg_origin", anchor_idx), anchor_idx, total - 3))
-        break_idx = int(np.clip(ev.get("break_idx", total - 1), orig_idx + 1, total - 2))
-
-        # Candidate Order Block candles for this structure break:
-        # 1st priority: `break_idx - 1` (the exact candle right before the breakout candle)
-        # 2nd priority: `break_idx - 2` (if `break_idx - 1` was already part of the impulse)
-        # 3rd priority: `orig_idx` (the extreme origin candle of that BOS pullback leg)
-        candidate_obs = []
-        for cand_i in (max(orig_idx, break_idx - 1), max(orig_idx, break_idx - 2), orig_idx):
-            if cand_i not in candidate_obs:
-                candidate_obs.append(cand_i)
-
-        for ob_idx in candidate_obs:
-            if is_bullish:
-                bot_val = float(lows[ob_idx])
-                top_val = max(float(highs[ob_idx]), bot_val + min_candle_span)
-
-                status = evaluate_pre_break_candle_poi(
-                    df, True, break_idx, top_val, bot_val, current_price, atr
-                )
-                if status == "INVALIDATED":
-                    continue
-
-                fvg_str = None
-                has_fvg = False
-                fvg_lo = max(orig_idx, ob_idx - 1)
-                fvg_hi = min(total - 3, break_idx + 1)
-                for k in range(fvg_hi, fvg_lo - 1, -1):
-                    if (closes[k + 1] > opens[k + 1]) and (float(lows[k + 2] - highs[k]) >= MIN_FVG_SIZE_ATR * atr):
-                        fvg_str = f"{round(float(highs[k]), decimals):.{decimals}f}–{round(float(lows[k + 2]), decimals):.{decimals}f}"
-                        has_fvg = True
-                        break
-
-                bot_r = round(bot_val, decimals)
-                top_r = round(top_val, decimals)
-                prefix = "ACTIVE BUY POI" if status == "TAPPED_ACTIVE" else "BUY POI"
-
-                poi_result = {
-                    "engine_ver": "11.4",
-                    "is_bullish": True,
-                    "status": status,
-                    "anchor_time": anchor_time,
-                    "ob_idx": int(ob_idx),
-                    "depart_idx": int(break_idx),
-                    "depart_time": int(dates[break_idx]),
-                    "top": top_r,
-                    "bottom": bot_r,
-                    "poi_level": top_r,
-                    "ob_range": f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
-                    "has_fvg": has_fvg,
-                    "fvg_range": fvg_str if fvg_str else "Direct Break (No FVG)",
-                    "locked_idm": None,
-                    "box": {
-                        "type": "BULL_OB",
-                        "top": top_r,
-                        "bottom": bot_r,
-                        "time": int(dates[ob_idx]),
-                        "end_time": int(dates[-1]),
-                        "label": f"{prefix} ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
-                        "mitigated": False,
-                    }
-                }
-                if state_key:
-                    POI_STATE[state_key] = poi_result
-                return poi_result
-
-            else:
-                top_val = float(highs[ob_idx])
-                bot_val = min(float(lows[ob_idx]), top_val - min_candle_span)
-
-                status = evaluate_pre_break_candle_poi(
-                    df, False, break_idx, top_val, bot_val, current_price, atr
-                )
-                if status == "INVALIDATED":
-                    continue
-
-                fvg_str = None
-                has_fvg = False
-                fvg_lo = max(orig_idx, ob_idx - 1)
-                fvg_hi = min(total - 3, break_idx + 1)
-                for k in range(fvg_hi, fvg_lo - 1, -1):
-                    if (opens[k + 1] > closes[k + 1]) and (float(lows[k] - highs[k + 2]) >= MIN_FVG_SIZE_ATR * atr):
-                        fvg_str = f"{round(float(highs[k + 2]), decimals):.{decimals}f}–{round(float(lows[k]), decimals):.{decimals}f}"
-                        has_fvg = True
-                        break
-
-                bot_r = round(bot_val, decimals)
-                top_r = round(top_val, decimals)
-                prefix = "ACTIVE SELL POI" if status == "TAPPED_ACTIVE" else "SELL POI"
-
-                poi_result = {
-                    "engine_ver": "11.4",
-                    "is_bullish": False,
-                    "status": status,
-                    "anchor_time": anchor_time,
-                    "ob_idx": int(ob_idx),
-                    "depart_idx": int(break_idx),
-                    "depart_time": int(dates[break_idx]),
-                    "top": top_r,
-                    "bottom": bot_r,
-                    "poi_level": bot_r,
-                    "ob_range": f"{bot_r:.{decimals}f}–{top_r:.{decimals}f}",
-                    "has_fvg": has_fvg,
-                    "fvg_range": fvg_str if fvg_str else "Direct Break (No FVG)",
-                    "locked_idm": None,
-                    "box": {
-                        "type": "BEAR_OB",
-                        "top": top_r,
-                        "bottom": bot_r,
-                        "time": int(dates[ob_idx]),
-                        "end_time": int(dates[-1]),
-                        "label": f"{prefix} ({bot_r:.{decimals}f}–{top_r:.{decimals}f})",
-                        "mitigated": False,
-                    }
-                }
-                if state_key:
-                    POI_STATE[state_key] = poi_result
-                return poi_result
-
-    return None
-
-
-def find_pullback_liquidity(df: pd.DataFrame, is_bullish: bool, poi_info: Optional[Dict],
-                            atr: float, decimals: int) -> Dict:
-    if not poi_info:
-        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
-
-    highs = df['High'].values
-    lows = df['Low'].values
-    dates = df['Date'].values if 'Date' in df.columns else df.index.values
-    total = len(highs)
-
-    dep_time = poi_info.get("depart_time", 0)
-    dep_matches = np.where(dates >= dep_time)[0]
-    depart_idx = int(dep_matches[0]) if len(dep_matches) > 0 else total
-
-    if depart_idx >= total - 5:
-        return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
-
-    poi_top = poi_info["top"]
-    poi_bot = poi_info["bottom"]
-    scan_end = total - 4
-
+    # Step 1: Collect all internal swing lows (for Bullish PFL) or swing highs (for Bearish PFH)
+    pools = []
     if is_bullish:
-        cand_lows = []
-        for j in range(depart_idx + 2, scan_end):
-            if (
+        for j in range(start_scan, total - 2):
+            # 2-bar left, 2-bar right fractal low (orBOS pullback origin)
+            is_fractal_low = (
                 lows[j] <= lows[j - 1] and lows[j] <= lows[j - 2]
                 and lows[j] <= lows[j + 1] and lows[j] <= lows[j + 2]
-            ):
-                subsequent_bounce = float(np.max(highs[j + 1 : min(total, j + 8)])) - float(lows[j])
-                if subsequent_bounce >= (0.45 * atr):
-                    if poi_bot + (0.05 * atr) <= lows[j] <= poi_top + (6.5 * atr):
-                        cand_lows.append(j)
-
-        if cand_lows:
-            idm_idx = cand_lows[0]
-            idm_price = float(lows[idm_idx])
-            eq_lows = [idx for idx in cand_lows if abs(lows[idx] - idm_price) <= 0.20 * atr]
-            liq_type = "Range Liquidity (EQL)" if len(eq_lows) >= 2 else "Inducement (IDM)"
-            lvl_r = round(idm_price, decimals)
-
-            post_min = float(np.min(lows[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
-            swept = bool(post_min < idm_price - (0.01 * atr))
-            status_tag = "SWEPT ✅" if swept else ""
-            label_str = f"$$$ {liq_type} {status_tag} ({lvl_r:.{decimals}f})".replace("  ", " ")
-
-            return {
-                "has_liquidity": True,
-                "swept": swept,
-                "liq_type": liq_type,
-                "liq_level": lvl_r,
-                "liq_line": {
-                    "level": lvl_r,
-                    "start_time": int(dates[idm_idx]),
-                    "end_time": int(dates[-1]),
-                    "type": label_str,
-                    "color": "rgba(192, 132, 252, 0.92)",
-                    "is_anchor": False,
-                    "is_struct": True,
-                    "is_choch": False,
-                },
-            }
+            )
+            if not is_fractal_low:
+                continue
+            lvl = float(lows[j])
+            if lvl <= anchor_price + (0.05 * atr):
+                continue
+            # Must have produced a meaningful bounce (>= 0.40 * ATR) before being swept
+            bounce_end = min(total, j + 10)
+            bounce = float(np.max(highs[j + 1 : bounce_end])) - lvl
+            if bounce >= 0.40 * atr:
+                pools.append({"idx": j, "level": lvl, "time": int(dates[j])})
     else:
-        cand_highs = []
-        for j in range(depart_idx + 2, scan_end):
-            if (
+        for j in range(start_scan, total - 2):
+            is_fractal_high = (
                 highs[j] >= highs[j - 1] and highs[j] >= highs[j - 2]
                 and highs[j] >= highs[j + 1] and highs[j] >= highs[j + 2]
+            )
+            if not is_fractal_high:
+                continue
+            lvl = float(highs[j])
+            if lvl >= anchor_price - (0.05 * atr):
+                continue
+            drop_end = min(total, j + 10)
+            drop = lvl - float(np.min(lows[j + 1 : drop_end]))
+            if drop >= 0.40 * atr:
+                pools.append({"idx": j, "level": lvl, "time": int(dates[j])})
+
+    if not pools:
+        return empty_res
+
+    # Step 2: Check each liquidity pool for a Sharkfin Stop-Hunt Sweep OR Unswept Bait status
+    recent_sweeps = []
+    unswept_pools = []
+
+    for p in pools:
+        p_idx = p["idx"]
+        p_lvl = p["level"]
+        p_time = p["time"]
+
+        # Check if an Equal High/Low (EQL/EQH) cluster exists near this level
+        eq_matches = [x for x in pools if abs(x["level"] - p_lvl) <= 0.18 * atr]
+        if is_bullish:
+            p_type = "Equal Lows (EQL)" if len(eq_matches) >= 2 else "Swing Low Liquidity"
+        else:
+            p_type = "Equal Highs (EQH)" if len(eq_matches) >= 2 else "Swing High Liquidity"
+
+        first_breach_idx = None
+        for k in range(p_idx + 3, total):
+            if is_bullish:
+                if lows[k] < p_lvl - min_sweep_pen:
+                    first_breach_idx = k
+                    break
+            else:
+                if highs[k] > p_lvl + min_sweep_pen:
+                    first_breach_idx = k
+                    break
+
+        if first_breach_idx is None:
+            unswept_pools.append({
+                "idx": p_idx,
+                "level": round(p_lvl, decimals),
+                "time": p_time,
+                "pool_type": p_type,
+            })
+            continue
+
+        # Evaluate if the breach at `k = first_breach_idx` (or `k + 1`) formed a valid Sharkfin Snap-Back!
+        k = first_breach_idx
+        if is_bullish:
+            # Pattern A: Single-candle Sharkfin wick sweep (pierces below `p_lvl`, closes back >= `p_lvl`)
+            pen_k = p_lvl - float(lows[k])
+            c_range = max(float(highs[k] - lows[k]), 1e-9)
+            close_pos = (float(closes[k]) - float(lows[k])) / c_range
+
+            if (
+                min_sweep_pen <= pen_k <= max_sweep_pen
+                and float(lows[k]) > anchor_price
+                and float(closes[k]) >= p_lvl - (0.03 * atr)
+                and (float(closes[k]) > float(opens[k]) or close_pos >= 0.45)
             ):
-                subsequent_drop = float(highs[j]) - float(np.min(lows[j + 1 : min(total, j + 8)]))
-                if subsequent_drop >= (0.45 * atr):
-                    if poi_bot - (6.5 * atr) <= highs[j] <= poi_top - (0.05 * atr):
-                        cand_highs.append(j)
+                recent_sweeps.append({
+                    "signal_idx": k,
+                    "signal_time": int(dates[k]),
+                    "pool_idx": p_idx,
+                    "pool_time": p_time,
+                    "pool_level": round(p_lvl, decimals),
+                    "pool_type": p_type,
+                    "sweep_extreme": round(float(lows[k]), decimals),
+                    "entry_close": round(float(closes[k]), decimals),
+                    "pattern": "1H Sharkfin Wick Sweep",
+                })
+                continue
 
-        if cand_highs:
-            idm_idx = cand_highs[0]
-            idm_price = float(highs[idm_idx])
-            eq_highs = [idx for idx in cand_highs if abs(highs[idx] - idm_price) <= 0.20 * atr]
-            liq_type = "Range Liquidity (EQH)" if len(eq_highs) >= 2 else "Inducement (IDM)"
-            lvl_r = round(idm_price, decimals)
+            # Pattern B: 2-Candle Sharkfin / Turtle Soup Reversal (Candle `k` dips below `p_lvl`, Candle `k+1` snaps back green above `p_lvl`)
+            if k + 1 < total:
+                pen_2 = p_lvl - float(min(lows[k], lows[k + 1]))
+                lowest_wick = float(min(lows[k], lows[k + 1]))
+                if (
+                    min_sweep_pen <= pen_2 <= max_sweep_pen
+                    and lowest_wick > anchor_price
+                    and float(closes[k + 1]) > p_lvl
+                    and float(closes[k + 1]) > float(opens[k + 1])
+                ):
+                    recent_sweeps.append({
+                        "signal_idx": k + 1,
+                        "signal_time": int(dates[k + 1]),
+                        "pool_idx": p_idx,
+                        "pool_time": p_time,
+                        "pool_level": round(p_lvl, decimals),
+                        "pool_type": p_type,
+                        "sweep_extreme": round(lowest_wick, decimals),
+                        "entry_close": round(float(closes[k + 1]), decimals),
+                        "pattern": "2-Bar Sharkfin Snap-Back",
+                    })
+        else:
+            # Bearish Pattern A: Single-candle Sharkfin wick sweep above `p_lvl`, closes back <= `p_lvl`
+            pen_k = float(highs[k]) - p_lvl
+            c_range = max(float(highs[k] - lows[k]), 1e-9)
+            close_pos = (float(highs[k]) - float(closes[k])) / c_range
 
-            post_max = float(np.max(highs[idm_idx + 1:])) if idm_idx + 1 < total else idm_price
-            swept = bool(post_max > idm_price + (0.01 * atr))
-            status_tag = "SWEPT ✅" if swept else ""
-            label_str = f"$$$ {liq_type} {status_tag} ({lvl_r:.{decimals}f})".replace("  ", " ")
+            if (
+                min_sweep_pen <= pen_k <= max_sweep_pen
+                and float(highs[k]) < anchor_price
+                and float(closes[k]) <= p_lvl + (0.03 * atr)
+                and (float(closes[k]) < float(opens[k]) or close_pos >= 0.45)
+            ):
+                recent_sweeps.append({
+                    "signal_idx": k,
+                    "signal_time": int(dates[k]),
+                    "pool_idx": p_idx,
+                    "pool_time": p_time,
+                    "pool_level": round(p_lvl, decimals),
+                    "pool_type": p_type,
+                    "sweep_extreme": round(float(highs[k]), decimals),
+                    "entry_close": round(float(closes[k]), decimals),
+                    "pattern": "1H Sharkfin Wick Sweep",
+                })
+                continue
 
-            return {
-                "has_liquidity": True,
-                "swept": swept,
-                "liq_type": liq_type,
-                "liq_level": lvl_r,
-                "liq_line": {
-                    "level": lvl_r,
-                    "start_time": int(dates[idm_idx]),
-                    "end_time": int(dates[-1]),
-                    "type": label_str,
-                    "color": "rgba(192, 132, 252, 0.92)",
-                    "is_anchor": False,
-                    "is_struct": True,
-                    "is_choch": False,
-                },
-            }
+            # Bearish Pattern B: 2-Candle Sharkfin / Turtle Soup Reversal
+            if k + 1 < total:
+                pen_2 = float(max(highs[k], highs[k + 1])) - p_lvl
+                highest_wick = float(max(highs[k], highs[k + 1]))
+                if (
+                    min_sweep_pen <= pen_2 <= max_sweep_pen
+                    and highest_wick < anchor_price
+                    and float(closes[k + 1]) < p_lvl
+                    and float(closes[k + 1]) < float(opens[k + 1])
+                ):
+                    recent_sweeps.append({
+                        "signal_idx": k + 1,
+                        "signal_time": int(dates[k + 1]),
+                        "pool_idx": p_idx,
+                        "pool_time": p_time,
+                        "pool_level": round(p_lvl, decimals),
+                        "pool_type": p_type,
+                        "sweep_extreme": round(highest_wick, decimals),
+                        "entry_close": round(float(closes[k + 1]), decimals),
+                        "pattern": "2-Bar Sharkfin Snap-Back",
+                    })
 
-    return {"has_liquidity": False, "swept": False, "liq_type": "Inducement (IDM)", "liq_level": None, "liq_line": None}
+    # Sort recent sweeps by signal candle index (newest first)
+    recent_sweeps.sort(key=lambda x: x["signal_idx"], reverse=True)
+
+    # Determine which liquidity line to display on the chart right now:
+    # 1. If a recent Sharkfin sweep happened within the last 28 bars and hasn't been invalidated, show `🦈 SHARKFIN SWEPT ✅`!
+    for sw in recent_sweeps:
+        if (total - 1 - sw["signal_idx"]) <= 28:
+            post_slice_low = float(np.min(lows[sw["signal_idx"] + 1:])) if sw["signal_idx"] + 1 < total else sw["sweep_extreme"]
+            post_slice_high = float(np.max(highs[sw["signal_idx"] + 1:])) if sw["signal_idx"] + 1 < total else sw["sweep_extreme"]
+            if is_bullish and post_slice_low >= sw["sweep_extreme"] - (0.05 * atr):
+                lvl_r = sw["pool_level"]
+                return {
+                    "has_pool": True,
+                    "swept": True,
+                    "pool_type": sw["pool_type"],
+                    "pool_level": lvl_r,
+                    "pool_idx": sw["pool_idx"],
+                    "pool_time": sw["pool_time"],
+                    "sweep_extreme": sw["sweep_extreme"],
+                    "pool_line": {
+                        "level": lvl_r,
+                        "start_time": sw["pool_time"],
+                        "end_time": int(dates[-1]),
+                        "type": f"🦈 SHARKFIN SWEPT ✅ ({lvl_r:.{decimals}f})",
+                        "color": "rgba(192, 132, 252, 0.95)",
+                        "is_anchor": False,
+                        "is_struct": True,
+                        "is_choch": False,
+                    },
+                    "recent_sweeps": recent_sweeps,
+                }
+            elif (not is_bullish) and post_slice_high <= sw["sweep_extreme"] + (0.05 * atr):
+                lvl_r = sw["pool_level"]
+                return {
+                    "has_pool": True,
+                    "swept": True,
+                    "pool_type": sw["pool_type"],
+                    "pool_level": lvl_r,
+                    "pool_idx": sw["pool_idx"],
+                    "pool_time": sw["pool_time"],
+                    "sweep_extreme": sw["sweep_extreme"],
+                    "pool_line": {
+                        "level": lvl_r,
+                        "start_time": sw["pool_time"],
+                        "end_time": int(dates[-1]),
+                        "type": f"🦈 SHARKFIN SWEPT ✅ ({lvl_r:.{decimals}f})",
+                        "color": "rgba(192, 132, 252, 0.95)",
+                        "is_anchor": False,
+                        "is_struct": True,
+                        "is_choch": False,
+                    },
+                    "recent_sweeps": recent_sweeps,
+                }
+
+    # 2. Otherwise, show the nearest UNSWEPT liquidity pool ("Bait") waiting to be hunted!
+    if unswept_pools:
+        if is_bullish:
+            below_price = [p for p in unswept_pools if p["level"] <= current_price + (0.25 * atr)]
+            chosen = max(below_price, key=lambda x: x["level"]) if below_price else unswept_pools[-1]
+        else:
+            above_price = [p for p in unswept_pools if p["level"] >= current_price - (0.25 * atr)]
+            chosen = min(above_price, key=lambda x: x["level"]) if above_price else unswept_pools[-1]
+
+        lvl_r = chosen["level"]
+        return {
+            "has_pool": True,
+            "swept": False,
+            "pool_type": chosen["pool_type"],
+            "pool_level": lvl_r,
+            "pool_idx": chosen["idx"],
+            "pool_time": chosen["time"],
+            "sweep_extreme": lvl_r,
+            "pool_line": {
+                "level": lvl_r,
+                "start_time": chosen["time"],
+                "end_time": int(dates[-1]),
+                "type": f"$$$ {chosen['pool_type']} ({lvl_r:.{decimals}f})",
+                "color": "rgba(192, 132, 252, 0.92)",
+                "is_anchor": False,
+                "is_struct": True,
+                "is_choch": False,
+            },
+            "recent_sweeps": recent_sweeps,
+        }
+
+    return empty_res
 
 
 def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
-                            is_bullish: bool, poi_ref: float, current_price: float,
+                            is_bullish: bool, ref_entry: float, current_price: float,
                             anchor_idx: int, atr: float, decimals: int) -> List[Dict]:
     highs = df['High'].values
     lows = df['Low'].values
@@ -769,13 +716,13 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
     anchor_idx = int(np.clip(anchor_idx, 0, total - 1))
     anchor_time = int(dates[anchor_idx])
 
-    min_dist_from_poi = 1.25 * atr
+    min_dist_from_entry = 1.25 * atr
     max_sensible_dist = 4.20 * atr
 
     if is_bullish:
         leg_high = float(max(highs[anchor_idx:].max(), current_price))
-        min_t1_floor = max(poi_ref + min_dist_from_poi, leg_high)
-        max_t1_cap = max(leg_high + 0.35 * atr, poi_ref + max_sensible_dist)
+        min_t1_floor = max(ref_entry + min_dist_from_entry, leg_high)
+        max_t1_cap = max(leg_high + 0.35 * atr, ref_entry + max_sensible_dist)
 
         candidate_indices = set(int(i) for i in raw_highs if 0 <= int(i) < total)
         if anchor_idx < total:
@@ -822,8 +769,8 @@ def find_structural_targets(df: pd.DataFrame, raw_highs, raw_lows,
 
     else:
         leg_low = float(min(lows[anchor_idx:].min(), current_price))
-        max_t1_ceil = min(poi_ref - min_dist_from_poi, leg_low)
-        min_t1_cap = min(leg_low - 0.35 * atr, poi_ref - max_sensible_dist)
+        max_t1_ceil = min(ref_entry - min_dist_from_entry, leg_low)
+        min_t1_cap = min(leg_low - 0.35 * atr, ref_entry - max_sensible_dist)
 
         candidate_indices = set(int(i) for i in raw_lows if 0 <= int(i) < total)
         if anchor_idx < total:
@@ -880,6 +827,7 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
     total = len(closes)
     decimals = profile.get('decimals', 5)
+    pip_size = profile.get('pip_size', 0.0001)
 
     atr = calculate_atr(df, 14)
     if atr == 0:
@@ -1001,11 +949,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         fresh_anchor_time = int(dates[fresh_anchor_idx])
         fresh_anchor_price = float(lows[fresh_anchor_idx]) if is_bullish else float(highs[fresh_anchor_idx])
 
-    # SMART MACRO vs. ACTIVE REVERSAL ALIGNMENT (v11.4):
-    # Checks the last lower high before `macro_min_idx` (or last higher low before `macro_max_idx`).
-    # If price has ONLY made a tiny bounce (< last lower high), keep the macro trend.
-    # But once price breaks the last lower high (`CHoCH ▲` + `BOS ▲`, like USD/JPY and USD/CHF this week!),
-    # respect the new Bullish cycle anchored at `macro_min_idx`!
     macro_lookback = max(0, total - 260)
     macro_max_idx = macro_lookback + int(np.argmax(highs[macro_lookback:]))
     macro_min_idx = macro_lookback + int(np.argmin(lows[macro_lookback:]))
@@ -1020,7 +963,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 if macro_max_idx + 3 <= int(i) <= macro_min_idx - 2
                 and (highs[int(i)] - macro_low_val) >= (1.5 * atr)
             ]
-            # Use the LAST Lower High before the bottom (`inter_highs[-1]`), NOT `max(inter_highs)`!
             reversal_ceiling = float(highs[inter_highs[-1]]) if inter_highs else (macro_low_val + 0.38 * macro_span)
             post_low_max_close = float(np.max(closes[macro_min_idx:]))
             if post_low_max_close <= reversal_ceiling + (0.10 * atr):
@@ -1052,7 +994,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 fresh_anchor_time = int(dates[macro_max_idx])
                 fresh_anchor_price = macro_high_val
 
-    # Snap to the true extreme wick if the anchor landed on a secondary shoulder
     if is_bullish:
         shoulder_win = max(0, fresh_anchor_idx - 65)
         true_leg_min_idx = shoulder_win + int(np.argmin(lows[shoulder_win : fresh_anchor_idx + 1]))
@@ -1145,20 +1086,19 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         })
 
     live_ref = current_price if current_price > 0 else float(closes[-1])
-    poi_info = find_or_lock_unmitigated_poi(
-        df, is_bullish, int(anchor_idx), anchor_time, struct_events, live_ref, atr, decimals, state_key=state_key
+
+    # Run Sharkfin Stop-Hunt Detector (NO POI BOXES!)
+    sharkfin_data = detect_sharkfin_stophunt(
+        df, is_bullish, int(anchor_idx), struct_events, live_ref, atr, decimals, pip_size
     )
-    zone_boxes = [poi_info["box"]] if poi_info else []
-    poi_level = poi_info["poi_level"] if poi_info else anchor_price
+    if sharkfin_data.get("pool_line"):
+        all_lines.append(sharkfin_data["pool_line"])
 
-    liq_data = find_pullback_liquidity(df, is_bullish, poi_info, atr, decimals)
-    if liq_data.get("liq_line"):
-        all_lines.append(liq_data["liq_line"])
-
-    targets = find_structural_targets(df, raw_highs, raw_lows, is_bullish, poi_level, live_ref, int(anchor_idx), atr, decimals)
+    pool_level = sharkfin_data.get("pool_level") or round(anchor_price, decimals)
+    targets = find_structural_targets(df, raw_highs, raw_lows, is_bullish, pool_level, live_ref, int(anchor_idx), atr, decimals)
 
     projection_path = []
-    if poi_info is not None and len(targets) >= 1:
+    if sharkfin_data.get("has_pool") and len(targets) >= 1:
         target_line_color = "rgba(255, 193, 7, 0.95)"
         t = targets[0]
         all_lines.append({
@@ -1171,11 +1111,11 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             "is_struct": False,
         })
 
-        if poi_info.get("status") == "UNTOUCHED":
+        if not sharkfin_data.get("swept"):
             step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
             projection_path = [
                 {"time": int(dates[-1]), "price": round(live_ref, decimals), "label": "Now"},
-                {"time": int(dates[-1] + step_seconds * 4), "price": round(poi_level, decimals), "label": "POI Entry Zone"},
+                {"time": int(dates[-1] + step_seconds * 4), "price": round(pool_level, decimals), "label": "Stop-Hunt Zone"},
                 {"time": int(dates[-1] + step_seconds * 12), "price": t["level"], "label": t["label"]},
             ]
 
@@ -1208,10 +1148,9 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
         "raw_highs": raw_highs.tolist(),
         "raw_lows": raw_lows.tolist(),
         "trendline": None,
-        "poi_info": poi_info,
-        "liq_data": liq_data,
-        "zone_boxes": zone_boxes,
-        "poi_level": round(poi_level, decimals),
+        "sharkfin_data": sharkfin_data,
+        "zone_boxes": [],  # POI boxes removed as requested!
+        "poi_level": round(pool_level, decimals),
         "targets": targets,
         "projection_path": projection_path,
     }
@@ -1228,29 +1167,22 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     atr = ms["atr"]
     break_kind = ms["break_kind"]
     break_level = ms["break_level"]
-    poi_info = ms.get("poi_info")
-    liq_data = ms.get("liq_data", {})
-    zone_boxes = ms["zone_boxes"]
+    sharkfin_data = ms.get("sharkfin_data", {})
     targets = ms["targets"]
 
-    opens = df['Open'].values
     closes = df['Close'].values
     highs = df['High'].values
     lows = df['Low'].values
     dates = df['Date'].values if 'Date' in df.columns else df.index.values
     total = len(closes)
 
-    has_poi = poi_info is not None and len(zone_boxes) > 0
-    poi_level = poi_info["poi_level"] if has_poi else anchor_price
-    ob_range = poi_info["ob_range"] if has_poi else None
-    fvg_range = poi_info["fvg_range"] if has_poi else None
+    has_pool = bool(sharkfin_data.get("has_pool", False))
+    pool_swept = bool(sharkfin_data.get("swept", False))
+    pool_type = sharkfin_data.get("pool_type", "Stop-Hunt Pool")
+    pool_level = sharkfin_data.get("pool_level")
+    recent_sweeps = sharkfin_data.get("recent_sweeps", [])
 
     tp_level = targets[0]["level"] if len(targets) >= 1 else None
-
-    has_liquidity = bool(liq_data.get("has_liquidity", False))
-    liq_swept = bool(liq_data.get("swept", False))
-    liq_type = liq_data.get("liq_type", "Inducement (IDM)")
-    liq_level = liq_data.get("liq_level")
 
     dir_word = "BULLISH (BUY BIAS)" if is_bullish else "BEARISH (SELL BIAS)"
     peak_word = "Peak Low (W)" if is_bullish else "Peak High (M)"
@@ -1292,188 +1224,129 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             if lt.get("signal_time"):
                 CLOSED_SIGNALS[state_key].add(int(lt["signal_time"]))
             del ACTIVE_TRADES[state_key]
-            if state_key in POI_STATE:
-                del POI_STATE[state_key]
 
     locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
 
-    # 2. Scan post-departure candles (`depart_idx + 2` to `total - 1`) for 1H rejection inside POI
-    if locked_trade is None and has_poi and peak_confirmed:
-        active_ob = zone_boxes[0]
-        depart_idx = int(poi_info.get("depart_idx", anchor_idx + 2))
-        if total > depart_idx + 2:
-            search_start = max(depart_idx + 2, total - 35)
-            for k in range(search_start, total):
-                sig_ts = int(dates[k])
-                if state_key and sig_ts in CLOSED_SIGNALS.get(state_key, set()):
+    # 2. Scan recent Sharkfin Stop-Hunt sweeps (`recent_sweeps`) for an active unclosed trade
+    if locked_trade is None and peak_confirmed and recent_sweeps:
+        for sw in recent_sweeps:
+            k = sw["signal_idx"]
+            sig_ts = sw["signal_time"]
+            if (total - 1 - k) > 30:
+                continue
+            if state_key and sig_ts in CLOSED_SIGNALS.get(state_key, set()):
+                continue
+
+            entry_k = sw["entry_close"]
+            sweep_ext = sw["sweep_extreme"]
+
+            if is_bullish:
+                init_sl_k = round(min(sweep_ext - 0.20 * atr, entry_k - 0.35 * atr), decimals)
+                risk_k = max(abs(entry_k - init_sl_k), 1e-6)
+
+                t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, entry_k, anchor_idx, atr, decimals)
+                if not t_list:
+                    continue
+                tp_k = t_list[0]["level"]
+                tp_dist_k = abs(tp_k - entry_k)
+                rr_k = round(tp_dist_k / risk_k, 2)
+                if rr_k < MIN_ALLOWED_RR:
                     continue
 
-                c_open = float(opens[k])
-                c_close = float(closes[k])
-                c_high = float(highs[k])
-                c_low = float(lows[k])
-                p_high = float(highs[k - 1])
-                p_low = float(lows[k - 1])
+                be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
+                be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
+                curr_sl_k = init_sl_k
+                be_active_k = False
+                trade_closed = False
 
-                body_sz = abs(c_close - c_open)
-                u_wick = c_high - max(c_open, c_close)
-                l_wick = min(c_open, c_close) - c_low
+                sim_highs = list(highs[k + 1:]) + [max(float(full_df['High'].iloc[-1]), current_price)]
+                sim_lows = list(lows[k + 1:]) + [min(float(full_df['Low'].iloc[-1]), current_price)]
 
-                if is_bullish:
-                    touched_ob = (min(c_low, p_low) <= active_ob["top"] + 0.04 * atr) and (c_close >= active_ob["bottom"])
-                    if not touched_ob:
-                        continue
+                for s_hi, s_lo in zip(sim_highs, sim_lows):
+                    if float(s_lo) <= curr_sl_k or float(s_hi) >= tp_k:
+                        trade_closed = True
+                        break
+                    if (not be_active_k) and (float(s_hi) - entry_k) >= be_trigger_k:
+                        curr_sl_k = round(entry_k + be_cushion_k, decimals)
+                        be_active_k = True
 
-                    is_bull_rej = (
-                        ((c_close > c_open) and (body_sz >= 0.06 * atr))
-                        or (l_wick >= 0.12 * atr and c_close >= c_low + 0.45 * max(c_high - c_low, 1e-9))
-                    )
-                    not_chasing = (c_close - active_ob["top"]) <= (0.80 * atr)
-                    if not (is_bull_rej and not_chasing):
-                        continue
-
-                    entry_k = round(c_close, decimals)
-                    swing_floor = min(c_low, p_low)
-                    ob_span = active_ob["top"] - active_ob["bottom"]
-                    if ob_span > (1.20 * atr):
-                        floor_k = max(active_ob["bottom"], swing_floor - 0.10 * atr)
-                    else:
-                        floor_k = min(active_ob["bottom"], swing_floor)
-
-                    init_sl_k = round(min(floor_k - 0.22 * atr, entry_k - 0.35 * atr), decimals)
-                    risk_k = max(abs(entry_k - init_sl_k), 1e-6)
-
-                    t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], True, entry_k, entry_k, anchor_idx, atr, decimals)
-                    if not t_list:
-                        continue
-                    tp_k = t_list[0]["level"]
-                    tp_dist_k = abs(tp_k - entry_k)
-                    rr_k = round(tp_dist_k / risk_k, 2)
-                    if rr_k < MIN_ALLOWED_RR:
-                        continue
-
-                    be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
-                    be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
-                    curr_sl_k = init_sl_k
-                    be_active_k = False
-                    trade_closed = False
-
-                    sim_highs = list(highs[k + 1:]) + [max(float(full_df['High'].iloc[-1]), current_price)]
-                    sim_lows = list(lows[k + 1:]) + [min(float(full_df['Low'].iloc[-1]), current_price)]
-
-                    for s_hi, s_lo in zip(sim_highs, sim_lows):
-                        if float(s_lo) <= curr_sl_k or float(s_hi) >= tp_k:
-                            trade_closed = True
-                            break
-                        if (not be_active_k) and (float(s_hi) - entry_k) >= be_trigger_k:
-                            curr_sl_k = round(entry_k + be_cushion_k, decimals)
-                            be_active_k = True
-
-                    if trade_closed:
-                        if state_key:
-                            CLOSED_SIGNALS[state_key].add(sig_ts)
-                        continue
-
-                    poi_snap = dict(poi_info)
-                    poi_snap["box"] = dict(active_ob)
-                    poi_snap["box"]["label"] = f"ACTIVE BUY POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
-
-                    locked_trade = {
-                        "is_bullish": True,
-                        "signal": "BUY",
-                        "signal_idx": k,
-                        "signal_time": sig_ts,
-                        "entry": entry_k,
-                        "initial_sl": init_sl_k,
-                        "stop_loss": curr_sl_k,
-                        "breakeven_active": be_active_k,
-                        "target_1": tp_k,
-                        "risk_reward": rr_k,
-                        "ob_range": ob_range,
-                        "fvg_range": fvg_range,
-                        "poi_snapshot": poi_snap,
-                    }
+                if trade_closed:
                     if state_key:
-                        ACTIVE_TRADES[state_key] = locked_trade
-                    break
+                        CLOSED_SIGNALS[state_key].add(sig_ts)
+                    continue
 
-                else:
-                    touched_ob = (max(c_high, p_high) >= active_ob["bottom"] - 0.04 * atr) and (c_close <= active_ob["top"])
-                    if not touched_ob:
-                        continue
+                locked_trade = {
+                    "is_bullish": True,
+                    "signal": "BUY",
+                    "signal_idx": k,
+                    "signal_time": sig_ts,
+                    "entry": entry_k,
+                    "initial_sl": init_sl_k,
+                    "stop_loss": curr_sl_k,
+                    "breakeven_active": be_active_k,
+                    "target_1": tp_k,
+                    "risk_reward": rr_k,
+                    "pool_level": sw["pool_level"],
+                    "pool_type": sw["pool_type"],
+                    "pattern": sw["pattern"],
+                }
+                if state_key:
+                    ACTIVE_TRADES[state_key] = locked_trade
+                break
 
-                    is_bear_rej = (
-                        ((c_close < c_open) and (body_sz >= 0.06 * atr))
-                        or (u_wick >= 0.12 * atr and c_close <= c_high - 0.45 * max(c_high - c_low, 1e-9))
-                    )
-                    not_chasing = (active_ob["bottom"] - c_close) <= (0.80 * atr)
-                    if not (is_bear_rej and not_chasing):
-                        continue
+            else:
+                init_sl_k = round(max(sweep_ext + 0.20 * atr, entry_k + 0.35 * atr), decimals)
+                risk_k = max(abs(init_sl_k - entry_k), 1e-6)
 
-                    entry_k = round(c_close, decimals)
-                    swing_ceil = max(c_high, p_high)
-                    ob_span = active_ob["top"] - active_ob["bottom"]
-                    if ob_span > (1.20 * atr):
-                        ceil_k = min(active_ob["top"], swing_ceil + 0.10 * atr)
-                    else:
-                        ceil_k = max(active_ob["top"], swing_ceil)
+                t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, entry_k, anchor_idx, atr, decimals)
+                if not t_list:
+                    continue
+                tp_k = t_list[0]["level"]
+                tp_dist_k = abs(entry_k - tp_k)
+                rr_k = round(tp_dist_k / risk_k, 2)
+                if rr_k < MIN_ALLOWED_RR:
+                    continue
 
-                    init_sl_k = round(max(ceil_k + 0.22 * atr, entry_k + 0.35 * atr), decimals)
-                    risk_k = max(abs(init_sl_k - entry_k), 1e-6)
+                be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
+                be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
+                curr_sl_k = init_sl_k
+                be_active_k = False
+                trade_closed = False
 
-                    t_list = find_structural_targets(df.iloc[:k + 1], ms["raw_highs"], ms["raw_lows"], False, entry_k, entry_k, anchor_idx, atr, decimals)
-                    if not t_list:
-                        continue
-                    tp_k = t_list[0]["level"]
-                    tp_dist_k = abs(entry_k - tp_k)
-                    rr_k = round(tp_dist_k / risk_k, 2)
-                    if rr_k < MIN_ALLOWED_RR:
-                        continue
+                sim_highs = list(highs[k + 1:]) + [max(float(full_df['High'].iloc[-1]), current_price)]
+                sim_lows = list(lows[k + 1:]) + [min(float(full_df['Low'].iloc[-1]), current_price)]
 
-                    be_trigger_k = max(risk_k * 1.25, 0.65 * tp_dist_k)
-                    be_cushion_k = round(max(min_be_buf, 0.25 * risk_k), decimals)
-                    curr_sl_k = init_sl_k
-                    be_active_k = False
-                    trade_closed = False
+                for s_hi, s_lo in zip(sim_highs, sim_lows):
+                    if float(s_hi) >= curr_sl_k or float(s_lo) <= tp_k:
+                        trade_closed = True
+                        break
+                    if (not be_active_k) and (entry_k - float(s_lo)) >= be_trigger_k:
+                        curr_sl_k = round(entry_k - be_cushion_k, decimals)
+                        be_active_k = True
 
-                    sim_highs = list(highs[k + 1:]) + [max(float(full_df['High'].iloc[-1]), current_price)]
-                    sim_lows = list(lows[k + 1:]) + [min(float(full_df['Low'].iloc[-1]), current_price)]
-
-                    for s_hi, s_lo in zip(sim_highs, sim_lows):
-                        if float(s_hi) >= curr_sl_k or float(s_lo) <= tp_k:
-                            trade_closed = True
-                            break
-                        if (not be_active_k) and (entry_k - float(s_lo)) >= be_trigger_k:
-                            curr_sl_k = round(entry_k - be_cushion_k, decimals)
-                            be_active_k = True
-
-                    if trade_closed:
-                        if state_key:
-                            CLOSED_SIGNALS[state_key].add(sig_ts)
-                        continue
-
-                    poi_snap = dict(poi_info)
-                    poi_snap["box"] = dict(active_ob)
-                    poi_snap["box"]["label"] = f"ACTIVE SELL POI ({active_ob['bottom']:.{decimals}f}–{active_ob['top']:.{decimals}f})"
-
-                    locked_trade = {
-                        "is_bullish": False,
-                        "signal": "SELL",
-                        "signal_idx": k,
-                        "signal_time": sig_ts,
-                        "entry": entry_k,
-                        "initial_sl": init_sl_k,
-                        "stop_loss": curr_sl_k,
-                        "breakeven_active": be_active_k,
-                        "target_1": tp_k,
-                        "risk_reward": rr_k,
-                        "ob_range": ob_range,
-                        "fvg_range": fvg_range,
-                        "poi_snapshot": poi_snap,
-                    }
+                if trade_closed:
                     if state_key:
-                        ACTIVE_TRADES[state_key] = locked_trade
-                    break
+                        CLOSED_SIGNALS[state_key].add(sig_ts)
+                    continue
+
+                locked_trade = {
+                    "is_bullish": False,
+                    "signal": "SELL",
+                    "signal_idx": k,
+                    "signal_time": sig_ts,
+                    "entry": entry_k,
+                    "initial_sl": init_sl_k,
+                    "stop_loss": curr_sl_k,
+                    "breakeven_active": be_active_k,
+                    "target_1": tp_k,
+                    "risk_reward": rr_k,
+                    "pool_level": sw["pool_level"],
+                    "pool_type": sw["pool_type"],
+                    "pattern": sw["pattern"],
+                }
+                if state_key:
+                    ACTIVE_TRADES[state_key] = locked_trade
+                break
 
     if locked_trade:
         f_entry = locked_trade["entry"]
@@ -1483,13 +1356,8 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         f_tp = locked_trade["target_1"]
         f_rr = locked_trade["risk_reward"]
         f_dir = locked_trade["signal"]
-        l_ob = locked_trade.get("ob_range") or f"{f_entry:.{decimals}f}"
-        l_fvg = locked_trade.get("fvg_range") or "Confirmed"
-
-        if locked_trade.get("poi_snapshot") and locked_trade["poi_snapshot"].get("box"):
-            active_box = dict(locked_trade["poi_snapshot"]["box"])
-            active_box["end_time"] = int(full_df['Date'].iloc[-1]) if 'Date' in full_df.columns else int(dates[-1])
-            ms["zone_boxes"] = [active_box]
+        f_pool_lvl = locked_trade.get("pool_level", f_entry)
+        f_pat = locked_trade.get("pattern", "Sharkfin Stop Hunt")
 
         step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
         now_ts = int(full_df['Date'].iloc[-1]) if 'Date' in full_df.columns else int(dates[-1])
@@ -1503,23 +1371,23 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
         sl_status_txt = f"SL @ BE ({f_sl:.{decimals}f}) 🛡️" if f_be else f"Entered @ {f_entry:.{decimals}f} ✅"
         checklist = [
-            {"step": f"1. Market Structure ({peak_word} & {break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "2. Point of Interest (Origin OB)", "done": True, "detail": f"{l_ob} ✅"},
-            {"step": "3. Fair Value Gap (FVG)", "done": True, "detail": f"{l_fvg} ✅"},
-            {"step": f"4. Liquidity & 1H Close (RR 1:{f_rr})", "done": True, "detail": sl_status_txt},
+            {"step": f"1. Peak Anchor ({peak_word})", "done": True, "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+            {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+            {"step": "3. Sharkfin Stop Hunt (Liquidity Sweep)", "done": True, "detail": f"Swept {f_pool_lvl:.{decimals}f} 🦈✅"},
+            {"step": f"4. Snap-Back Close (RR 1:{f_rr})", "done": True, "detail": sl_status_txt},
         ]
 
-        active_conf = 84 + (4 if has_liquidity else 0) + (4 if htf_aligned else 0) + (2 if f_be else 0)
+        active_conf = 86 + (4 if htf_aligned else 0) + (2 if f_be else 0)
         sl_label = f"SL (BE 🛡️): {f_sl:.{decimals}f}" if f_be else f"SL: {f_sl:.{decimals}f}"
         trigger_note = (
-            f"{'🟢 BUY' if is_bullish else '🔴 SELL'} EXECUTING: Locked Entry @ {f_entry:.{decimals}f} | "
+            f"{'🟢 BUY' if is_bullish else '🔴 SELL'} EXECUTING ({f_pat}): Locked Entry @ {f_entry:.{decimals}f} | "
             f"TP: {f_tp:.{decimals}f} | {sl_label}"
         )
 
         return {
             "signal": f_dir,
             "confidence": min(96, active_conf),
-            "setup_name": f"SMC A+ {f_dir} Active" + (" (Risk-Free BE 🛡️)" if f_be else ""),
+            "setup_name": f"Sharkfin {f_dir} Active" + (" (Risk-Free BE 🛡️)" if f_be else ""),
             "checklist": checklist,
             "execution_plan": {
                 "stage": "TRADE_ACTIVE",
@@ -1545,28 +1413,28 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             }
         }
 
-    if not has_poi:
+    if not has_pool or pool_level is None:
         checklist = [
-            {"step": f"1. Market Structure ({peak_word} & {break_kind} {arrow})", "done": bool(peak_confirmed), "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "2. Point of Interest (Origin OB)", "done": False, "detail": "Waiting for Unmitigated OB"},
-            {"step": "3. Fair Value Gap (FVG)", "done": False, "detail": "Waiting for BOS Impulse"},
-            {"step": "4. Liquidity & 1H Confirmation", "done": False, "detail": "Wait for POI First"},
+            {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+            {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+            {"step": "3. Sharkfin Stop Hunt (Liquidity Pool)", "done": False, "detail": "Waiting for Pullback Swing"},
+            {"step": "4. 1H Snap-Back Close", "done": False, "detail": "Await Stop-Hunt Pool"},
         ]
         note = (
-            f"⏳ NO UNMITIGATED POI YET: {dir_word} confirmed via {break_kind} {arrow} ({break_level:.{decimals}f}), "
-            f"but prior Order Blocks have already been mitigated. Waiting for a new BOS."
+            f"⏳ FORMING LIQUIDITY BAIT: {dir_word} anchored at {peak_word} ({anchor_price:.{decimals}f}). "
+            f"Waiting for an internal pullback swing to form the next Stop-Hunt liquidity pool."
         )
         return {
             "signal": "WAIT",
-            "confidence": 48,
-            "setup_name": "Waiting for Unmitigated POI",
+            "confidence": 52,
+            "setup_name": "Waiting for Stop-Hunt Pool",
             "checklist": checklist,
             "execution_plan": {
                 "stage": "AWAITING_PULLBACK",
                 "trigger_condition": note,
                 "planned_entry": None,
                 "planned_sl": None,
-                "planned_tp1": None,
+                "planned_tp1": round(tp_level, decimals) if tp_level else None,
                 "planned_tp2": None,
                 "risk_reward": "—",
             },
@@ -1574,56 +1442,40 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             "trade_levels": None,
         }
 
-    active_ob = zone_boxes[0]
-    poi_status = poi_info.get("status", "UNTOUCHED")
-    has_fvg_flag = bool(poi_info.get("has_fvg", False))
-    live_open = float(full_df['Open'].iloc[-1])
+    # Waiting for price to sweep `pool_level` and close back inside (Sharkfin)
+    live_high = max(float(full_df['High'].iloc[-1]), current_price)
+    live_low = min(float(full_df['Low'].iloc[-1]), current_price)
 
     if is_bullish:
-        in_zone_now = (poi_status == "TAPPED_ACTIVE")
-        ob_span = active_ob["top"] - active_ob["bottom"]
-        eff_floor = (active_ob["top"] - 0.85 * atr) if ob_span > (1.20 * atr) else active_ob["bottom"]
-        planned_sl = round(min(eff_floor, poi_level) - (0.22 * atr), decimals)
-        risk = max(abs(poi_level - planned_sl), 1e-6)
-        best_rr = round(abs(tp_level - poi_level) / risk, 2) if tp_level else 2.5
-
-        step4_detail = (
-            "Watch 1H Close!" if in_zone_now
-            else f"{liq_type} {'SWEPT ✅' if liq_swept else f'@ {liq_level:.{decimals}f}'}" if has_liquidity
-            else f"Wait for {poi_level:.{decimals}f} (1:{best_rr})"
-        )
+        sweeping_now = (live_low <= pool_level) and (live_low > anchor_price)
+        planned_sl = round(pool_level - (0.38 * atr), decimals)
+        risk = max(abs(pool_level - planned_sl), 1e-6)
+        best_rr = round(abs(tp_level - pool_level) / risk, 2) if tp_level else 2.4
+        pips_away = round(abs(current_price - pool_level) / max(pip_size, 1e-6), 1)
 
         checklist = [
-            {"step": f"1. Market Structure ({peak_word} & {break_kind} {arrow})", "done": bool(peak_confirmed), "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "2. Point of Interest (Origin OB)", "done": True, "detail": f"{ob_range} {'🎯' if in_zone_now else '🔒'}"},
-            {"step": "3. Fair Value Gap (FVG)", "done": True, "detail": f"{fvg_range} {'✅' if has_fvg_flag else '⚡'}"},
-            {"step": f"4. Liquidity & 1H Close (RR 1:{best_rr})", "done": False, "detail": step4_detail},
+            {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+            {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+            {"step": f"3. Stop-Hunt Pool ({pool_type})", "done": True, "detail": f"Bait @ {pool_level:.{decimals}f} {'🦈' if sweeping_now else '🎯'}"},
+            {"step": f"4. 1H Sharkfin Close (RR 1:{best_rr})", "done": False, "detail": "Close ABOVE Pool!" if sweeping_now else f"{pips_away}p above Pool"},
         ]
 
-        if in_zone_now:
+        if sweeping_now:
             stage = "IN_ZONE_CONFIRMING"
-            trig_lvl = round(max(live_open, active_ob["bottom"]), decimals)
-            note = f"🎯 PRICE TAPPED BUY POI ({ob_range})! Wait for 1H candle to close GREEN above {trig_lvl:.{decimals}f} to lock BUY."
+            note = f"🦈 SHARKFIN IN PROGRESS! Price is sweeping below {pool_type} ({pool_level:.{decimals}f}). Wait for 1H candle to snap back and close ABOVE {pool_level:.{decimals}f} to trigger BUY!"
         else:
             stage = "AWAITING_PULLBACK"
-            pips_away = round(abs(current_price - poi_level) / max(pip_size, 1e-6), 1)
-            liq_hint = (
-                f" {liq_type} ({liq_level:.{decimals}f}) SWEPT ✅ — heading to Buy POI!"
-                if (has_liquidity and liq_swept)
-                else f" {liq_type} sitting @ {liq_level:.{decimals}f} above POI."
-                if has_liquidity else ""
-            )
-            note = f"🔒 UNMITIGATED BUY POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips above Buy POI.{liq_hint}"
+            note = f"🎯 BUY STOP-HUNT BAIT LOCKED ({pool_level:.{decimals}f}): Price is {pips_away} pips above {pool_type}. Waiting for a Sharkfin sweep below {pool_level:.{decimals}f} + snap-back close."
 
         return {
             "signal": "WAIT",
-            "confidence": 68 if in_zone_now else (62 if (has_liquidity and liq_swept) else 56),
-            "setup_name": "SMC Bullish A+ — " + ("In Buy POI" if in_zone_now else "Locked Buy POI"),
+            "confidence": 72 if sweeping_now else 60,
+            "setup_name": "Sharkfin Bullish — " + ("Sweeping Now 🦈" if sweeping_now else "Stop-Hunt Bait Locked"),
             "checklist": checklist,
             "execution_plan": {
                 "stage": stage,
                 "trigger_condition": note,
-                "planned_entry": round(poi_level, decimals),
+                "planned_entry": round(pool_level, decimals),
                 "planned_sl": planned_sl,
                 "planned_tp1": round(tp_level, decimals) if tp_level else None,
                 "planned_tp2": None,
@@ -1634,50 +1486,35 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         }
 
     else:
-        in_zone_now = (poi_status == "TAPPED_ACTIVE")
-        ob_span = active_ob["top"] - active_ob["bottom"]
-        eff_ceil = (active_ob["bottom"] + 0.85 * atr) if ob_span > (1.20 * atr) else active_ob["top"]
-        planned_sl = round(max(eff_ceil, poi_level) + (0.22 * atr), decimals)
-        risk = max(abs(planned_sl - poi_level), 1e-6)
-        best_rr = round(abs(poi_level - tp_level) / risk, 2) if tp_level else 2.5
-
-        step4_detail = (
-            "Watch 1H Close!" if in_zone_now
-            else f"{liq_type} {'SWEPT ✅' if liq_swept else f'@ {liq_level:.{decimals}f}'}" if has_liquidity
-            else f"Wait for {poi_level:.{decimals}f} (1:{best_rr})"
-        )
+        sweeping_now = (live_high >= pool_level) and (live_high < anchor_price)
+        planned_sl = round(pool_level + (0.38 * atr), decimals)
+        risk = max(abs(planned_sl - pool_level), 1e-6)
+        best_rr = round(abs(pool_level - tp_level) / risk, 2) if tp_level else 2.4
+        pips_away = round(abs(pool_level - current_price) / max(pip_size, 1e-6), 1)
 
         checklist = [
-            {"step": f"1. Market Structure ({peak_word} & {break_kind} {arrow})", "done": bool(peak_confirmed), "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "2. Point of Interest (Origin OB)", "done": True, "detail": f"{ob_range} {'🎯' if in_zone_now else '🔒'}"},
-            {"step": "3. Fair Value Gap (FVG)", "done": True, "detail": f"{fvg_range} {'✅' if has_fvg_flag else '⚡'}"},
-            {"step": f"4. Liquidity & 1H Close (RR 1:{best_rr})", "done": False, "detail": step4_detail},
+            {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+            {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+            {"step": f"3. Stop-Hunt Pool ({pool_type})", "done": True, "detail": f"Bait @ {pool_level:.{decimals}f} {'🦈' if sweeping_now else '🎯'}"},
+            {"step": f"4. 1H Sharkfin Close (RR 1:{best_rr})", "done": False, "detail": "Close BELOW Pool!" if sweeping_now else f"{pips_away}p below Pool"},
         ]
 
-        if in_zone_now:
+        if sweeping_now:
             stage = "IN_ZONE_CONFIRMING"
-            trig_lvl = round(min(live_open, active_ob["top"]), decimals)
-            note = f"🎯 PRICE TAPPED SELL POI ({ob_range})! Wait for 1H candle to close RED below {trig_lvl:.{decimals}f} to lock SELL."
+            note = f"🦈 SHARKFIN IN PROGRESS! Price is sweeping above {pool_type} ({pool_level:.{decimals}f}). Wait for 1H candle to snap back and close BELOW {pool_level:.{decimals}f} to trigger SELL!"
         else:
             stage = "AWAITING_PULLBACK"
-            pips_away = round(abs(poi_level - current_price) / max(pip_size, 1e-6), 1)
-            liq_hint = (
-                f" {liq_type} ({liq_level:.{decimals}f}) SWEPT ✅ — rallying toward Sell POI!"
-                if (has_liquidity and liq_swept)
-                else f" {liq_type} sitting @ {liq_level:.{decimals}f} below POI."
-                if has_liquidity else ""
-            )
-            note = f"🔒 UNMITIGATED SELL POI ({ob_range}) | FVG ({fvg_range}): Price is {pips_away} pips below Sell POI.{liq_hint}"
+            note = f"🎯 SELL STOP-HUNT BAIT LOCKED ({pool_level:.{decimals}f}): Price is {pips_away} pips below {pool_type}. Waiting for a Sharkfin sweep above {pool_level:.{decimals}f} + snap-back close."
 
         return {
             "signal": "WAIT",
-            "confidence": 68 if in_zone_now else (62 if (has_liquidity and liq_swept) else 56),
-            "setup_name": "SMC Bearish A+ — " + ("In Sell POI" if in_zone_now else "Locked Sell POI"),
+            "confidence": 72 if sweeping_now else 60,
+            "setup_name": "Sharkfin Bearish — " + ("Sweeping Now 🦈" if sweeping_now else "Stop-Hunt Bait Locked"),
             "checklist": checklist,
             "execution_plan": {
                 "stage": stage,
                 "trigger_condition": note,
-                "planned_entry": round(poi_level, decimals),
+                "planned_entry": round(pool_level, decimals),
                 "planned_sl": planned_sl,
                 "planned_tp1": round(tp_level, decimals) if tp_level else None,
                 "planned_tp2": None,
@@ -1744,8 +1581,6 @@ async def analyze(req: AnalysisRequest):
             eval_df, df, ms, current_price, ema_50, ema_200, rsi, htf_aligned, decimals, pip_size, state_key=state_key
         )
 
-        zone_boxes = ms.get('zone_boxes', [])
-
         checklist = entry_eval.get("checklist", [])
         reasoning = [
             f"{'✅' if c['done'] else '⏳'} {c['step']} ({c['detail']})"
@@ -1753,10 +1588,10 @@ async def analyze(req: AnalysisRequest):
         ]
         reasoning.append(entry_eval["entry_note"])
 
-        has_valid_poi = len(zone_boxes) > 0 or (entry_eval["trade_levels"] is not None)
+        has_valid_pool = bool(ms.get("sharkfin_data", {}).get("has_pool")) or (entry_eval["trade_levels"] is not None)
         t1_out = (
             entry_eval["trade_levels"]["target_1"] if entry_eval["trade_levels"]
-            else (targets[0]["level"] if (has_valid_poi and len(targets) >= 1) else None)
+            else (targets[0]["level"] if (has_valid_pool and len(targets) >= 1) else None)
         )
 
         return {
@@ -1771,7 +1606,7 @@ async def analyze(req: AnalysisRequest):
             "keyLevels": {
                 "resistance": round(ms["anchor"], decimals) if not ms["is_bullish"] else round(ms["break_level"], decimals),
                 "support": round(ms["anchor"], decimals) if ms["is_bullish"] else round(ms["break_level"], decimals),
-                "poi": ms["poi_level"] if has_valid_poi else None,
+                "poi": ms["poi_level"] if has_valid_pool else None,
                 "target1": t1_out,
                 "target2": None,
                 "ema200": round(ema_200, decimals),
@@ -1781,8 +1616,8 @@ async def analyze(req: AnalysisRequest):
                 "bos_lines": lines,
                 "sweeps": [],
                 "trendline": None,
-                "order_blocks": zone_boxes,
-                "targets": targets if has_valid_poi else [],
+                "order_blocks": [],
+                "targets": targets if has_valid_pool else [],
                 "projection_path": ms["projection_path"],
             },
             "mtf_confluence": [
@@ -1813,13 +1648,12 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v11.4 — Active Reversal Cycle + Multi-Candidate Pre-Breakout POI + 65% TP Break-Even Engine",
+            "✅ ENGINE VERSION": "AuraBrain v12.0 — Peak Formation + CHoCH/BOS + Sharkfin Stop-Hunt Engine (No POI Boxes)",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],
             "📏 LINES": ms['lines'],
-            "🔒 LOCKED POI": ms.get('poi_info'),
-            "💧 LIQUIDITY": ms.get('liq_data'),
+            "🦈 SHARKFIN STOP HUNT": ms.get('sharkfin_data'),
             "🎯 TARGETS": ms.get('targets', []),
             "🔒 ACTIVE TRADES": ACTIVE_TRADES,
             "🚫 CLOSED SIGNALS": {k: list(v) for k, v in CLOSED_SIGNALS.items()},
