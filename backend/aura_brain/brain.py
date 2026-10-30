@@ -22,7 +22,7 @@ FLIP_BUFFER_ATR = 0.30
 FLIP_CONFIRM_BARS = 2
 ANCHOR_MIN_MOVE_ATR = 1.5
 SWING_PROMINENCE_ATR = 0.80
-MIN_ALLOWED_RR = 1.4
+MIN_ALLOWED_RR = 1.25
 
 # TDI (Traders Dynamic Index) Standard BTMM Parameters
 TDI_RSI_PERIOD = 13
@@ -195,98 +195,159 @@ def compute_tdi_arrays(df: pd.DataFrame) -> Dict[str, np.ndarray]:
     }
 
 
-def is_clean_single_peak_fin(green: np.ndarray, yellow: np.ndarray,
-                             upper: np.ndarray, lower: np.ndarray,
-                             apex_idx: int, is_bullish: bool) -> bool:
+def evaluate_sharkfin_lifecycle(green: np.ndarray, yellow: np.ndarray,
+                                upper: np.ndarray, lower: np.ndarray,
+                                apex_idx: int, is_bullish: bool) -> Optional[Dict]:
     """
-    CLEAN SINGLE-PEAK TRIANGLE SHARKFIN FILTER (v12.2):
-    - A real Sharkfin starts from the Yellow Middle Band (or inside the river),
-      rises/falls smoothly to ONE single sharp point (`apex_idx`) at or slightly outside
-      the Blue Volatility Band, and immediately hooks back inside on `apex_idx + 1`
-      (spanning ~3 to 7 candles total).
-    - Strictly rejects:
-      1. Multi-peak "M" or "W" formations near/outside the Blue Band.
-      2. Flat sideways dragging (> 2 bars spent outside the Blue Band).
+    TRUE BTMM SHARKFIN LIFECYCLE EVALUATOR (v12.3):
+    1. Only looks in the direction of the Peak:
+       - `is_bullish=True` (PFL): Only watches the Lower Blue Band for a sharp V-bottom (`v`).
+       - `is_bullish=False` (PFH): Only watches the Upper Blue Band for a sharp inverted-V (`^`).
+    2. Apex Geometry (`apex_idx`):
+       - Must reach the outer Blue Band OR the outer 28% of the river (`yellow -> band`) with a sharp V-turn
+         (catches XAU/USD Oct 29 and all 3 USD/JPY fins!).
+       - Must be the TRUE extreme of the local window (fixes USD/CHF early dot so only the true bottom V-fin is marked!).
+       - Must NOT be a multi-peak "M" or "W" outside the band.
+    3. Confirmation vs. Watching vs. Invalidated ("W/M" Exception Rule):
+       - Walks forward from `apex_idx + 1`:
+       - If Green reverses back beyond the Blue Band / `apex_idx` BEFORE crossing the Yellow Base Line,
+         it forms a "W" or "M" shape -> returns `None` (INVALIDATED!).
+       - When Green crosses and closes ABOVE `yellow` (for Buy) or BELOW `yellow` (for Sell),
+         returns `status="CONFIRMED"` at `confirm_idx`!
+       - If the chart is currently at the end (`total - 1`) and Green has hooked inside from `apex_idx`
+         and is heading toward `yellow` without violating the W/M rule yet, returns `status="WATCHING"`
+         (like GBP/USD and USD/CHF right now)!
     """
     n = len(green)
     if apex_idx < 3 or apex_idx >= n - 1:
-        return False
+        return None
 
     if is_bullish:
-        # 1. Must touch the inner edge of the Lower Blue Band or poke slightly below it
-        if green[apex_idx] > lower[apex_idx] + 1.8 and green[apex_idx] > 33.5:
-            return False
+        band_width = max(float(yellow[apex_idx] - lower[apex_idx]), 4.0)
+        river_edge = float(lower[apex_idx]) + 0.28 * band_width
 
-        # 2. Must be a strict single V-bottom turning point (`v`)
-        if not (green[apex_idx] < green[apex_idx - 1] - 0.6 and green[apex_idx + 1] > green[apex_idx] + 1.2):
-            return False
+        # 1. Must reach the Lower Blue Band or outer 28% river edge (and be below Yellow Base Line)
+        if green[apex_idx] > river_edge or green[apex_idx] >= yellow[apex_idx] - 3.5:
+            return None
 
-        # 3. Walk back up to 6 bars toward the Yellow Middle Band to verify a clean downward leg
-        #    with ZERO secondary troughs ("W" double-bottom lag) and at most 2 bars below the Blue Band
-        win_start = max(1, apex_idx - 5)
-        win_end = min(n - 2, apex_idx + 2)
+        # 2. Must be a sharp V-bottom (`v`): lower than previous bar and hooking up on next bar
+        if not (green[apex_idx] < green[apex_idx - 1] - 0.4 and green[apex_idx + 1] > green[apex_idx] + 0.8):
+            return None
 
-        outside_bars = 0
-        trough_count = 0
-        for idx in range(win_start, win_end + 1):
-            if green[idx] < lower[idx] - 0.2:
-                outside_bars += 1
-            # Count any local trough that is near the Lower Blue Band
-            if green[idx] <= green[idx - 1] + 0.15 and green[idx] <= green[idx + 1] + 0.15:
-                if green[idx] <= lower[idx] + 3.2:
-                    trough_count += 1
+        # 3. Must be the TRUE lowest point of the surrounding window (prevents USD/CHF early kink dots!)
+        nb_left = max(0, apex_idx - 3)
+        nb_right = min(n - 1, apex_idx + 3)
+        if float(green[apex_idx]) > float(np.min(green[nb_left : nb_right + 1])) + 1e-6:
+            return None
 
-        if outside_bars > 2 or trough_count > 1:
-            return False
+        # 4. Reject if it dragged outside the Lower Blue Band for > 3 bars or already formed a W-bottom before apex
+        outside_bars = sum(1 for i in range(max(0, apex_idx - 4), apex_idx + 2) if green[i] < lower[i] - 0.3)
+        if outside_bars > 3:
+            return None
 
-        # 4. Ensure the approach into `apex_idx` didn't stall flat or bounce up first (no W-lag)
-        if apex_idx >= 2 and green[apex_idx - 1] > green[apex_idx - 2] + 0.8 and green[apex_idx - 2] <= lower[apex_idx - 2] + 3.0:
-            return False
+        # 5. Meaningful drop from recent 6-bar high into the V-trough
+        recent_high = float(np.max(green[max(0, apex_idx - 6) : apex_idx]))
+        if (recent_high - float(green[apex_idx])) < 4.5:
+            return None
 
-        # 5. Total drop from the recent 5-bar high (near Yellow Middle Band) into the fin tip must be meaningful (>= 5 RSI pts)
-        launch_high = float(np.max(green[max(0, apex_idx - 5) : apex_idx]))
-        if (launch_high - float(green[apex_idx])) < 5.0:
-            return False
+        # 6. Trace forward from `apex_idx + 1` to check Yellow Base Line crossover vs. W-shape invalidation
+        for m in range(apex_idx + 1, n):
+            # W-SHAPE INVALIDATION RULE:
+            # If Green drops back below the Lower Blue Band (or makes a second trough after hooking up)
+            # BEFORE reaching the Yellow Base Line -> INVALIDATED!
+            if m > apex_idx + 1 and green[m] < green[m - 1] - 1.0 and green[m] < lower[m] + 1.0:
+                return None
+            if green[m] <= green[apex_idx] + 0.2:
+                return None
 
-        return True
+            # BASE LINE CONFIRMATION RULE:
+            # Confirmed ONLY when Green crosses/closes ABOVE the Yellow Market Base Line!
+            if green[m] > yellow[m] + 0.1:
+                return {
+                    "status": "CONFIRMED",
+                    "apex_idx": apex_idx,
+                    "confirm_idx": m,
+                    "tdi_val": round(float(green[apex_idx]), 1),
+                }
+
+            # Do not wait more than 9 bars for the base line crossover
+            if (m - apex_idx) > 9:
+                return None
+
+        # If we reached the live right edge of the chart (`n - 1`) within 6 bars of `apex_idx`
+        # and Green is rising toward the Yellow Base Line -> POTENTIAL STOP-HUNT (WATCHING)!
+        if (n - 1 - apex_idx) <= 6 and green[n - 1] > green[apex_idx] and green[n - 1] <= yellow[n - 1] + 0.1:
+            return {
+                "status": "WATCHING",
+                "apex_idx": apex_idx,
+                "confirm_idx": None,
+                "tdi_val": round(float(green[apex_idx]), 1),
+            }
+
+        return None
 
     else:
-        # Bearish Fin (`SELL` in a `PFH` trend):
-        # 1. Must touch the inner edge of the Upper Blue Band or poke slightly above it
-        if green[apex_idx] < upper[apex_idx] - 1.8 and green[apex_idx] < 66.5:
-            return False
+        # Bearish Trend (`PFH` -> Watch Upper Blue Band ONLY for SELL Stop-Hunts):
+        band_width = max(float(upper[apex_idx] - yellow[apex_idx]), 4.0)
+        river_edge = float(upper[apex_idx]) - 0.28 * band_width
 
-        # 2. Must be a strict single inverted-V turning point (`^`)
-        if not (green[apex_idx] > green[apex_idx - 1] + 0.6 and green[apex_idx + 1] < green[apex_idx] - 1.2):
-            return False
+        # 1. Must reach the Upper Blue Band or outer 28% river edge (and be above Yellow Base Line)
+        if green[apex_idx] < river_edge or green[apex_idx] <= yellow[apex_idx] + 3.5:
+            return None
 
-        # 3. Walk back up to 6 bars toward the Yellow Middle Band to verify a clean upward leg
-        #    with ZERO secondary peaks ("M" double-top lag) and at most 2 bars above the Blue Band
-        win_start = max(1, apex_idx - 5)
-        win_end = min(n - 2, apex_idx + 2)
+        # 2. Must be a sharp inverted-V peak (`^`): higher than previous bar and hooking down on next bar
+        if not (green[apex_idx] > green[apex_idx - 1] + 0.4 and green[apex_idx + 1] < green[apex_idx] - 0.8):
+            return None
 
-        outside_bars = 0
-        peak_count = 0
-        for idx in range(win_start, win_end + 1):
-            if green[idx] > upper[idx] + 0.2:
-                outside_bars += 1
-            if green[idx] >= green[idx - 1] - 0.15 and green[idx] >= green[idx + 1] - 0.15:
-                if green[idx] >= upper[idx] - 3.2:
-                    peak_count += 1
+        # 3. Must be the TRUE highest point of the surrounding window
+        nb_left = max(0, apex_idx - 3)
+        nb_right = min(n - 1, apex_idx + 3)
+        if float(green[apex_idx]) < float(np.max(green[nb_left : nb_right + 1])) - 1e-6:
+            return None
 
-        if outside_bars > 2 or peak_count > 1:
-            return False
+        # 4. Reject if it dragged outside the Upper Blue Band for > 3 bars
+        outside_bars = sum(1 for i in range(max(0, apex_idx - 4), apex_idx + 2) if green[i] > upper[i] + 0.3)
+        if outside_bars > 3:
+            return None
 
-        # 4. Ensure the approach into `apex_idx` didn't dip down first near the band (no M-lag)
-        if apex_idx >= 2 and green[apex_idx - 1] < green[apex_idx - 2] - 0.8 and green[apex_idx - 2] >= upper[apex_idx - 2] - 3.0:
-            return False
+        # 5. Meaningful rise from recent 6-bar low into the inverted-V peak
+        recent_low = float(np.min(green[max(0, apex_idx - 6) : apex_idx]))
+        if (float(green[apex_idx]) - recent_low) < 4.5:
+            return None
 
-        # 5. Total rise from the recent 5-bar low (near Yellow Middle Band) into the fin tip must be meaningful (>= 5 RSI pts)
-        launch_low = float(np.min(green[max(0, apex_idx - 5) : apex_idx]))
-        if (float(green[apex_idx]) - launch_low) < 5.0:
-            return False
+        # 6. Trace forward from `apex_idx + 1` to check Yellow Base Line crossover vs. M-shape invalidation
+        for m in range(apex_idx + 1, n):
+            # M-SHAPE INVALIDATION RULE:
+            # If Green turns back up into the Upper Blue Band before reaching the Yellow Base Line -> INVALIDATED!
+            if m > apex_idx + 1 and green[m] > green[m - 1] + 1.0 and green[m] > upper[m] - 1.0:
+                return None
+            if green[m] >= green[apex_idx] - 0.2:
+                return None
 
-        return True
+            # BASE LINE CONFIRMATION RULE:
+            # Confirmed ONLY when Green crosses/closes BELOW the Yellow Market Base Line!
+            if green[m] < yellow[m] - 0.1:
+                return {
+                    "status": "CONFIRMED",
+                    "apex_idx": apex_idx,
+                    "confirm_idx": m,
+                    "tdi_val": round(float(green[apex_idx]), 1),
+                }
+
+            if (m - apex_idx) > 9:
+                return None
+
+        # If we reached the live right edge of the chart (`n - 1`) within 6 bars of `apex_idx`
+        # and Green is falling toward the Yellow Base Line -> POTENTIAL STOP-HUNT (WATCHING)!
+        if (n - 1 - apex_idx) <= 6 and green[n - 1] < green[apex_idx] and green[n - 1] >= yellow[n - 1] - 0.1:
+            return {
+                "status": "WATCHING",
+                "apex_idx": apex_idx,
+                "confirm_idx": None,
+                "tdi_val": round(float(green[apex_idx]), 1),
+            }
+
+        return None
 
 
 def build_tdi_visual_series(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
@@ -305,7 +366,7 @@ def build_tdi_visual_series(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
             "yellow": round(float(tdi["yellow"][i]), 2),
             "upper": round(float(tdi["upper"][i]), 2),
             "lower": round(float(tdi["lower"][i]), 2),
-            "fin_type": fin_map.get(i),  # Strictly "BULL", "BEAR", or None!
+            "fin_type": fin_map.get(i),  # "BULL", "BEAR", "WATCH_BULL", "WATCH_BEAR", or None
         })
     return out
 
@@ -562,14 +623,15 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                                  struct_events: List[Dict], current_price: float,
                                  atr: float, decimals: int, pip_size: float) -> Dict:
     """
-    TRUE BTMM SINGLE-PEAK TDI SHARKFIN + STOP-HUNT DETECTOR (v12.2):
-    - Only accepts clean 3-to-7 candle triangle fins (`is_clean_single_peak_fin`)
-      that launch from the Yellow Middle Band, touch/pierce the Blue Band at a single point
-      (`apex_idx`), and immediately hook back inside on `k = apex_idx + 1`!
-    - Rejects all multi-bar "M" / "W" formations and records `fin_apex_map` so ONLY
-      true Sharkfin tips get a dot on the TDI chart!
+    TRUE BTMM TDI SHARKFIN + BASE-LINE CONFIRMATION DETECTOR (v12.3):
+    - Strictly looks in the direction of the Peak (`is_bullish` -> Lower Band BUY fins only;
+      `not is_bullish` -> Upper Band SELL fins only).
+    - Separates setups into:
+      1. `CONFIRMED`: V-fin formed at Blue Band AND subsequently closed beyond the Yellow Market Base Line!
+      2. `WATCHING`: V-fin just formed at Blue Band (like GBP/USD and USD/CHF), currently between Blue Band
+         and Yellow Base Line -> drawn with a dot on TDI, watched until it closes beyond Yellow Base Line
+         (or canceled if it reverses back outside Blue Band to form a W/M!).
     """
-    opens = df['Open'].values
     highs = df['High'].values
     lows = df['Low'].values
     closes = df['Close'].values
@@ -593,6 +655,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
     empty_res = {
         "has_pool": False,
         "swept": False,
+        "watching_fin": None,
         "pool_type": "TDI Sharkfin Zone",
         "pool_level": None,
         "pool_idx": None,
@@ -602,82 +665,91 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
         "fin_apex_map": {},
         "live_tdi": live_tdi,
     }
-    if total < 25 or anchor_idx >= total - 3:
+    if total < 25 or anchor_idx >= total - 2:
         return empty_res
 
     anchor_price = float(lows[anchor_idx]) if is_bullish else float(highs[anchor_idx])
-    first_struct_brk = int(struct_events[0]["break_idx"]) if struct_events else (anchor_idx + 2)
-    start_scan = max(first_struct_brk, total - 180)
+    start_scan = max(anchor_idx + 2, total - 220)
 
     # 1. Identify structural pullback swing lows (for Bullish PFL) or swing highs (for Bearish PFH)
     pools = []
     if is_bullish:
-        for j in range(max(anchor_idx + 2, total - 200), total - 2):
+        for j in range(max(anchor_idx + 2, total - 220), total - 2):
             if (
                 lows[j] <= lows[j - 1] and lows[j] <= lows[j - 2]
                 and lows[j] <= lows[j + 1] and lows[j] <= lows[j + 2]
             ):
                 lvl = float(lows[j])
-                if lvl <= anchor_price + (0.05 * atr):
+                if lvl <= anchor_price + (0.02 * atr):
                     continue
                 bounce = float(np.max(highs[j + 1 : min(total, j + 10)])) - lvl
-                if bounce >= 0.45 * atr:
+                if bounce >= 0.40 * atr:
                     pools.append({"idx": j, "level": lvl, "time": int(dates[j])})
     else:
-        for j in range(max(anchor_idx + 2, total - 200), total - 2):
+        for j in range(max(anchor_idx + 2, total - 220), total - 2):
             if (
                 highs[j] >= highs[j - 1] and highs[j] >= highs[j - 2]
                 and highs[j] >= highs[j + 1] and highs[j] >= highs[j + 2]
             ):
                 lvl = float(highs[j])
-                if lvl >= anchor_price - (0.05 * atr):
+                if lvl >= anchor_price - (0.02 * atr):
                     continue
                 drop = lvl - float(np.min(lows[j + 1 : min(total, j + 10)]))
-                if drop >= 0.45 * atr:
+                if drop >= 0.40 * atr:
                     pools.append({"idx": j, "level": lvl, "time": int(dates[j])})
 
-    # 2. Scan for Clean Single-Peak Triangle TDI Sharkfins (where `apex_idx = k - 1` and `k` is the hook-back candle)
+    # 2. Scan for Clean V-Shaped TDI Sharkfins in the direction of the Peak
     recent_sweeps = []
+    watching_fin = None
     fin_apex_map: Dict[int, str] = {}
 
-    for k in range(max(start_scan, 6), total):
-        apex_idx = k - 1
-        if not is_clean_single_peak_fin(green, yellow, upper, lower, apex_idx, is_bullish):
+    for apex_idx in range(max(start_scan, 4), total - 1):
+        res = evaluate_sharkfin_lifecycle(green, yellow, upper, lower, apex_idx, is_bullish)
+        if res is None:
             continue
 
+        status = res["status"]
+        confirm_idx = res["confirm_idx"]
+        tdi_val = res["tdi_val"]
+
         if is_bullish:
-            # Confirm candle `k` hooks TDI Green back inside Lower Blue Band and price closes bullishly / rejects low
-            if green[k] < lower[k] - 0.5 or green[k] > 56.0:
-                continue
-            c_range = max(float(highs[k] - lows[k]), 1e-9)
-            if not (closes[k] > opens[k] or (closes[k] - lows[k]) >= 0.48 * c_range):
-                continue
-
-            recent_leg_high = float(np.max(highs[max(anchor_idx, k - 30) : k + 1]))
-            if (recent_leg_high - float(closes[k])) < (0.85 * atr):
-                continue
-
-            w_start = max(anchor_idx + 1, apex_idx - 1)
-            sweep_low_idx = w_start + int(np.argmin(lows[w_start : k + 1]))
+            w_start = max(anchor_idx + 1, apex_idx - 2)
+            w_end = (confirm_idx + 1) if confirm_idx is not None else total
+            sweep_low_idx = w_start + int(np.argmin(lows[w_start:w_end]))
             sweep_extreme = float(lows[sweep_low_idx])
             if sweep_extreme <= anchor_price:
                 continue
 
+            # Mark the green dot on the TDI at `apex_idx`!
+            fin_apex_map[apex_idx] = "BULL"
+
+            if status == "WATCHING":
+                watching_fin = {
+                    "apex_idx": apex_idx,
+                    "apex_time": int(dates[apex_idx]),
+                    "sweep_extreme": round(sweep_extreme, decimals),
+                    "tdi_val": tdi_val,
+                    "yellow_lvl": live_tdi["yellow"],
+                    "lower_lvl": live_tdi["lower"],
+                }
+                continue
+
+            # Status == "CONFIRMED" (Green closed ABOVE Yellow Market Base Line at `confirm_idx`!)
+            k = int(confirm_idx)
+            recent_leg_high = float(np.max(highs[max(anchor_idx, k - 35) : k + 1]))
+            if (recent_leg_high - float(closes[k])) < (0.65 * atr):
+                continue
+
             swept_pool = None
             for p in reversed(pools):
-                if p["idx"] < apex_idx and sweep_extreme <= p["level"] + (0.10 * atr) and float(closes[k]) >= p["level"] - (0.12 * atr):
+                if p["idx"] < apex_idx and sweep_extreme <= p["level"] + (0.15 * atr):
                     swept_pool = p
                     break
 
             pool_lvl = round(swept_pool["level"] if swept_pool else sweep_extreme, decimals)
             pool_tm = int(swept_pool["time"] if swept_pool else dates[sweep_low_idx])
             pool_idx_val = int(swept_pool["idx"] if swept_pool else sweep_low_idx)
-            min_tdi_val = round(float(green[apex_idx]), 1)
 
-            if recent_sweeps and abs(k - recent_sweeps[-1]["signal_idx"]) <= 4:
-                continue
-
-            fin_apex_map[apex_idx] = "BULL"
             recent_sweeps.append({
                 "signal_idx": k,
                 "signal_time": int(dates[k]),
@@ -685,46 +757,51 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                 "pool_idx": pool_idx_val,
                 "pool_time": pool_tm,
                 "pool_level": pool_lvl,
-                "pool_type": f"TDI Sharkfin ({min_tdi_val})",
+                "pool_type": f"TDI Sharkfin ({tdi_val})",
                 "sweep_extreme": round(sweep_extreme, decimals),
                 "entry_close": round(float(closes[k]), decimals),
-                "tdi_val": min_tdi_val,
-                "pattern": f"Clean TDI Sharkfin Buy (RSI {min_tdi_val})",
+                "tdi_val": tdi_val,
+                "pattern": f"Confirmed TDI Sharkfin Buy (Closed > Base @ {round(float(yellow[k]), 1)})",
             })
 
         else:
-            # Bearish Fin (`SELL` in a `PFH` trend):
-            if green[k] > upper[k] + 0.5 or green[k] < 44.0:
-                continue
-            c_range = max(float(highs[k] - lows[k]), 1e-9)
-            if not (closes[k] < opens[k] or (highs[k] - closes[k]) >= 0.48 * c_range):
-                continue
-
-            recent_leg_low = float(np.min(lows[max(anchor_idx, k - 30) : k + 1]))
-            if (float(closes[k]) - recent_leg_low) < (0.85 * atr):
-                continue
-
-            w_start = max(anchor_idx + 1, apex_idx - 1)
-            sweep_high_idx = w_start + int(np.argmax(highs[w_start : k + 1]))
+            w_start = max(anchor_idx + 1, apex_idx - 2)
+            w_end = (confirm_idx + 1) if confirm_idx is not None else total
+            sweep_high_idx = w_start + int(np.argmax(highs[w_start:w_end]))
             sweep_extreme = float(highs[sweep_high_idx])
             if sweep_extreme >= anchor_price:
                 continue
 
+            # Mark the red dot on the TDI at `apex_idx`!
+            fin_apex_map[apex_idx] = "BEAR"
+
+            if status == "WATCHING":
+                watching_fin = {
+                    "apex_idx": apex_idx,
+                    "apex_time": int(dates[apex_idx]),
+                    "sweep_extreme": round(sweep_extreme, decimals),
+                    "tdi_val": tdi_val,
+                    "yellow_lvl": live_tdi["yellow"],
+                    "upper_lvl": live_tdi["upper"],
+                }
+                continue
+
+            # Status == "CONFIRMED" (Green closed BELOW Yellow Market Base Line at `confirm_idx`!)
+            k = int(confirm_idx)
+            recent_leg_low = float(np.min(lows[max(anchor_idx, k - 35) : k + 1]))
+            if (float(closes[k]) - recent_leg_low) < (0.65 * atr):
+                continue
+
             swept_pool = None
             for p in reversed(pools):
-                if p["idx"] < apex_idx and sweep_extreme >= p["level"] - (0.10 * atr) and float(closes[k]) <= p["level"] + (0.12 * atr):
+                if p["idx"] < apex_idx and sweep_extreme >= p["level"] - (0.15 * atr):
                     swept_pool = p
                     break
 
             pool_lvl = round(swept_pool["level"] if swept_pool else sweep_extreme, decimals)
             pool_tm = int(swept_pool["time"] if swept_pool else dates[sweep_high_idx])
             pool_idx_val = int(swept_pool["idx"] if swept_pool else sweep_high_idx)
-            max_tdi_val = round(float(green[apex_idx]), 1)
 
-            if recent_sweeps and abs(k - recent_sweeps[-1]["signal_idx"]) <= 4:
-                continue
-
-            fin_apex_map[apex_idx] = "BEAR"
             recent_sweeps.append({
                 "signal_idx": k,
                 "signal_time": int(dates[k]),
@@ -732,18 +809,45 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                 "pool_idx": pool_idx_val,
                 "pool_time": pool_tm,
                 "pool_level": pool_lvl,
-                "pool_type": f"TDI Sharkfin ({max_tdi_val})",
+                "pool_type": f"TDI Sharkfin ({tdi_val})",
                 "sweep_extreme": round(sweep_extreme, decimals),
                 "entry_close": round(float(closes[k]), decimals),
-                "tdi_val": max_tdi_val,
-                "pattern": f"Clean TDI Sharkfin Sell (RSI {max_tdi_val})",
+                "tdi_val": tdi_val,
+                "pattern": f"Confirmed TDI Sharkfin Sell (Closed < Base @ {round(float(yellow[k]), 1)})",
             })
 
     recent_sweeps.sort(key=lambda x: x["signal_idx"], reverse=True)
 
-    # 3. If a valid TDI Sharkfin triggered recently and its stop loss hasn't been breached, display it on the chart!
+    # 3. If a Potential Stop-Hunt (`watching_fin`) is forming right now (e.g. GBP/USD or USD/CHF), highlight it!
+    if watching_fin is not None:
+        lvl_r = watching_fin["sweep_extreme"]
+        return {
+            "has_pool": True,
+            "swept": False,
+            "watching_fin": watching_fin,
+            "pool_type": f"Potential Sharkfin ({watching_fin['tdi_val']})",
+            "pool_level": lvl_r,
+            "pool_idx": watching_fin["apex_idx"],
+            "pool_time": watching_fin["apex_time"],
+            "sweep_extreme": lvl_r,
+            "pool_line": {
+                "level": lvl_r,
+                "start_time": watching_fin["apex_time"],
+                "end_time": int(dates[-1]),
+                "type": f"👀 Potential Sharkfin — Await Base Line ({lvl_r:.{decimals}f})",
+                "color": "rgba(255, 214, 0, 0.95)",
+                "is_anchor": False,
+                "is_struct": True,
+                "is_choch": False,
+            },
+            "recent_sweeps": recent_sweeps,
+            "fin_apex_map": fin_apex_map,
+            "live_tdi": live_tdi,
+        }
+
+    # 4. If a Confirmed TDI Sharkfin triggered recently and its stop loss hasn't been breached, display it!
     for sw in recent_sweeps:
-        if (total - 1 - sw["signal_idx"]) <= 28:
+        if (total - 1 - sw["signal_idx"]) <= 35:
             post_low = float(np.min(lows[sw["signal_idx"] + 1:])) if sw["signal_idx"] + 1 < total else sw["sweep_extreme"]
             post_high = float(np.max(highs[sw["signal_idx"] + 1:])) if sw["signal_idx"] + 1 < total else sw["sweep_extreme"]
             if is_bullish and post_low >= sw["sweep_extreme"] - (0.05 * atr):
@@ -751,6 +855,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                 return {
                     "has_pool": True,
                     "swept": True,
+                    "watching_fin": None,
                     "pool_type": sw["pool_type"],
                     "pool_level": lvl_r,
                     "pool_idx": sw["pool_idx"],
@@ -760,7 +865,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                         "level": lvl_r,
                         "start_time": sw["pool_time"],
                         "end_time": int(dates[-1]),
-                        "type": f"🦈 {sw['pool_type']} SWEPT ✅ ({lvl_r:.{decimals}f})",
+                        "type": f"🦈 {sw['pool_type']} CONFIRMED ✅ ({lvl_r:.{decimals}f})",
                         "color": "rgba(192, 132, 252, 0.95)",
                         "is_anchor": False,
                         "is_struct": True,
@@ -775,6 +880,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                 return {
                     "has_pool": True,
                     "swept": True,
+                    "watching_fin": None,
                     "pool_type": sw["pool_type"],
                     "pool_level": lvl_r,
                     "pool_idx": sw["pool_idx"],
@@ -784,7 +890,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                         "level": lvl_r,
                         "start_time": sw["pool_time"],
                         "end_time": int(dates[-1]),
-                        "type": f"🦈 {sw['pool_type']} SWEPT ✅ ({lvl_r:.{decimals}f})",
+                        "type": f"🦈 {sw['pool_type']} CONFIRMED ✅ ({lvl_r:.{decimals}f})",
                         "color": "rgba(192, 132, 252, 0.95)",
                         "is_anchor": False,
                         "is_struct": True,
@@ -795,7 +901,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
                     "live_tdi": live_tdi,
                 }
 
-    # 4. Otherwise, show the nearest UNSWEPT Swing Low/High liquidity pool where we are waiting for a TDI Sharkfin
+    # 5. Otherwise, show the nearest UNSWEPT Swing Low/High liquidity pool where we are watching for a TDI Sharkfin
     unswept_pools = []
     for p in pools:
         p_idx, p_lvl, p_time = p["idx"], p["level"], p["time"]
@@ -817,6 +923,7 @@ def detect_tdi_sharkfin_stophunt(df: pd.DataFrame, tdi: Dict[str, np.ndarray],
         return {
             "has_pool": True,
             "swept": False,
+            "watching_fin": None,
             "pool_type": p_label,
             "pool_level": lvl_r,
             "pool_idx": chosen["idx"],
@@ -1135,6 +1242,17 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
                 fresh_anchor_time = int(dates[macro_max_idx])
                 fresh_anchor_price = macro_high_val
 
+    # However, if the latest structural cycle event (`cycle_events[-1]`) happened AFTER `macro_max_idx` / `macro_min_idx`
+    # (for example, AUD/USD forming a brand new Peak Formation High @ 0.70696 and breaking CHoCH ▼, or USD/CHF breaking CHoCH ▲),
+    # respect the newest confirmed Peak Formation!
+    if cycle_events:
+        last_ev = cycle_events[-1]
+        if last_ev["anchor_idx"] > max(macro_max_idx, macro_min_idx) - 15:
+            is_bullish = last_ev["bullish"]
+            fresh_anchor_idx = last_ev["anchor_idx"]
+            fresh_anchor_time = last_ev["anchor_time"]
+            fresh_anchor_price = last_ev["anchor_price"]
+
     if is_bullish:
         shoulder_win = max(0, fresh_anchor_idx - 65)
         true_leg_min_idx = shoulder_win + int(np.argmin(lows[shoulder_win : fresh_anchor_idx + 1]))
@@ -1142,12 +1260,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             fresh_anchor_idx = int(true_leg_min_idx)
             fresh_anchor_time = int(dates[fresh_anchor_idx])
             fresh_anchor_price = float(lows[fresh_anchor_idx])
-
-        if lows[macro_min_idx] < fresh_anchor_price and macro_min_idx < fresh_anchor_idx:
-            if np.max(highs[fresh_anchor_idx:]) >= np.max(highs[macro_min_idx:fresh_anchor_idx]) - (0.50 * atr):
-                fresh_anchor_idx = int(macro_min_idx)
-                fresh_anchor_time = int(dates[macro_min_idx])
-                fresh_anchor_price = float(lows[macro_min_idx])
     else:
         shoulder_win = max(0, fresh_anchor_idx - 65)
         true_leg_max_idx = shoulder_win + int(np.argmax(highs[shoulder_win : fresh_anchor_idx + 1]))
@@ -1155,12 +1267,6 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
             fresh_anchor_idx = int(true_leg_max_idx)
             fresh_anchor_time = int(dates[fresh_anchor_idx])
             fresh_anchor_price = float(highs[fresh_anchor_idx])
-
-        if highs[macro_max_idx] > fresh_anchor_price and macro_max_idx < fresh_anchor_idx:
-            if np.min(lows[fresh_anchor_idx:]) <= np.min(lows[macro_max_idx:fresh_anchor_idx]) + (0.50 * atr):
-                fresh_anchor_idx = int(macro_max_idx)
-                fresh_anchor_time = int(dates[macro_max_idx])
-                fresh_anchor_price = float(highs[macro_max_idx])
 
     anchor_idx = fresh_anchor_idx
     anchor_time = fresh_anchor_time
@@ -1228,14 +1334,14 @@ def analyze_market_structure(df: pd.DataFrame, profile: Dict,
 
     live_ref = current_price if current_price > 0 else float(closes[-1])
 
-    # Run True Single-Peak TDI Sharkfin + Stop-Hunt Detector
+    # Run True Single-Peak TDI Sharkfin + Base-Line Confirmation Detector
     sharkfin_data = detect_tdi_sharkfin_stophunt(
         df, tdi_arrays, is_bullish, int(anchor_idx), struct_events, live_ref, atr, decimals, pip_size
     )
     if sharkfin_data.get("pool_line"):
         all_lines.append(sharkfin_data["pool_line"])
 
-    # Build TDI series with ONLY confirmed Sharkfin apexes marked!
+    # Build TDI series with ONLY trend-aligned Sharkfin apexes marked!
     tdi_series = build_tdi_visual_series(
         df, tdi_arrays, fin_apex_map=sharkfin_data.get("fin_apex_map"), max_bars=500
     )
@@ -1324,10 +1430,10 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
     total = len(closes)
 
     has_pool = bool(sharkfin_data.get("has_pool", False))
-    pool_type = sharkfin_data.get("pool_type", "TDI Sharkfin Zone")
+    watching_fin = sharkfin_data.get("watching_fin")
     pool_level = sharkfin_data.get("pool_level")
     recent_sweeps = sharkfin_data.get("recent_sweeps", [])
-    live_tdi = sharkfin_data.get("live_tdi", {"green": 50.0, "red": 50.0, "upper": 68.0, "lower": 32.0})
+    live_tdi = sharkfin_data.get("live_tdi", {"green": 50.0, "red": 50.0, "yellow": 50.0, "upper": 68.0, "lower": 32.0})
 
     tp_level = targets[0]["level"] if len(targets) >= 1 else None
 
@@ -1374,12 +1480,14 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
 
     locked_trade = ACTIVE_TRADES.get(state_key) if state_key else None
 
-    # 2. Scan recent Clean Single-Peak TDI Sharkfin sweeps (`recent_sweeps`) for an active unclosed trade
-    if locked_trade is None and peak_confirmed and recent_sweeps:
+    # 2. If a Potential Stop-Hunt (`watching_fin`) is currently forming on the right edge (e.g. GBP/USD or USD/CHF),
+    #    prioritize WATCHING it until it closes beyond the Yellow Market Base Line!
+    #    Otherwise, check if a Confirmed Sharkfin (that already closed beyond the Base Line) is active.
+    if locked_trade is None and watching_fin is None and peak_confirmed and recent_sweeps:
         for sw in recent_sweeps:
             k = sw["signal_idx"]
             sig_ts = sw["signal_time"]
-            if (total - 1 - k) > 25:
+            if (total - 1 - k) > 35:
                 continue
             if state_key and sig_ts in CLOSED_SIGNALS.get(state_key, set()):
                 continue
@@ -1504,7 +1612,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         f_rr = locked_trade["risk_reward"]
         f_dir = locked_trade["signal"]
         f_pool_lvl = locked_trade.get("pool_level", f_entry)
-        f_pat = locked_trade.get("pattern", "Clean TDI Sharkfin")
+        f_pat = locked_trade.get("pattern", "Confirmed TDI Sharkfin")
         f_ptype = locked_trade.get("pool_type", "TDI Sharkfin")
 
         step_seconds = int(dates[-1] - dates[-2]) if len(dates) >= 2 else 3600
@@ -1522,7 +1630,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
             {"step": f"1. Peak Anchor ({peak_word})", "done": True, "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
             {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
             {"step": f"3. {f_ptype}", "done": True, "detail": f"Swept {f_pool_lvl:.{decimals}f} 🦈✅"},
-            {"step": f"4. Clean V-Fin Hook (RR 1:{f_rr})", "done": True, "detail": sl_status_txt},
+            {"step": f"4. Closed Beyond Base Line (RR 1:{f_rr})", "done": True, "detail": sl_status_txt},
         ]
 
         active_conf = 88 + (4 if htf_aligned else 0) + (2 if f_be else 0)
@@ -1535,7 +1643,7 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         return {
             "signal": f_dir,
             "confidence": min(96, active_conf),
-            "setup_name": f"Clean TDI Sharkfin {f_dir} Active" + (" (Risk-Free BE 🛡️)" if f_be else ""),
+            "setup_name": f"Confirmed Sharkfin {f_dir}" + (" (Risk-Free BE 🛡️)" if f_be else ""),
             "checklist": checklist,
             "execution_plan": {
                 "stage": "TRADE_ACTIVE",
@@ -1562,37 +1670,64 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         }
 
     g_now = live_tdi["green"]
+    y_now = live_tdi["yellow"]
     u_now = live_tdi["upper"]
     l_now = live_tdi["lower"]
 
     if is_bullish:
-        fin_forming = g_now <= l_now + 1.8
         ref_lvl = pool_level if pool_level is not None else round(anchor_price, decimals)
         planned_sl = round(ref_lvl - (0.38 * atr), decimals)
         risk = max(abs(ref_lvl - planned_sl), 1e-6)
         best_rr = round(abs(tp_level - ref_lvl) / risk, 2) if tp_level else 2.4
 
+        if watching_fin is not None:
+            stage = "IN_ZONE_CONFIRMING"
+            note = (
+                f"👀 POTENTIAL BUY STOP-HUNT DETECTED (TDI V-Fin @ {watching_fin['tdi_val']})! "
+                f"Watching until TDI Green ({g_now}) closes ABOVE the Yellow Base Line ({y_now}) to confirm BUY. "
+                f"(Invalidated if Green drops back below Lower Blue Band {l_now} into a W-shape!)"
+            )
+            checklist = [
+                {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+                {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+                {"step": "3. Lower-Band V-Fin Stop Hunt", "done": True, "detail": f"V-Fin @ {watching_fin['tdi_val']} 🦈👀"},
+                {"step": f"4. Close ABOVE Base Line ({y_now})", "done": False, "detail": f"Green {g_now} -> Need > {y_now}"},
+            ]
+            return {
+                "signal": "WAIT",
+                "confidence": 76,
+                "setup_name": "Potential Buy Stop-Hunt — Await Base Line Close 👀",
+                "checklist": checklist,
+                "execution_plan": {
+                    "stage": stage,
+                    "trigger_condition": note,
+                    "planned_entry": round(current_price, decimals),
+                    "planned_sl": round(watching_fin["sweep_extreme"] - 0.20 * atr, decimals),
+                    "planned_tp1": round(tp_level, decimals) if tp_level else None,
+                    "planned_tp2": None,
+                    "risk_reward": best_rr,
+                },
+                "entry_note": note,
+                "trade_levels": None,
+            }
+
         checklist = [
             {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
             {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "3. TDI Single-Peak Fin vs. Lower Band", "done": fin_forming, "detail": f"Green: {g_now} | Lower Band: {l_now} {'🦈' if fin_forming else '⏳'}"},
-            {"step": f"4. Clean V-Hook Inside (RR 1:{best_rr})", "done": False, "detail": "Wait for Immediate Hook Up!" if fin_forming else f"Wait for TDI < {l_now}"},
+            {"step": "3. Lower-Band V-Fin Stop Hunt", "done": False, "detail": f"Green: {g_now} | Lower Band: {l_now} ⏳"},
+            {"step": f"4. Close ABOVE Base Line ({y_now})", "done": False, "detail": "Wait for V-Fin First"},
         ]
-
-        if fin_forming:
-            stage = "IN_ZONE_CONFIRMING"
-            note = f"🦈 BULLISH TDI SHARKFIN AT LOWER BAND ({g_now} vs {l_now})! Must hook back UP immediately in 1 single point (no W-lag) to trigger BUY."
-        else:
-            stage = "AWAITING_PULLBACK"
-            note = f"⏳ WAITING FOR CLEAN BULLISH SHARKFIN: Live TDI Green is at {g_now} (Lower Blue Band is {l_now}). Waiting for a clean single-point dip to {l_now} + immediate snap-back."
-
+        note = (
+            f"⏳ WATCHING FOR BUY STOP-HUNT: {dir_word} from {peak_word} ({anchor_price:.{decimals}f}). "
+            f"Waiting for TDI Green ({g_now}) to form a sharp V-fin at the Lower Blue Band ({l_now}) and close ABOVE the Yellow Base Line ({y_now})."
+        )
         return {
             "signal": "WAIT",
-            "confidence": 74 if fin_forming else 58,
-            "setup_name": "TDI Sharkfin Bullish — " + ("Testing Lower Band 🦈" if fin_forming else "Awaiting Clean V-Fin"),
+            "confidence": 58,
+            "setup_name": "Watching for Buy Stop-Hunt (PFL Bias)",
             "checklist": checklist,
             "execution_plan": {
-                "stage": stage,
+                "stage": "AWAITING_PULLBACK",
                 "trigger_condition": note,
                 "planned_entry": ref_lvl if has_pool else None,
                 "planned_sl": planned_sl if has_pool else None,
@@ -1605,33 +1740,59 @@ def evaluate_entry_signal(df: pd.DataFrame, full_df: pd.DataFrame, ms: Dict, cur
         }
 
     else:
-        fin_forming = g_now >= u_now - 1.8
         ref_lvl = pool_level if pool_level is not None else round(anchor_price, decimals)
         planned_sl = round(ref_lvl + (0.38 * atr), decimals)
         risk = max(abs(planned_sl - ref_lvl), 1e-6)
         best_rr = round(abs(ref_lvl - tp_level) / risk, 2) if tp_level else 2.4
 
+        if watching_fin is not None:
+            stage = "IN_ZONE_CONFIRMING"
+            note = (
+                f"👀 POTENTIAL SELL STOP-HUNT DETECTED (TDI V-Fin @ {watching_fin['tdi_val']})! "
+                f"Watching until TDI Green ({g_now}) closes BELOW the Yellow Base Line ({y_now}) to confirm SELL. "
+                f"(Invalidated if Green spikes back above Upper Blue Band {u_now} into an M-shape!)"
+            )
+            checklist = [
+                {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
+                {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
+                {"step": "3. Upper-Band V-Fin Stop Hunt", "done": True, "detail": f"V-Fin @ {watching_fin['tdi_val']} 🦈👀"},
+                {"step": f"4. Close BELOW Base Line ({y_now})", "done": False, "detail": f"Green {g_now} -> Need < {y_now}"},
+            ]
+            return {
+                "signal": "WAIT",
+                "confidence": 76,
+                "setup_name": "Potential Sell Stop-Hunt — Await Base Line Close 👀",
+                "checklist": checklist,
+                "execution_plan": {
+                    "stage": stage,
+                    "trigger_condition": note,
+                    "planned_entry": round(current_price, decimals),
+                    "planned_sl": round(watching_fin["sweep_extreme"] + 0.20 * atr, decimals),
+                    "planned_tp1": round(tp_level, decimals) if tp_level else None,
+                    "planned_tp2": None,
+                    "risk_reward": best_rr,
+                },
+                "entry_note": note,
+                "trade_levels": None,
+            }
+
         checklist = [
             {"step": f"1. Peak Anchor ({peak_word})", "done": bool(peak_confirmed), "detail": f"Locked @ {anchor_price:.{decimals}f} ✅"},
             {"step": f"2. Structure ({break_kind} {arrow})", "done": True, "detail": f"Cleared {break_level:.{decimals}f} ✅"},
-            {"step": "3. TDI Single-Peak Fin vs. Upper Band", "done": fin_forming, "detail": f"Green: {g_now} | Upper Band: {u_now} {'🦈' if fin_forming else '⏳'}"},
-            {"step": f"4. Clean V-Hook Inside (RR 1:{best_rr})", "done": False, "detail": "Wait for Immediate Hook Down!" if fin_forming else f"Wait for TDI > {u_now}"},
+            {"step": "3. Upper-Band V-Fin Stop Hunt", "done": False, "detail": f"Green: {g_now} | Upper Band: {u_now} ⏳"},
+            {"step": f"4. Close BELOW Base Line ({y_now})", "done": False, "detail": "Wait for V-Fin First"},
         ]
-
-        if fin_forming:
-            stage = "IN_ZONE_CONFIRMING"
-            note = f"🦈 BEARISH TDI SHARKFIN AT UPPER BAND ({g_now} vs {u_now})! Must hook back DOWN immediately in 1 single point (no M-lag) to trigger SELL."
-        else:
-            stage = "AWAITING_PULLBACK"
-            note = f"⏳ WAITING FOR CLEAN BEARISH SHARKFIN: Live TDI Green is at {g_now} (Upper Blue Band is {u_now}). Waiting for a clean single-point spike to {u_now} + immediate snap-back."
-
+        note = (
+            f"⏳ WATCHING FOR SELL STOP-HUNT: {dir_word} from {peak_word} ({anchor_price:.{decimals}f}). "
+            f"Waiting for TDI Green ({g_now}) to form a sharp V-fin at the Upper Blue Band ({u_now}) and close BELOW the Yellow Base Line ({y_now})."
+        )
         return {
             "signal": "WAIT",
-            "confidence": 74 if fin_forming else 58,
-            "setup_name": "TDI Sharkfin Bearish — " + ("Testing Upper Band 🦈" if fin_forming else "Awaiting Clean V-Fin"),
+            "confidence": 58,
+            "setup_name": "Watching for Sell Stop-Hunt (PFH Bias)",
             "checklist": checklist,
             "execution_plan": {
-                "stage": stage,
+                "stage": stage if 'stage' in locals() else "AWAITING_PULLBACK",
                 "trigger_condition": note,
                 "planned_entry": ref_lvl if has_pool else None,
                 "planned_sl": planned_sl if has_pool else None,
@@ -1768,7 +1929,7 @@ async def debug_analysis(req: AnalysisRequest):
         profile = get_instrument_profile(req.currency, current_price)
         ms = analyze_market_structure(df, profile, current_price=current_price)
         return {
-            "✅ ENGINE VERSION": "AuraBrain v12.2 — Peak Formation + Single-Peak Triangle TDI Sharkfin Engine (No M/W Lag)",
+            "✅ ENGINE VERSION": "AuraBrain v12.3 — Peak Direction + V-Fin Stop-Hunt + Mandatory Market Base Line Crossover",
             "📊 INSTRUMENT": req.currency,
             "🎯 STRUCTURE": ms['cycle'],
             "⚓ PEAK ANCHOR": ms['anchor'],

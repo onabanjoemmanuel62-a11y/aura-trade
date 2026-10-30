@@ -68,7 +68,7 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
   return timeScale.timeToCoordinate(candles[bestIdx].time);
 };
 
-// Local fallback TDI calculator so the TDI panel renders immediately even before Python responds
+// Local fallback TDI line calculator (strictly leaves fin_type = null so ONLY Python's Peak-aligned Sharkfins get dots!)
 const computeLocalTDI = (candles) => {
   if (!candles || candles.length < 20) return [];
   const closes = candles.map(c => c.close);
@@ -100,7 +100,8 @@ const computeLocalTDI = (candles) => {
   }
 
   const raw = [];
-  for (let i = 0; i < n; i++) {
+  const startIdx = Math.max(0, n - 500);
+  for (let i = startIdx; i < n; i++) {
     const gStart = Math.max(0, i - 1);
     let gSum = 0;
     for (let j = gStart; j <= i; j++) gSum += rsi[j];
@@ -137,44 +138,7 @@ const computeLocalTDI = (candles) => {
     });
   }
 
-  // Mark ONLY clean single-peak Sharkfin apexes (no M/W multi-dot clusters)
-  for (let i = 5; i < n - 2; i++) {
-    const cur = raw[i];
-    const prev = raw[i - 1];
-    const next = raw[i + 1];
-
-    // Check Bullish single-trough Sharkfin
-    if (cur.green <= cur.lower + 1.8 && cur.green < prev.green - 0.6 && next.green > cur.green + 1.2) {
-      let outsideBars = 0;
-      let troughs = 0;
-      for (let k = Math.max(1, i - 5); k <= Math.min(n - 2, i + 2); k++) {
-        if (raw[k].green < raw[k].lower - 0.2) outsideBars++;
-        if (raw[k].green <= raw[k - 1].green + 0.15 && raw[k].green <= raw[k + 1].green + 0.15 && raw[k].green <= raw[k].lower + 3.2) {
-          troughs++;
-        }
-      }
-      if (outsideBars <= 2 && troughs === 1) {
-        cur.fin_type = 'BULL';
-      }
-    }
-
-    // Check Bearish single-peak Sharkfin
-    if (cur.green >= cur.upper - 1.8 && cur.green > prev.green + 0.6 && next.green < cur.green - 1.2) {
-      let outsideBars = 0;
-      let peaks = 0;
-      for (let k = Math.max(1, i - 5); k <= Math.min(n - 2, i + 2); k++) {
-        if (raw[k].green > raw[k].upper + 0.2) outsideBars++;
-        if (raw[k].green >= raw[k - 1].green - 0.15 && raw[k].green >= raw[k + 1].green - 0.15 && raw[k].green >= raw[k].upper - 3.2) {
-          peaks++;
-        }
-      }
-      if (outsideBars <= 2 && peaks === 1) {
-        cur.fin_type = 'BEAR';
-      }
-    }
-  }
-
-  return raw.slice(Math.max(0, n - 500));
+  return raw;
 };
 
 class LineRenderer {
@@ -491,7 +455,7 @@ class ProjectionPrimitive {
 }
 
 // ============================================================================
-// 🦈 TDI (TRADERS DYNAMIC INDEX) SUB-WINDOW PRIMITIVE (CLEAN SINGLE-FIN DOT)
+// 🦈 TDI (TRADERS DYNAMIC INDEX) SUB-WINDOW PRIMITIVE (PEAK-ALIGNED SHARKFIN DOTS)
 // ============================================================================
 class TDIPaneRenderer {
   constructor(data) { this._data = data; }
@@ -604,7 +568,7 @@ class TDIPaneRenderer {
       // 7. Draw Green RSI Price Line (SMA 2 of RSI 13)
       strokeTDILine('green', 'rgba(0, 230, 118, 0.98)', 2.0);
 
-      // 8. Draw a single glowing dot STRICTLY on confirmed Clean Single-Peak Sharkfin tips!
+      // 8. Draw a single glowing dot STRICTLY on Python-validated Peak-aligned Sharkfin tips!
       pts.forEach((p) => {
         if (p.finType !== 'BULL' && p.finType !== 'BEAR') return;
 
