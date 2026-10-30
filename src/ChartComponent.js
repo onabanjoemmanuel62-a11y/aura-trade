@@ -68,7 +68,12 @@ const safeTimeToX = (timeScale, candles, targetTime) => {
   return timeScale.timeToCoordinate(candles[bestIdx].time);
 };
 
-// Local fallback TDI line calculator (strictly leaves fin_type = null so ONLY Python's Peak-aligned Sharkfins get dots!)
+// Exact MT4 Mobile 5-Step TDI calculator:
+// Step 1: RSI(13, Close) -> First Indicator's Data
+// Step 2: Green = Simple MA(2) applied to RSI(13)
+// Step 3: Red   = Simple MA(7) applied to Previous Indicator's Data (Green Line!)
+// Step 4: Blue  = Bollinger Bands(34, Deviation 1.618, ddof=0) applied to First Indicator's Data (RSI 13)
+// Step 5: Yellow = Simple MA(34) applied to First Indicator's Data (RSI 13)
 const computeLocalTDI = (candles) => {
   if (!candles || candles.length < 20) return [];
   const closes = candles.map(c => c.close);
@@ -79,39 +84,50 @@ const computeLocalTDI = (candles) => {
   let avgGain = 0;
   let avgLoss = 0;
 
-  for (let i = 1; i < n; i++) {
+  for (let i = 1; i <= period && i < n; i++) {
+    const chg = closes[i] - closes[i - 1];
+    if (chg > 0) avgGain += chg;
+    else avgLoss -= chg;
+  }
+  avgGain /= period;
+  avgLoss /= period;
+
+  if (n > period) {
+    rsi[period] = avgLoss === 0 ? (avgGain > 0 ? 100 : 50) : 100 - 100 / (1 + avgGain / avgLoss);
+    for (let k = 0; k < period; k++) rsi[k] = rsi[period];
+  }
+
+  for (let i = period + 1; i < n; i++) {
     const chg = closes[i] - closes[i - 1];
     const gain = chg > 0 ? chg : 0;
     const loss = chg < 0 ? -chg : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    rsi[i] = avgLoss === 0 ? (avgGain > 0 ? 100 : 50) : 100 - 100 / (1 + avgGain / avgLoss);
+  }
 
-    if (i <= period) {
-      avgGain += gain / period;
-      avgLoss += loss / period;
-      if (i === period) {
-        const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-        rsi[i] = 100 - 100 / (1 + rs);
-      }
-    } else {
-      avgGain = (avgGain * (period - 1) + gain) / period;
-      avgLoss = (avgLoss * (period - 1) + loss) / period;
-      const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-      rsi[i] = 100 - 100 / (1 + rs);
-    }
+  // Step 2: Green Line = SMA(2) of RSI(13)
+  const greenArr = new Array(n).fill(50);
+  for (let i = 0; i < n; i++) {
+    const gStart = Math.max(0, i - 1);
+    let gSum = 0;
+    for (let j = gStart; j <= i; j++) gSum += rsi[j];
+    greenArr[i] = gSum / (i - gStart + 1);
   }
 
   const raw = [];
   const startIdx = Math.max(0, n - 500);
   for (let i = startIdx; i < n; i++) {
-    const gStart = Math.max(0, i - 1);
-    let gSum = 0;
-    for (let j = gStart; j <= i; j++) gSum += rsi[j];
-    const green = gSum / (i - gStart + 1);
+    const green = greenArr[i];
 
+    // Step 3: Red Line = SMA(7) applied to Previous Indicator's Data (greenArr!)
     const rStart = Math.max(0, i - 6);
     let rSum = 0;
-    for (let j = rStart; j <= i; j++) rSum += rsi[j];
+    for (let j = rStart; j <= i; j++) rSum += greenArr[j];
     const red = rSum / (i - rStart + 1);
 
+    // Step 4 & 5: Yellow Market Baseline = SMA(34) of First Indicator's Data (rsi)
+    // and Blue Bollinger Bands = 34-period, Deviation 1.618 (ddof=0) of First Indicator's Data (rsi)
     const bStart = Math.max(0, i - 33);
     const bLen = i - bStart + 1;
     let bSum = 0;
@@ -124,8 +140,8 @@ const computeLocalTDI = (candles) => {
       varSum += d * d;
     }
     const std = Math.sqrt(varSum / Math.max(1, bLen));
-    const upper = Math.min(100, Math.max(0, yellow + 1.6185 * std));
-    const lower = Math.min(100, Math.max(0, yellow - 1.6185 * std));
+    const upper = Math.min(100, Math.max(0, yellow + 1.618 * std));
+    const lower = Math.min(100, Math.max(0, yellow - 1.618 * std));
 
     raw.push({
       time: candles[i].time,
@@ -455,7 +471,7 @@ class ProjectionPrimitive {
 }
 
 // ============================================================================
-// 🦈 TDI (TRADERS DYNAMIC INDEX) SUB-WINDOW PRIMITIVE (PEAK-ALIGNED SHARKFIN DOTS)
+// 🦈 TDI (TRADERS DYNAMIC INDEX) SUB-WINDOW PRIMITIVE (MT4 MOBILE 5-STEP SPEC)
 // ============================================================================
 class TDIPaneRenderer {
   constructor(data) { this._data = data; }
@@ -473,15 +489,15 @@ class TDIPaneRenderer {
       const paneH   = Math.round(fullH * 0.24);
       const paneTop = fullH - paneH;
       const padTop  = 18 * vPR;
-      const padBot  = 8 * vPR;
+      const padBot  = 6 * vPR;
       const plotTop = paneTop + padTop;
       const plotBot = fullH - padBot;
       const plotH   = Math.max(20 * vPR, plotBot - plotTop);
 
-      // Map RSI 12..88 range into the sub-window height
+      // True MT4 RSI 0..100 vertical scale
       const valToY = (v) => {
-        const clamped = Math.max(12, Math.min(88, v));
-        return plotBot - ((clamped - 12) / (88 - 12)) * plotH;
+        const clamped = Math.max(0, Math.min(100, v));
+        return plotBot - (clamped / 100) * plotH;
       };
 
       const pts = this._data.points.filter(p => p.x != null && p.x * hPR >= -20 && p.x * hPR <= fullW + 20);
@@ -500,11 +516,11 @@ class TDIPaneRenderer {
       ctx.lineWidth   = 1.2 * vPR;
       ctx.stroke();
 
-      // 2. Reference levels: 68 (Overbought), 50 (Mid), 32 (Oversold)
+      // 2. MT4 Reference levels: 68, 50, 32
       [
-        { lvl: 68, col: 'rgba(239, 83, 80, 0.30)' },
-        { lvl: 50, col: 'rgba(255, 255, 255, 0.16)' },
-        { lvl: 32, col: 'rgba(38, 166, 154, 0.30)' },
+        { lvl: 68, col: 'rgba(239, 83, 80, 0.35)' },
+        { lvl: 50, col: 'rgba(255, 255, 255, 0.20)' },
+        { lvl: 32, col: 'rgba(38, 166, 154, 0.35)' },
       ].forEach(({ lvl, col }) => {
         const y = Math.round(valToY(lvl));
         ctx.beginPath();
@@ -517,7 +533,7 @@ class TDIPaneRenderer {
         ctx.setLineDash([]);
 
         ctx.font      = `${9 * hPR}px monospace`;
-        ctx.fillStyle = 'rgba(156, 163, 175, 0.65)';
+        ctx.fillStyle = 'rgba(156, 163, 175, 0.75)';
         ctx.fillText(String(lvl), fullW - 22 * hPR, y - 3 * vPR);
       });
 
@@ -555,18 +571,18 @@ class TDIPaneRenderer {
         ctx.setLineDash([]);
       };
 
-      // 4. Draw Upper & Lower Blue Volatility Bands
-      strokeTDILine('upper', 'rgba(41, 182, 246, 0.85)', 1.3);
-      strokeTDILine('lower', 'rgba(41, 182, 246, 0.85)', 1.3);
+      // 4. Step 4: Blue Bollinger Bands (34, 1.618, 1px width)
+      strokeTDILine('upper', 'rgba(41, 182, 246, 0.90)', 1.0);
+      strokeTDILine('lower', 'rgba(41, 182, 246, 0.90)', 1.0);
 
-      // 5. Draw Yellow Market Base Line (SMA 34)
-      strokeTDILine('yellow', 'rgba(255, 214, 0, 0.90)', 1.4);
+      // 5. Step 5: Yellow Market Baseline (SMA 34 on First Indicator, thicker line width)
+      strokeTDILine('yellow', 'rgba(255, 214, 0, 0.95)', 2.0);
 
-      // 6. Draw Red Trade Signal Line (SMA 7)
+      // 6. Step 3: Red Slow Moving Average (SMA 7 on Previous Indicator = Green Line)
       strokeTDILine('red', 'rgba(255, 82, 82, 0.95)', 1.6);
 
-      // 7. Draw Green RSI Price Line (SMA 2 of RSI 13)
-      strokeTDILine('green', 'rgba(0, 230, 118, 0.98)', 2.0);
+      // 7. Step 2: Green Fast Moving Average (SMA 2 on RSI 13, thicker line width)
+      strokeTDILine('green', 'rgba(0, 230, 118, 0.98)', 2.5);
 
       // 8. Draw a single glowing dot STRICTLY on Python-validated Peak-aligned Sharkfin tips!
       pts.forEach((p) => {
@@ -597,19 +613,19 @@ class TDIPaneRenderer {
       const last = pts[pts.length - 1];
       ctx.font      = `bold ${10 * hPR}px monospace`;
       ctx.fillStyle = '#E8EDF3';
-      ctx.fillText('🦈 TDI (13, 2, 7, 34)', 12 * hPR, paneTop + 13 * vPR);
+      ctx.fillText('🦈 TDI (13, 2, 7, 34, 1.618)', 12 * hPR, paneTop + 13 * vPR);
 
       ctx.fillStyle = '#00E676';
-      ctx.fillText(`Green: ${last.green.toFixed(1)}`, 165 * hPR, paneTop + 13 * vPR);
+      ctx.fillText(`Green: ${last.green.toFixed(1)}`, 195 * hPR, paneTop + 13 * vPR);
 
       ctx.fillStyle = '#FF5252';
-      ctx.fillText(`Red: ${last.red.toFixed(1)}`, 255 * hPR, paneTop + 13 * vPR);
+      ctx.fillText(`Red: ${last.red.toFixed(1)}`, 285 * hPR, paneTop + 13 * vPR);
 
       ctx.fillStyle = '#FFD600';
-      ctx.fillText(`Base: ${last.yellow.toFixed(1)}`, 335 * hPR, paneTop + 13 * vPR);
+      ctx.fillText(`Base: ${last.yellow.toFixed(1)}`, 365 * hPR, paneTop + 13 * vPR);
 
       ctx.fillStyle = '#29B6F6';
-      ctx.fillText(`Bands: ${last.lower.toFixed(1)}–${last.upper.toFixed(1)}`, 425 * hPR, paneTop + 13 * vPR);
+      ctx.fillText(`Bands: ${last.lower.toFixed(1)}–${last.upper.toFixed(1)}`, 455 * hPR, paneTop + 13 * vPR);
 
       ctx.restore();
     });
