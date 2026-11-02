@@ -17,6 +17,13 @@ const symbolToPairLabel = (symbol) => SYMBOL_LABELS[symbol] || symbol;
 // In-memory backup vault so an active trade's Entry/SL/TP NEVER shifts even if MongoDB hiccups
 const MEMORY_OPEN_TRADES = {};
 
+const getPipSize = (symbol = '') => {
+  const s = symbol.toUpperCase();
+  if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 0.10;
+  if (s.includes('JPY')) return 0.01;
+  return 0.0001;
+};
+
 const getPipBuffer = (symbol = '') => {
   const s = symbol.toUpperCase();
   if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 0.20;
@@ -29,6 +36,35 @@ const getDecimals = (symbol = '') => {
   if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 2;
   if (s.includes('JPY')) return 3;
   return 5;
+};
+
+const getMinTargetPips = (symbol = '') => {
+  const s = symbol.toUpperCase();
+  if (s.includes('GC=F') || s.includes('XAU') || s.includes('GOLD')) return 150.0;
+  return 50.0;
+};
+
+/**
+ * Enforces the Pip-Based TP Floor (50 pips Forex / 150 pips Gold) AND
+ * guarantees that TP distance is ALWAYS >= 2.0x the initial Stop-Loss risk (2.0R)
+ * so TP is NEVER smaller than SL!
+ */
+const enforceMinPipAndRRTarget = (symbol, isBuy, entryNum, initSlNum, rawTpNum) => {
+  const decimals    = getDecimals(symbol);
+  const pipSize     = getPipSize(symbol);
+  const minTpPips   = getMinTargetPips(symbol);
+  const minPipDist  = minTpPips * pipSize;
+  const slRiskDist  = Math.abs(entryNum - initSlNum);
+  const rrFloorDist = slRiskDist * 2.0;
+
+  const rawTpDist   = rawTpNum != null && !isNaN(rawTpNum) ? Math.abs(rawTpNum - entryNum) : 0;
+  const finalTpDist = Math.max(minPipDist, rrFloorDist, rawTpDist);
+
+  const finalTp = isBuy
+    ? Number((entryNum + finalTpDist).toFixed(decimals))
+    : Number((entryNum - finalTpDist).toFixed(decimals));
+
+  return finalTp;
 };
 
 /**
@@ -126,7 +162,7 @@ const getOpenTrades = async (req, res) => {
  * Opens a new automatic paper trade from a qualifying AI signal, OR returns
  * the existing OPEN trade for this symbol so the chart keeps showing the
  * exact locked Entry / SL / TP lines without shifting as price moves.
- * NEVER re-opens a setup that already closed at the same Entry!
+ * Strictly enforces Pip-Based TP (50p Forex / 150p Gold) & TP >= 2.0 * SL!
  */
 const openPaperTradeIfEligible = async (symbol, analysisResult) => {
   try {
@@ -140,10 +176,29 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
       tp: { $ne: null }
     });
     if (existingOpen) {
+      let needsSave = false;
       if (!existingOpen.initialSl) {
         existingOpen.initialSl = Number(
           analysisResult.tradeSetup?.initial_sl || existingOpen.sl
         );
+        needsSave = true;
+      }
+
+      // Upgrade any existing OPEN trade whose TP was smaller than the 50p/150p or 2.0R floor
+      const isBuyOpen = (existingOpen.action || '').toUpperCase() === 'BUY';
+      const enforcedOpenTp = enforceMinPipAndRRTarget(
+        symbol,
+        isBuyOpen,
+        Number(existingOpen.entry),
+        Number(existingOpen.initialSl || existingOpen.sl),
+        Number(existingOpen.tp)
+      );
+      if (enforcedOpenTp !== Number(existingOpen.tp)) {
+        existingOpen.tp = enforcedOpenTp;
+        needsSave = true;
+      }
+
+      if (needsSave) {
         await existingOpen.save();
       }
       MEMORY_OPEN_TRADES[symbol] = existingOpen;
@@ -163,12 +218,16 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
       return null;
     }
 
+    const isBuy     = signal === 'BUY';
     const entryNum  = Number(tradeSetup.entry);
     const slNum     = Number(tradeSetup.stop_loss);
     const initSl    = Number(tradeSetup.initial_sl || tradeSetup.stop_loss);
-    const tpNum     = Number(tradeSetup.take_profit);
-    const actionStr = signal === 'BUY' ? 'Buy' : 'Sell';
+    const rawTpNum  = Number(tradeSetup.take_profit);
+    const actionStr = isBuy ? 'Buy' : 'Sell';
     const pipBuf    = getPipBuffer(symbol);
+
+    // Enforce Pip-Based TP (50p Forex / 150p Gold) & TP >= 2.0x SL Risk
+    const tpNum = enforceMinPipAndRRTarget(symbol, isBuy, entryNum, initSl, rawTpNum);
 
     // 4. DUPLICATE RE-ENTRY GUARD:
     // Check if we ALREADY took and closed a trade on this symbol with the same entry (within 2.5 pips)
@@ -206,7 +265,9 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
     const trade = await Trade.create(tradePayload);
     MEMORY_OPEN_TRADES[symbol] = trade;
 
-    console.log(`📝 PAPER TRADE OPENED & LOCKED: ${trade.action} ${trade.pair} @ ${trade.entry} | SL ${trade.sl} | TP ${trade.tp} | Confidence ${confidence}%`);
+    const tpPips = calculatePips(symbol, Math.abs(tpNum - entryNum));
+    const slPips = calculatePips(symbol, Math.abs(entryNum - initSl));
+    console.log(`📝 PAPER TRADE OPENED & LOCKED: ${trade.action} ${trade.pair} @ ${trade.entry} | SL ${trade.sl} (-${slPips}p) | TP ${trade.tp} (+${tpPips}p) | Confidence ${confidence}%`);
     return trade;
   } catch (error) {
     console.error(`⚠️ DB save warning for ${symbol} (using in-memory lock):`, error.message);
@@ -216,9 +277,10 @@ const openPaperTradeIfEligible = async (symbol, analysisResult) => {
 
 /**
  * Checks all OPEN paper trades on a given symbol against a fresh price tick:
- * 1. Waits until price has covered 65% of the distance to TP (and at least 1.25R) before
+ * 1. Ensures TP meets the 50p/150p & 2.0R floor.
+ * 2. Waits until price has covered 65% of the distance to TP (and at least 1.25R) before
  *    locking SL to Break-Even (+0.25R cushion so normal pullbacks don't choke the trade at +1.0p).
- * 2. Then checks if SL or TP was hit and closes the trade with accurate Forex/Gold Pips.
+ * 3. Then checks if SL or TP was hit and closes the trade with accurate Forex/Gold Pips.
  */
 const evaluateOpenTrades = async (symbol, candle) => {
   try {
@@ -240,7 +302,16 @@ const evaluateOpenTrades = async (symbol, candle) => {
       const entry     = Number(trade.entry);
       let currentSL   = Number(trade.sl);
       const initSL    = Number(trade.initialSl || currentSL);
-      const tp        = Number(trade.tp);
+      let tp          = Number(trade.tp);
+
+      // Step 0: Ensure TP always respects the Pip & 2.0R floor
+      const enforcedTp = enforceMinPipAndRRTarget(symbol, isBuy, entry, initSL, tp);
+      if (enforcedTp !== tp) {
+        tp = enforcedTp;
+        trade.tp = enforcedTp;
+        await trade.save();
+        MEMORY_OPEN_TRADES[symbol] = trade;
+      }
 
       // Step 1: Breathing-Room Break-Even Check (65% of TP distance & at least 1.25R, locking +0.25R profit cushion)
       const initRisk = Math.abs(entry - initSL);
